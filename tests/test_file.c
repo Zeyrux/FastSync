@@ -9,7 +9,9 @@
 #include "charset.h"
 #include "utils.h"
 #include "protocol.h"
+#include "xattr.h"
 #include "test_utils.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -17,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -339,12 +342,17 @@ static void test_file_save_to_disk_temp_dir_confined() {
   const char* root = "test_temp_confine_tmp";
   const char* dest_file = "test_temp_confine_tmp/file.txt";
   char outside[PATH_MAX];
+  char inside_abs[PATH_MAX];
   snprintf(outside, sizeof(outside), "/tmp/fastsync_temp_outside_%d", (int)getpid());
   unlink(dest_file);
   rmdir("test_temp_confine_tmp/scratch");
+  rmdir("test_temp_confine_tmp/abs_scratch");
   rmdir(root);
   mkdir(root, 0755);
   mkdir("test_temp_confine_tmp/scratch", 0755);
+  mkdir("test_temp_confine_tmp/abs_scratch", 0755);
+  if (!realpath("test_temp_confine_tmp/abs_scratch", inside_abs))
+    EXPECT_FAIL("realpath(abs_scratch) failed; inside_abs would be uninitialized");
   mkdir(outside, 0755);
 
   File* f = file_create("file.txt");
@@ -364,6 +372,13 @@ static void test_file_save_to_disk_temp_dir_confined() {
   config->temp_dir = str_dup("../escape");
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
   EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  /* An absolute temp dir that canonicalizes INSIDE the receive root is
+     accepted and used (the parity win); destination is still written. */
+  free(config->temp_dir);
+  config->temp_dir = str_dup(inside_abs);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(access(dest_file, F_OK), 0);
+  unlink(dest_file);
   free(config->temp_dir);
   config->temp_dir = str_dup("scratch");
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
@@ -373,6 +388,7 @@ static void test_file_save_to_disk_temp_dir_confined() {
   config_delete(config);
   unlink(dest_file);
   rmdir("test_temp_confine_tmp/scratch");
+  rmdir("test_temp_confine_tmp/abs_scratch");
   rmdir(root);
   rmdir(outside);
 }
@@ -1312,6 +1328,103 @@ static void test_special_socket_recreated() {
   file_destroy(f);
   config_delete(cfg);
   unlink(sock);
+  rmdir(root);
+}
+
+/* --fake-super device round-trip (rsync parity): a char/block device must be
+ * materialized as a REGULAR empty file whose user.rsync.%stat records the real
+ * rdev -- never as an mknod'ed node -- even on a privileged receiver.  This is
+ * the non-privileged unit counterpart to the setpriv integration test (which
+ * the PR gate excludes). */
+static void test_fake_super_device_writes_regular_file_with_rdev() {
+  const char* root = "test_fake_super_dev_tmp";
+  const char* node = "test_fake_super_dev_tmp/cdev";
+  unlink(node);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->fake_super = true;
+  cfg->preserve_devices = true;
+  cfg->preserve_perms = true;
+  cfg->use_metadata = true;
+  cfg->use_xattrs = true;
+
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFCHR | 0644;
+
+  File* f = file_create("cdev");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->rdev_major = 1;
+  f->rdev_minor = 3;
+  f->metadata = &meta;
+
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+
+  struct stat st;
+  EXPECT_EQ_INT(lstat(node, &st), 0);
+  EXPECT_TRUE(S_ISREG(st.st_mode)); /* never a real device node */
+  EXPECT_EQ_INT((int)st.st_size, 0);
+
+  char value[128] = {0};
+  ssize_t got = getxattr(node, FAKESUPER_XATTR, value, sizeof(value) - 1);
+  EXPECT_TRUE(got > 0);
+  EXPECT_EQ_STR(value, "20644 1,3 0:0"); /* the REAL rdev, not 0,0 */
+
+  f->metadata = NULL;
+  file_destroy(f);
+  config_delete(cfg);
+  unlink(node);
+  rmdir(root);
+}
+
+/* A char/block device that mknodat() refuses (EPERM/EACCES on an unprivileged
+ * receiver) must be a PER-ENTRY failure -- FILE_SAVE_FAILED, which the receiver
+ * counts and continues past -- never the fatal FILE_SAVE_ERROR that aborts the
+ * stream.  The unit suite normally runs as root, so drop the effective uid to
+ * make the kernel refusal deterministic. */
+static void test_device_mknod_failure_is_per_entry() {
+  const char* root = "test_device_eperm_tmp";
+  const char* node = "test_device_eperm_tmp/cdev";
+  unlink(node);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0777), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->preserve_devices = true;
+  cfg->use_metadata = true;
+
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFCHR | 0644;
+
+  File* f = file_create("cdev");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->rdev_major = 1;
+  f->rdev_minor = 3;
+  f->metadata = &meta;
+
+  uid_t saved = geteuid();
+  bool dropped = false;
+  if (saved == 0 && seteuid(65534) == 0)
+    dropped = true;
+  FileSaveResult result = file_save_to_disk_full(root, f, cfg);
+  if (dropped)
+    EXPECT_EQ_INT(seteuid(saved), 0);
+
+  EXPECT_EQ_INT(result, FILE_SAVE_FAILED);
+  /* Nothing was created: no device node and no regular-file fallback. */
+  struct stat st;
+  EXPECT_EQ_INT(lstat(node, &st), -1);
+
+  f->metadata = NULL;
+  file_destroy(f);
+  config_delete(cfg);
   rmdir(root);
 }
 
@@ -2396,6 +2509,8 @@ void test_file() {
   test_new_file_mode_honors_source_and_umask();
   test_special_fifo_mode_honors_source_and_umask();
   test_special_socket_recreated();
+  test_fake_super_device_writes_regular_file_with_rdev();
+  test_device_mknod_failure_is_per_entry();
   test_inplace_overwrite_truncates_shorter_payload();
   test_inplace_refuses_fifo_destination();
   test_inplace_refuses_device_destination();

@@ -44,7 +44,8 @@ const char* delete_plan_walk_root(const Config* config, const ArrayList* synced_
 bool files_from_list_check(const Config* config, ArrayList* missing_dest, int* skipped_out);
 bool scan_paths_only(const Config* config, const ScannerOptions* options, ArrayList* manifest,
                      DeletePlanSender* plans, bool* io_error_out,
-                     unsigned long long* non_dir_count_out);
+                     unsigned long long* non_dir_count_out, ArrayList* chunks_out,
+                     bool emit_nonreg);
 
 /* client_report.c */
 void log_server_rejection(const char* context);

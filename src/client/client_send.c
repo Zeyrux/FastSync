@@ -1148,6 +1148,43 @@ send_fail:
 static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
   protocol_session_bind(&context->allocation_session);
+  if (context->prescan_chunks != NULL) {
+    /* --delete-before replays the pre-scan that built the early keep-set as the
+       data pass (rsync builds one file list).  Feed the retained chunks straight
+       into the pipeline instead of re-reading the source, so a file created
+       after the pre-scan is neither transferred nor kept.  The chunk also
+       carries the directory times captured by that scan (there is no later
+       scan), so no scanner is created here. */
+    bool failed = false;
+    for (int i = 0; i < context->prescan_chunks->size; i++) {
+      Chunk* chunk = (Chunk*)context->prescan_chunks->items[i];
+      /* Move ownership out of the retained list so a cleanup here never
+         double-frees a chunk the queue now owns. */
+      context->prescan_chunks->items[i] = NULL;
+      if (chunk == NULL)
+        continue;
+      if (!queue_enqueue_multithreaded_cancel(
+              context->queue_scanner, chunk, &context->mutex_scanner,
+              &context->condition_not_empty_scanner, &context->condition_not_full_scanner,
+              &context->cancelled)) {
+        chunk_destroy(chunk);
+        failed = true;
+        break;
+      }
+    }
+    mtx_lock(&context->mutex_scanner);
+    context->scanner_done = true;
+    cnd_broadcast(&context->condition_not_empty_scanner);
+    cnd_broadcast(&context->condition_not_full_scanner);
+    mtx_unlock(&context->mutex_scanner);
+    if (failed) {
+      pipeline_cancel(context);
+      protocol_session_unbind();
+      return thrd_error;
+    }
+    protocol_session_unbind();
+    return thrd_success;
+  }
   PreparedScanner prepared;
   /* -j/--threads=N sizes the parallel scanner's worker pool; 0 (bare -j) lets
    * the scanner apply its built-in default. */
@@ -1394,6 +1431,10 @@ typedef struct {
   Client* client;
   DirectoryScanner* scanner;
   ArrayList* manifest;
+  /* --delete-before: the pre-scan that built the keep-set, retained as the data
+     pass's file list (owning Chunk*; consumed chunks are NULLed as they are
+     sent).  NULL in every other mode, where the data pass scans normally. */
+  ArrayList* prescan_chunks;
   DeletePlanSender* plan_sender;
   ArrayList* remove_sources;
   ArrayList* dir_entries;
@@ -1478,12 +1519,23 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
   if (state->delete_early) {
     /* Pass 1: collect the complete keep-set (paths only, no data loaded) and
        transmit it now, before any file data.  The receiver removes extras and
-       acks; the transfer aborts here if the deletion could not commit. */
+       acks; the transfer aborts here if the deletion could not commit.  The
+       scanned chunks are retained so the data pass can replay this exact list
+       instead of re-reading the source (rsync builds one file list and never
+       transfers a file created after it). */
     ArrayList* early_manifest = array_list_create(free);
-    if (!early_manifest)
+    ArrayList* prescan_chunks = array_list_create(chunk_destroy);
+    if (!early_manifest || !prescan_chunks) {
+      array_list_delete(early_manifest);
+      array_list_delete(prescan_chunks);
       return false;
+    }
+    /* No later scan runs for --delete-before, so this pass must also capture the
+       deferred directory times and the --stats directory count. */
+    state->prepared.options.dir_entries = state->dir_entries;
+    state->prepared.options.dir_count = config->stats ? &state->dir_count : NULL;
     bool prescan_ok = scan_paths_only(config, &state->prepared.options, early_manifest, NULL,
-                                      &state->had_scan_io, NULL);
+                                      &state->had_scan_io, NULL, prescan_chunks, true);
     bool early_ok = false;
     bool skip_delete = false;
     if (prescan_ok) {
@@ -1514,8 +1566,13 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
     state->prepared.options.excluded_paths = NULL;
     state->prepared.options.size_skipped_paths = NULL;
     state->prepared.options.synced_dirs = NULL;
-    if (!prescan_ok || (!early_ok && !skip_delete))
+    if (!prescan_ok || (!early_ok && !skip_delete)) {
+      array_list_delete(prescan_chunks);
       return false;
+    }
+    /* Adopt the captured scan as the data pass's file list (including when an
+       I/O error suppressed only the deletion: the list is still complete). */
+    state->prescan_chunks = prescan_chunks;
   } else if (state->delete_per_dir) {
     /* --delete-during/--delete-delay: build one plan per source directory from a
        path-only pre-scan and transmit the COMPLETE plan set now, before any data,
@@ -1527,8 +1584,9 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
     if (!state->plan_sender || !state->plan_dirs)
       return false;
     state->prepared.options.plan_dirs = state->plan_dirs;
-    bool prescan_ok = scan_paths_only(config, &state->prepared.options, NULL, state->plan_sender,
-                                      &state->had_scan_io, &state->per_dir_non_dir_count);
+    bool prescan_ok =
+        scan_paths_only(config, &state->prepared.options, NULL, state->plan_sender,
+                        &state->had_scan_io, &state->per_dir_non_dir_count, NULL, false);
     bool plans_ok = false;
     bool skip_delete = false;
     if (prescan_ok) {
@@ -1592,24 +1650,42 @@ static bool send_files_run(Config* config, SendFilesState* state) {
   state->stop = stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins,
                                     config->cli.stop_at_set, config->stop_at, now_mono);
   state->prepared.options.stop_condition = &state->stop;
-  /* The early-delete pre-scan above already ran; only the data pass should feed
-     the directory-time list (otherwise every directory would be captured
-     twice). */
-  state->prepared.options.dir_entries = state->dir_entries;
-  state->prepared.options.dir_count = config->stats ? &state->dir_count : NULL;
-  state->scanner =
-      directory_scanner_create_with_options(config->send_directory, &state->prepared.options);
-  if (!state->scanner)
-    return false;
+  /* --delete-before reuses the pre-scan that built the keep-set as the data
+     pass's file list, so a source file created after that scan is neither
+     transferred nor kept (rsync builds one file list).  That pre-scan captured
+     the deferred directory times and the --stats directory count because no
+     later scan runs; every other mode opens a fresh data scanner here. */
+  if (state->prescan_chunks == NULL) {
+    state->prepared.options.dir_entries = state->dir_entries;
+    state->prepared.options.dir_count = config->stats ? &state->dir_count : NULL;
+    state->scanner =
+        directory_scanner_create_with_options(config->send_directory, &state->prepared.options);
+    if (!state->scanner)
+      return false;
+  }
 
   Chunk* current_chunk;
+  int prescan_index = 0;
   memset(&state->transfer_stats, 0, sizeof(state->transfer_stats));
   state->start = time(NULL);
   client_progress_begin(config);
   /* True when the stop deadline cut the scan short so the keep-set manifest is
      only a prefix of the source. */
   bool send_failed = false;
-  while ((current_chunk = directory_scanner_next(state->scanner)) != NULL) {
+  while (true) {
+    if (state->prescan_chunks != NULL) {
+      if (prescan_index >= state->prescan_chunks->size)
+        break;
+      /* Move ownership out of the retained list so chunk_destroy below (and the
+         cleanup tail for an early exit) never double-frees it. */
+      current_chunk = (Chunk*)state->prescan_chunks->items[prescan_index];
+      state->prescan_chunks->items[prescan_index] = NULL;
+      prescan_index++;
+    } else {
+      current_chunk = directory_scanner_next(state->scanner);
+      if (current_chunk == NULL)
+        break;
+    }
     /* Graceful abort (Ctrl-C/SIGTERM): notify the receiver and clean up.  The
        session is active (config_send already succeeded); a send failure here is
        fine because the client is exiting anyway. */
@@ -1667,10 +1743,14 @@ static bool send_files_run(Config* config, SendFilesState* state) {
  * Returns the rsync-compatible exit code. */
 static int send_files_finalize(const Config* config, SendFilesState* state) {
   Client* client = state->client;
-  if (directory_scanner_failed(state->scanner))
-    return 1;
-  if (directory_scanner_had_io_error(state->scanner))
-    state->had_scan_io = true;
+  /* A --delete-before run replays the pre-scan and owns no data scanner; its
+     I/O-error verdict was already recorded by that pre-scan. */
+  if (state->scanner != NULL) {
+    if (directory_scanner_failed(state->scanner))
+      return 1;
+    if (directory_scanner_had_io_error(state->scanner))
+      state->had_scan_io = true;
+  }
   /* An abort that arrived after the last chunk must still stop the completion
      tail (manifest/finalize) rather than let it run to success. */
   if (client_abort_pending()) {
@@ -1774,6 +1854,8 @@ static int send_files_finalize(const Config* config, SendFilesState* state) {
 static void send_files_cleanup(SendFilesState* state) {
   if (state->manifest)
     array_list_delete(state->manifest);
+  if (state->prescan_chunks)
+    array_list_delete(state->prescan_chunks);
   if (state->plan_sender)
     delete_plan_sender_destroy(state->plan_sender);
   if (state->excluded)
@@ -1987,13 +2069,27 @@ int send_files_multithreaded(Config* config) {
         if (prepared_ok)
           prepared.options.plan_dirs = context->plan_dirs;
       } else {
+        /* --delete-before: retain the pre-scan chunks as the pipeline's data
+           pass (rsync's single file list) so a source file created after the
+           scan is not transferred.  No later scan runs, so this pass must also
+           capture the deferred directory times and the --stats directory
+           count. */
         context->manifest = array_list_create(free);
-        prepared_ok = prepared_ok && context->manifest != NULL;
+        context->prescan_chunks = array_list_create(chunk_destroy);
+        prepared_ok = prepared_ok && context->manifest != NULL && context->prescan_chunks != NULL;
+        if (prepared_ok) {
+          prepared.options.dir_entries = context->dir_entries;
+          prepared.options.dir_entries_mutex = &context->dir_entries_mutex;
+          prepared.options.dir_count = config->stats ? &context->dir_count : NULL;
+          if (!append_implied_dir_times(config, context->dir_entries))
+            prepared_ok = false;
+        }
       }
       bool prebuilt =
           prepared_ok &&
           scan_paths_only(config, &prepared.options, context->manifest, context->delete_plans,
-                          &context->scan_had_io_error, &pre_scan_non_dir);
+                          &context->scan_had_io_error, &pre_scan_non_dir, context->prescan_chunks,
+                          context->prescan_chunks != NULL);
       prepared_scanner_destroy(&prepared);
       if (per_dir && prebuilt) {
         const char* walk_root = delete_plan_walk_root(config, context->synced_dirs);

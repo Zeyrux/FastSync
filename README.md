@@ -187,7 +187,7 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--groupmap=MAP` | Map group names when applying ownership |
 | `--numeric-ids` | Apply source numeric uid/gid directly instead of mapping by name |
 | `--copy-as=USER[:GROUP]` | Force every written entry to USER[:GROUP] (requires a privileged receiver) |
-| `--fake-super` | Record the resolved owner plus mode/time in a reserved `user.fastsync.stat` xattr and replay mode/time; never performs a real chown |
+| `--fake-super` | Record the resolved owner plus full mode/rdev in rsync's reserved `user.rsync.%stat` xattr (rsync 3.4.1 grammar) and replay the permission bits; never performs a real chown |
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes) |
 | `-D` | Preserve device and special files (implies `--devices --specials`) |
 | `--devices` | Recreate device nodes on the destination (privileged; skipped without `CAP_MKNOD`) |
@@ -219,7 +219,7 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected) |
 | `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync |
 | `--delay-updates` | Put updated files into place only at the end of the transfer (`--force` is honored at publication; the fixed `.fastsync-stage` staging name diverges from rsync — see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
-| `-T, --temp-dir <dir>` | Scratch directory for temp files before the atomic install; confined to the receive root (relative only), with an `EXDEV` non-atomic copy fallback |
+| `-T, --temp-dir <dir>` | Scratch directory for temp files before the atomic install; confined to the receive root (a relative path resolves below it; an absolute path is accepted only when it canonicalizes inside it), with an `EXDEV` non-atomic copy fallback |
 | `-n, --dry-run` | Report what would be transferred without mutating the destination. Since protocol 2.21.0 a server-routed target contacts the receiver and reports would-transfer based on receiver state; a plain local destination keeps the client-side scan. Never mutates or deletes. |
 | `-v, --verbose` | Enable debug logging |
 | `-q, --quiet` | Suppress non-error output |
@@ -606,7 +606,7 @@ remote SSH argv is already built injection-safe.
 | `--max-alloc <SIZE>` | Maximum single allocation (binary units; default 1G; `0` = no local limit). |
 | `--max-depth <n>` | Limit recursive scanning depth; zero means unlimited. |
 | `-b, --backup` | Back up overwritten files. |
-| `-T, --temp-dir <dir>` | Scratch directory for temp files before the atomic install (confined to the receive root; `EXDEV` falls back to a non-atomic copy). |
+| `-T, --temp-dir <dir>` | Scratch directory for temp files before the atomic install (confined to the receive root: relative resolves below it, absolute must canonicalize inside it; `EXDEV` falls back to a non-atomic copy). |
 | `--backup-dir <dir>` | Store backups under a separate directory (requires `--backup`). |
 | `--suffix <suffix>` | Set the backup filename suffix (default: `~`). |
 | `--partial` | Select partial-transfer handling. On failed/interrupted writes the already-written temp file is retained (best-effort) for resumption. With `--partial --partial-dir <dir>`, completed files are written under the partial directory and installed atomically. |
@@ -643,7 +643,7 @@ remote SSH argv is already built injection-safe.
 | `--groupmap=MAP` | Map group names when applying ownership (same syntax as `--usermap`). |
 | `--numeric-ids` | Mapping modifier: apply the source numeric uid/gid directly instead of mapping by name (combine with `-o`/`-g`, `-a`, or a map). |
 | `--copy-as=USER[:GROUP]` | Force every written entry to USER[:GROUP]; requires a privileged receiver. |
-| `--fake-super` | Record the resolved owner plus mode/time in a reserved `user.fastsync.stat` xattr and replay mode/time; never performs a real chown. |
+| `--fake-super` | Record the resolved owner plus full mode/rdev in rsync's reserved `user.rsync.%stat` xattr (rsync 3.4.1 grammar) and replay the permission bits; never performs a real chown. |
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes). |
 | `--no-super` | Forbid those super-user activities even when the receiver is root. |
 | `-l`, `--links` | Copy symlinks as symlinks; the target is stored verbatim (absolute and `..`-bearing targets included), matching rsync. |
@@ -768,9 +768,17 @@ and `address`, the global section accepts:
 - `hosts allow` / `hosts deny` — comma- and/or whitespace-separated host access
   patterns.
 
-A `[module]` requires `path`, and may also set `read only`, `client owner`,
-`auth users`, `max connections` (0 = unlimited; enforced per module across all
-connection children), and its own `hosts allow`/`hosts deny`.
+A `[module]` requires `path`, and may also set `read only`, `write only`,
+`client owner`, `auth users`, `max connections` (0 = unlimited; enforced per
+module across all connection children), and its own `hosts allow`/`hosts deny`.
+
+Like rsync, a module is **read-only by default**: a bare `[module]` with only a
+`path` refuses a write transfer. Opt a module into writability explicitly with
+`read only = no` or `write only = yes`; a global `read only` value in the
+section before the first `[module]` sets the default for later modules, and a
+module's own `read only`/`write only = yes` always wins over it. An
+rsync-style `write only = yes` is mapped to writability because FastSync is
+push-only (a module can never be read from the network).
 
 The per-host cap and the shared auth lockout identify a source by its numeric
 peer IP. **Loopback peers (127.0.0.0/8, IPv6 `::1`) are exempt**: every local

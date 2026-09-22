@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,6 +199,56 @@ static FileSaveResult hardlink_sibling_absent_first(const char* destination_path
   return FILE_SAVE_ERROR;
 }
 
+/* Resolve a user-supplied --temp-dir against the receive `root`.
+ *
+ * A relative, traversal-free name is joined below the root (the historical
+ * behavior).  An absolute path is canonicalized with realpath(3) and accepted
+ * only when it lies inside the canonicalized receive root; this is the parity
+ * win over rejecting every absolute path, without weakening the confinement
+ * invariant: an absolute path that escapes the root (including one reached
+ * through a symlinked component) is still refused.  A `..` component in a
+ * relative name is likewise refused.  The root itself is treated as an
+ * absolute path free of `..`; its realpath() resolves any symlinks so the
+ * prefix comparison is against one canonical form.
+ *
+ * Logs a clear error on rejection (the scratch dir must stay confined) and
+ * returns a newly allocated scratch path, or NULL on rejection/allocation
+ * failure. */
+static char* file_save_resolve_temp_dir(const char* root, const char* temp_dir) {
+  if (temp_dir[0] != '/') {
+    if (has_path_traversal(temp_dir)) {
+      log_message(
+          LOG_LEVEL_ERROR,
+          "receiver rejected --temp-dir '%s': a '..' component would escape the receive root",
+          temp_dir);
+      return NULL;
+    }
+    return path_cat(root, temp_dir);
+  }
+  char canonical_temp[PATH_MAX];
+  char canonical_root[PATH_MAX];
+  if (!realpath(temp_dir, canonical_temp)) {
+    log_message(LOG_LEVEL_ERROR,
+                "receiver rejected --temp-dir '%s': could not resolve the absolute path (%s)",
+                temp_dir, strerror(errno));
+    return NULL;
+  }
+  if (!realpath(root, canonical_root)) {
+    log_message(LOG_LEVEL_ERROR,
+                "receiver rejected --temp-dir '%s': could not resolve the receive root (%s)",
+                temp_dir, strerror(errno));
+    return NULL;
+  }
+  if (strcmp(canonical_root, "/") != 0 && !path_is_within_root(canonical_root, canonical_temp)) {
+    log_message(LOG_LEVEL_ERROR,
+                "receiver rejected --temp-dir '%s': an absolute temp dir must be inside the "
+                "receive root '%s'",
+                temp_dir, canonical_root);
+    return NULL;
+  }
+  return str_dup(canonical_temp);
+}
+
 /* Install a --hard-links/-H sibling: the destination entry is atomically
    replaced (temp + rename) with a hard link to the group's first member.  The
    first member is guaranteed already installed at `hardlink_target` under the
@@ -303,17 +354,13 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     free(destination_path);
     return absent_result;
   }
-  /* Resolve a relative --temp-dir under the destination root, exactly as the
-   * primary save path does; an absolute or `..`-escaping value is rejected. */
+  /* Resolve the --temp-dir under the destination root, exactly as the primary
+   * save path does: a relative dir joins below the root, an absolute dir is
+   * accepted only when it canonicalizes inside the root, and any escaping value
+   * is rejected. */
   char* resolved_temp = NULL;
   if (cfg->temp_dir) {
-    if (cfg->temp_dir[0] == '/' || has_path_traversal(cfg->temp_dir)) {
-      free(content);
-      free(first_disk);
-      free(destination_path);
-      return FILE_SAVE_ERROR;
-    }
-    resolved_temp = path_cat(root_directory, cfg->temp_dir);
+    resolved_temp = file_save_resolve_temp_dir(root_directory, cfg->temp_dir);
     if (!resolved_temp) {
       free(content);
       free(first_disk);
@@ -353,11 +400,14 @@ bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode) {
 /* ---- Device/special node RECREATION (--devices/--specials), receiver side ----
  *
  * Privilege gating: making a real device node requires CAP_MKNOD (root); making
- * a FIFO works unprivileged (mkfifo).  When the receiver lacks the capability,
- * mknodat() fails with EPERM and the entry is SKIPPED with a warning -- the
- * whole transfer must NOT abort just because the environment cannot make the
- * node.  CI runs non-root, so device creation is expected to skip there and
- * only a FIFO is honestly assertable unprivileged.
+ * a FIFO works unprivileged (mkfifo).  A device node whose mknodat() fails with
+ * EPERM/EACCES is a PER-ENTRY failure (rsync parity: rsync reports the mknod
+ * failure, still transfers the rest, and exits partial, code 23), reported as
+ * FILE_SAVE_FAILED so the receiver counts it and continues.  Only the
+ * unprivileged FIFO/socket (--specials) path keeps the best-effort skip,
+ * because those are normally creatable without privilege and a failure there is
+ * environmental.  CI runs non-root, so device creation is expected to fail
+ * there; only a FIFO is honestly assertable unprivileged.
  *
  * Confinement: the parent directory is opened fd-relative below the receive
  * root (file_open_secure_parent: O_NOFOLLOW, no "..", root-checked) and the
@@ -495,13 +545,32 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
                   node_kind, escaped_path ? escaped_path : "<allocation failed>");
       free(escaped_path);
     } else if (errno == EPERM || errno == EACCES) {
-      /* Missing CAP_MKNOD / parent write permission: the environment cannot
-         create the node, so skip instead of failing the whole run. */
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
+      const char* shown_path = escaped_path ? escaped_path : "<allocation failed>";
+      if (is_char || is_blk) {
+        /* rsync parity: a device node that cannot be created (no CAP_MKNOD, or
+         * super-user activities not permitted) is a per-entry failure.  rsync
+         * logs `mknod ".../node" failed: ...`, still transfers the remaining
+         * files, and exits partial (23); FastSync logs it, counts it, and
+         * continues rather than aborting the stream.  FIFO/socket creation
+         * (--specials) keeps the best-effort skip path below. */
+        log_message(LOG_LEVEL_ERROR,
+                    "cannot create %s %s: %s\n"
+                    "  --devices node creation needs privilege (CAP_MKNOD)",
+                    node_kind, shown_path, strerror(errno));
+        free(escaped_path);
+        close(parent_fd);
+        free(leaf);
+        free(destination);
+        return FILE_SAVE_FAILED;
+      }
+      /* Missing CAP_MKNOD / parent write permission for a FIFO/socket: the
+         environment cannot create the node, so skip instead of failing the
+         whole run. */
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: cannot create %s node (%s)\n"
-                  "  --devices/--specials node creation needs privilege (CAP_MKNOD)",
-                  escaped_path ? escaped_path : "<allocation failed>", node_kind, strerror(errno));
+                  "  --specials node creation needs privilege (CAP_MKNOD)",
+                  shown_path, node_kind, strerror(errno));
       free(escaped_path);
     } else {
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
@@ -868,6 +937,14 @@ static bool file_save_try_special_dispatch(const FileSavePlan* plan, bool* creat
   /* Device/special node (--devices/--specials): recreate the node instead of
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special) {
+    /* Under --fake-super rsync never mknod()s a device: it writes a regular
+       empty file and records the real rdev in user.rsync.%stat.  Fall through to
+       the ordinary writer so the device round-trips (its S_IFMT mode bits and
+       rdev are parked in the record).  Without --fake-super the node is
+       recreated (or, when privilege is refused, handled per-entry). */
+    mode_t special_mode = file->metadata ? file->metadata->mode : 0;
+    if (config && config->fake_super && (S_ISCHR(special_mode) || S_ISBLK(special_mode)))
+      return false;
     *out = file_save_special_to_disk(plan->root_directory, file, config, created);
     return true;
   }
@@ -896,23 +973,26 @@ static bool file_save_try_special_dispatch(const FileSavePlan* plan, bool* creat
    and disk paths.  Returns false on an invalid/escaping option or an
    allocation failure (the caller routes to the cleanup epilogue). */
 static bool file_save_resolve_paths(FileSavePlan* plan) {
-  /* These options arrive from the client.  --backup-dir, --partial-dir and
-     --temp-dir are names below the server root, never independent filesystem
-     roots: an absolute or `..`-escaping value is rejected outright (rsync's
-     daemon confines temp-dir to the module the same way).  A relative temp dir
-     is resolved under the receive root below; if that resolution still lands on
-     a different filesystem than the destination the install falls back to a
-     non-atomic copy (see file_to_disk_secure_impl), never an abort. */
+  /* These options arrive from the client.  --backup-dir and --partial-dir are
+     names below the server root, never independent filesystem roots: an
+     absolute or `..`-escaping value is rejected outright.  --temp-dir is
+     resolved by file_save_resolve_temp_dir below: a relative name joins below
+     the root, an absolute name is accepted only when it canonicalizes inside
+     the root, and any escaping value is rejected.  If the resolved scratch dir
+     still lands on a different filesystem than the destination the install
+     falls back to a non-atomic copy (see file_to_disk_secure_impl), never an
+     abort. */
   if ((plan->backup_dir && (plan->backup_dir[0] == '/' || has_path_traversal(plan->backup_dir))) ||
-      (plan->partial_dir &&
-       (plan->partial_dir[0] == '/' || has_path_traversal(plan->partial_dir))) ||
-      (plan->temp_dir && (plan->temp_dir[0] == '/' || has_path_traversal(plan->temp_dir))))
+      (plan->partial_dir && (plan->partial_dir[0] == '/' || has_path_traversal(plan->partial_dir))))
     return false;
   if (plan->backup_dir &&
       !(plan->confined_backup = path_cat(plan->root_directory, plan->backup_dir)))
     return false;
   if (plan->partial_dir &&
       !(plan->confined_partial = path_cat(plan->root_directory, plan->partial_dir)))
+    return false;
+  if (plan->temp_dir &&
+      !(plan->confined_temp = file_save_resolve_temp_dir(plan->root_directory, plan->temp_dir)))
     return false;
 
   const char* actual_root = plan->use_partial_root ? plan->confined_partial : plan->root_directory;
@@ -1039,7 +1119,7 @@ static bool file_save_install_data(FileSavePlan* plan, const FileMetadata* metad
         config && config->preallocate, metadata, plan->policy, config && config->update,
         config && config->ignore_existing, config && config->use_fsync, file->xattrs,
         config ? config->fake_super : false, config ? config->partial : false, plan->confined_temp,
-        created_dirs, count_floor);
+        created_dirs, count_floor, (uint32_t)file->rdev_major, (uint32_t)file->rdev_minor);
   }
   free(count_floor);
   return ok;
@@ -1146,17 +1226,22 @@ FileSaveResult file_save_to_disk_full_ex(const char* root_directory, const File*
 
   /* A configured --temp-dir sends the temporary working copy to a scratch
      directory; the engine then atomically renames the completed file into the
-     final destination directory.  A relative temp dir is resolved under the
-     receive root and must already exist (an absolute or `..`-escaping value was
-     rejected above); the engine falls back to a non-atomic copy on EXDEV.  The
-     partial-dir flow already keeps its working copy in a separate directory and
-     --inplace writes directly, so neither diverts through the scratch dir
-     (matching rsync, where --inplace/--partial-dir supersede --temp-dir). */
-  bool use_temp_dir = plan.temp_dir != NULL && !plan.inplace && !plan.use_partial_root;
+     final destination directory.  The scratch path was confined to the receive
+     root (and canonicalized) in file_save_resolve_paths and must already exist;
+     the engine falls back to a non-atomic copy on EXDEV.  The partial-dir flow
+     already keeps its working copy in a separate directory and --inplace writes
+     directly, so neither diverts through the scratch dir (matching rsync, where
+     --inplace/--partial-dir supersede --temp-dir). */
+  /* --inplace and --partial-dir supersede --temp-dir in rsync, so the scratch
+     dir is not used on those paths.  The value was still validated/confined by
+     file_save_resolve_paths; drop the resolved path so it is never handed to the
+     install engine. */
+  if (plan.confined_temp && (plan.inplace || plan.use_partial_root)) {
+    free(plan.confined_temp);
+    plan.confined_temp = NULL;
+  }
+  bool use_temp_dir = plan.confined_temp != NULL;
   if (use_temp_dir) {
-    plan.confined_temp = path_cat(root_directory, plan.temp_dir);
-    if (!plan.confined_temp)
-      goto out;
     /* A user-supplied trailing slash would leave the scratch path ending in
        "/", which has no final component to create/open.  Normalize it away. */
     size_t temp_len = strlen(plan.confined_temp);
