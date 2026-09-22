@@ -33,6 +33,108 @@ static bool key_equals(const char* key, const char* canonical) {
   return strcasecmp(key, canonical) == 0;
 }
 
+/* True when `key` matches one of the NUL-terminated names in `list`. */
+static bool key_in_list(const char* key, const char* const* list, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    if (strcasecmp(key, list[i]) == 0)
+      return true;
+  }
+  return false;
+}
+
+/* rsync 3.4.1 rsyncd.conf GLOBAL keys accepted in the pre-module section that
+ * have no FastSync equivalent.  They are recognized and documented as inert:
+ * accepting a real rsync config must not fail on a logging/process key, but a
+ * silently-reinterpreted key is never invented.  `pidfile`/`logfile` are the
+ * compact --dparam spellings rsync documents.  The same list is used by the
+ * `--dparam` dispatch (apply_global_key), so there is a single impl. */
+static const char* const kRsyncInertGlobalKeys[] = {
+    "pid file",
+    "pidfile",
+    "log file",
+    "logfile",
+    "socket options",
+    "sockopts",
+    "listen backlog",
+    "syslog facility",
+    "syslog tag",
+    "log format",
+    "use chroot",
+    "uid",
+    "gid",
+    "timeout",
+    "max verbosity",
+    "min verbosity",
+    "lock file",
+    "transfer logging",
+    "strict modes",
+    "reverse lookup",
+    "forward lookup",
+    "ignore errors",
+    "ignore nonreadable",
+    "dont compress",
+};
+
+/* rsync 3.4.1 rsyncd.conf MODULE keys accepted in a [module] section that have
+ * no FastSync equivalent (accepted-and-documented inert).  Keys with a FastSync
+ * meaning (`path`, `read only`, `auth users`, `max connections`,
+ * `hosts allow`/`hosts deny`, `client owner`) are handled by apply_module_key
+ * before this list is consulted.  Security-relevant keys (`exclude`, `filter`,
+ * `secrets file`, `refuse options`, ...) are inert, so a daemon-side filter or
+ * rsync secrets file is NOT enforced: see RSYNC_COMPAT.md for the residual. */
+static const char* const kRsyncInertModuleKeys[] = {
+    "comment",
+    "use chroot",
+    "daemon chroot",
+    "uid",
+    "gid",
+    "daemon uid",
+    "daemon gid",
+    "exclude",
+    "include",
+    "exclude from",
+    "include from",
+    "filter",
+    "max verbosity",
+    "min verbosity",
+    "lock file",
+    "transfer logging",
+    "log file",
+    "log format",
+    "syslog facility",
+    "syslog tag",
+    "timeout",
+    "secrets file",
+    "auth digest",
+    "strict modes",
+    "numeric ids",
+    "fake super",
+    "munge symlinks",
+    "write only",
+    "list",
+    "dont compress",
+    "charset",
+    "refuse options",
+    "incoming chmod",
+    "outgoing chmod",
+    "open noatime",
+    "max size",
+    "min size",
+    "temp dir",
+    "pre-xfer exec",
+    "post-xfer exec",
+    "name converter",
+    "proxy protocol",
+    "proxy protocol hosts",
+    "reverse lookup",
+    "forward lookup",
+    "ignore errors",
+    "ignore nonreadable",
+};
+
+#define kRsyncInertGlobalCount (sizeof(kRsyncInertGlobalKeys) / sizeof(kRsyncInertGlobalKeys[0]))
+#define kRsyncInertModuleCount (sizeof(kRsyncInertModuleKeys) / sizeof(kRsyncInertModuleKeys[0]))
+
 static bool parse_bool_value(const char* value, bool* out) {
   if (strcasecmp(value, "yes") == 0 || strcasecmp(value, "true") == 0 || strcmp(value, "1") == 0) {
     *out = true;
@@ -250,6 +352,7 @@ DaemonConf* daemon_conf_create(void) {
   if (!conf)
     return NULL;
   conf->global.port = DAEMON_CONF_DEFAULT_PORT;
+  conf->global.read_only_default = false;
   conf->global.max_connections = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS;
   conf->global.auth_failure_delay_ms = DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS;
   conf->global.max_connections_per_host = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS_PER_HOST;
@@ -324,7 +427,7 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, boo
                              char* err, size_t err_size) {
   if (key_equals(key, "port"))
     return store_port(&conf->global.port, value, err, err_size);
-  if (key_equals(key, "motd file")) {
+  if (key_equals(key, "motd file") || key_equals(key, "motdfile")) {
     if (!store_string(&conf->global.motd_file, value)) {
       set_error(err, err_size, "out of memory parsing 'motd file'");
       return false;
@@ -335,6 +438,25 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, boo
     if (!store_string(&conf->global.address, value)) {
       set_error(err, err_size, "out of memory parsing 'address'");
       return false;
+    }
+    return true;
+  }
+  /* rsync allows the `read only` module key in the global section as the
+   * default for modules defined after it.  Map it to that default (a later
+   * --dparam re-applies it to modules that did not set their own value) so a
+   * global `read only = yes` cannot be silently dropped into a writable
+   * default. */
+  if (key_equals(key, "read only")) {
+    bool parsed;
+    if (!parse_bool_value(value, &parsed)) {
+      set_error(err, err_size, "global 'read only' must be yes/no (or true/false/1/0), got '%s'",
+                value);
+      return false;
+    }
+    conf->global.read_only_default = parsed;
+    for (int i = 0; i < conf->module_count; i++) {
+      if (!conf->modules[i].read_only_explicit)
+        conf->modules[i].read_only = parsed;
     }
     return true;
   }
@@ -360,6 +482,9 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, boo
   if (key_equals(key, "hosts deny"))
     return store_host_list(&conf->global.hosts_deny, &conf->global.hosts_deny_count, value,
                            "hosts deny", NULL, replace_hosts, err, err_size);
+  /* A recognized rsync global key with no FastSync equivalent loads inert. */
+  if (key_in_list(key, kRsyncInertGlobalKeys, kRsyncInertGlobalCount))
+    return true;
   set_error(err, err_size, "unknown global key '%s'", key);
   return false;
 }
@@ -388,6 +513,7 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
       return false;
     }
     module->read_only = parsed;
+    module->read_only_explicit = true;
     return true;
   }
   if (key_equals(key, "client owner")) {
@@ -457,6 +583,9 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
   if (key_equals(key, "hosts deny"))
     return store_host_list(&module->hosts_deny, &module->hosts_deny_count, value, "hosts deny",
                            module->name, false, err, err_size);
+  /* A recognized rsync module key with no FastSync equivalent loads inert. */
+  if (key_in_list(key, kRsyncInertModuleKeys, kRsyncInertModuleCount))
+    return true;
   set_error(err, err_size, "unknown key '%s' in module '%s'", key, module->name);
   return false;
 }
@@ -507,6 +636,7 @@ static int open_module(DaemonConf* conf, int* current_module, const char* name, 
   }
   conf->modules = grown;
   memset(&conf->modules[conf->module_count], 0, sizeof(DaemonModule));
+  conf->modules[conf->module_count].read_only = conf->global.read_only_default;
   conf->modules[conf->module_count].name = str_dup(name);
   if (!conf->modules[conf->module_count].name) {
     set_error(err, err_size, "out of memory adding module '%s'", name);
