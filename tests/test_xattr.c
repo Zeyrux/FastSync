@@ -450,6 +450,24 @@ static void test_fake_super_rsync_format() {
   EXPECT_EQ_INT((int)st.st_uid, (int)before.st_uid);
   EXPECT_EQ_INT((int)st.st_gid, (int)before.st_gid);
 
+  /* Hardened parser: an out-of-range field (previously UB via sscanf("%u")),
+     a missing field, or trailing garbage is rejected cleanly instead of being
+     silently accepted. */
+  const char* malformed[] = {
+      "20644 65536,3 111:222",        /* major > 0xffff */
+      "20644 1,16777216 111:222",     /* minor > 0xffffff */
+      "20644 1,3 111:222 trailing",   /* trailing garbage */
+      "20644 1,3 111",                /* missing gid */
+      "20644 1,3 4294967296:222",     /* uid > UINT_MAX */
+      "20644 1,3 111:4294967296",     /* gid > UINT_MAX */
+      "99999999999999999999 1,3 0:0", /* mode overflow */
+      "",                             /* empty record */
+  };
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+    EXPECT_EQ_INT((int)fsetxattr(fd, FAKESUPER_XATTR, malformed[i], strlen(malformed[i]), 0), 0);
+    EXPECT_FALSE(fake_super_restore_fd(fd, policy));
+  }
+
   close(fd);
   unlink(path);
 }

@@ -64,6 +64,11 @@ typedef struct PipelineContextReceiver {
   /* --info=del actually-removed path list, collected by the deferred delete
      commit in server.c and reported in the STATUS_STATS frame. */
   struct ArrayList* deleted_paths;
+  /* Per-run count of entries that failed to materialize without aborting the
+     stream (currently ONLY a --devices mknod EPERM/EACCES).  write_thread
+     increments it under `mutex`; server.c turns a nonzero count into a non-OK
+     terminal status so the client exits non-zero. */
+  size_t failed_entries;
 } PipelineContextReceiver;
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,

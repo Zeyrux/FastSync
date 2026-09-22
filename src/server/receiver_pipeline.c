@@ -29,6 +29,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->deferred_manifest = NULL;
   context->deferred_plans = NULL;
   context->delete_limit_reached = false;
+  context->failed_entries = 0;
   memset(&context->stats, 0, sizeof(context->stats));
   context->would_delete = NULL;
   context->deleted_paths = NULL;
@@ -262,6 +263,13 @@ int write_thread(void* pipeline_context) {
            receive thread also writes stats.matched_data). */
         mtx_lock(&context->mutex);
         receiver_stats_note_saved(&context->stats, file, created, created_dirs);
+        mtx_unlock(&context->mutex);
+      }
+      /* --devices parity: a device node that could not be mknod'ed is counted
+         per-run but does NOT abort the transfer. */
+      if (result == FILE_SAVE_FAILED) {
+        mtx_lock(&context->mutex);
+        context->failed_entries++;
         mtx_unlock(&context->mutex);
       }
       if (result == FILE_SAVE_ERROR) {

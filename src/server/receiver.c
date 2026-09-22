@@ -53,7 +53,13 @@ bool receiver_send_final_success(int fd, const Config* config, const ReceiverOut
     return send_status(fd, final_status);
   size_t count = outcomes ? outcomes->count : 0;
   for (size_t i = 0; i < count; i++) {
-    Status per_file = outcomes->entries[i] == FILE_SAVE_WRITTEN ? STATUS_NEXT : STATUS_OK;
+    Status per_file;
+    if (outcomes->entries[i] == FILE_SAVE_WRITTEN)
+      per_file = STATUS_NEXT;
+    else if (outcomes->entries[i] == FILE_SAVE_FAILED)
+      per_file = STATUS_ERROR;
+    else
+      per_file = STATUS_OK;
     if (!send_status(fd, per_file))
       return false;
   }
@@ -719,6 +725,11 @@ typedef struct {
   ArrayList* would_delete;
   /* --info=del: actually-removed paths collected during the delete commit. */
   ArrayList* deleted_paths;
+  /* Per-run count of entries that failed to materialize without aborting the
+     stream (currently ONLY a --devices mknod EPERM/EACCES).  A nonzero count
+     makes the terminal frame carry a non-OK status so the client exits
+     non-zero, matching rsync's continue-and-exit-partial behavior. */
+  size_t failed_entries;
 } ReceiverSaveContext;
 
 static bool receiver_save_file(File* file, void* context_pointer) {
@@ -742,6 +753,11 @@ static bool receiver_save_file(File* file, void* context_pointer) {
      count as matched data in the end-of-transfer report. */
   if (result != FILE_SAVE_ERROR && file->matched_bytes > 0)
     context->stats.matched_data += file->matched_bytes;
+  /* --devices parity: a device node the receiver could not mknod (EPERM/EACCES)
+     is counted per-run but does not abort the transfer.  The terminal frame
+     turns a nonzero count into a non-OK status so the client exits non-zero. */
+  if (result == FILE_SAVE_FAILED)
+    context->failed_entries++;
   /* Protocol 2.28.0: receiver-observed literal bytes and the created-entry
      breakdown (regular/dir/link/special) for the `--stats` report. */
   if (result == FILE_SAVE_WRITTEN)
@@ -775,9 +791,25 @@ static void receiver_note_delete_limit(void* context_pointer) {
   context->delete_limit_reached = true;
 }
 
+/* Terminal status for a run.  A capped --delete limit wins (rsync exit 25);
+   otherwise any per-entry failure (for example an unprivileged --devices
+   mknod) makes the terminal frame non-OK so the client exits non-zero.  rsync
+   reports 23 here; mapping the client's exact exit code to 23 is a separate,
+   pre-existing concern.  A clean run keeps STATUS_OK. */
+static Status receiver_final_status(bool delete_limit_reached, size_t failed_entries) {
+  if (delete_limit_reached)
+    return STATUS_DELETE_LIMIT;
+  return failed_entries > 0 ? STATUS_ERROR : STATUS_OK;
+}
+
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
-  Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
+  if (context->failed_entries > 0)
+    log_message(LOG_LEVEL_WARNING,
+                "%zu entr%s failed to materialize; continuing (partial transfer)",
+                context->failed_entries, context->failed_entries == 1 ? "y" : "ies");
+  Status final_status =
+      receiver_final_status(context->delete_limit_reached, context->failed_entries);
   if (!receiver_send_stats_frame(fd, context->config, &context->stats, context->would_delete,
                                  context->deleted_paths))
     return false;
