@@ -597,7 +597,10 @@ void client_progress_begin(const Config* config) {
     }
     return;
   }
-  if (g_progress_active)
+  /* -i/--out-format alone do not print the header, but --progress always does
+     and --info=flist does under any output mode (rsync prints it for
+     `-i --info=flist` and `--out-format=... --info=flist` too). */
+  if (g_progress_active || (!config->quiet && info_flag_enabled(config, LOG_INFO_FLIST)))
     printf("sending incremental file list\n");
   /* rsync prints the transfer-root directory before the first entry.  Under
      -i/--out-format it is the root change line (`.d..t...... ./`); otherwise it
@@ -677,6 +680,125 @@ static bool progress_precount_add_dir(ProgressPrecount* p, const char* path) {
   return false;
 }
 
+static int progress_path_compare(const void* left, const void* right) {
+  const char* const* a = (const char* const*)left;
+  const char* const* b = (const char* const*)right;
+  return strcmp(*a, *b);
+}
+
+/* Sort the collected directory paths and drop duplicates so a large
+ * --files-from list (many entries sharing an implied ancestor) cannot grow the
+ * list without bound. */
+static void progress_precount_dedup_dirs(ArrayList* dir_paths) {
+  if (dir_paths == NULL || dir_paths->size < 2)
+    return;
+  qsort(dir_paths->items, (size_t)dir_paths->size, sizeof(char*), progress_path_compare);
+  int write = 0;
+  for (int read = 0; read < dir_paths->size; read++) {
+    char* current = (char*)dir_paths->items[read];
+    if (write > 0 && strcmp((char*)dir_paths->items[write - 1], current) == 0) {
+      free(current);
+      continue;
+    }
+    dir_paths->items[write++] = current;
+  }
+  dir_paths->size = write;
+}
+
+/* Create a metadata-bearing directory File for the transfer-relative directory
+ * `rel` ("" is the transfer root), stat'ing it below config->send_directory.
+ * The -d/--files-from dirs generator never traverses directories, so this
+ * synthesizes the metadata the recursive scanner captures through
+ * scanner_capture_dir_time, letting -i/--out-format render %M/%B/%U/%G and the
+ * transfer-root/ancestor lines identically on both paths.  Returns NULL when
+ * the path cannot be stat'd as a directory or on allocation failure (the line
+ * is then simply omitted, exactly as before). */
+static File* progress_precount_make_dir(const Config* config, const char* rel) {
+  if (config == NULL || config->send_directory == NULL)
+    return NULL;
+  char* fs_path = (rel == NULL || rel[0] == '\0') ? str_dup(config->send_directory)
+                                                  : path_cat(config->send_directory, rel);
+  if (fs_path == NULL)
+    return NULL;
+  struct stat st;
+  if (stat(fs_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    free(fs_path);
+    return NULL;
+  }
+  File* file = file_create(fs_path);
+  if (file == NULL) {
+    free(fs_path);
+    return NULL;
+  }
+  file->is_dir = true;
+  file->metadata =
+      file_metadata_create(fs_path, &st, config->preserve_atimes, config->preserve_crtimes);
+  file->send_path = str_dup(rel != NULL ? rel : "");
+  free(fs_path);
+  if (file->metadata == NULL || file->send_path == NULL) {
+    file_destroy(file);
+    return NULL;
+  }
+  return file;
+}
+
+/* The -d/--files-from dirs generator neither traverses nor records directories,
+ * so its metadata walk captures no Files.  Synthesize the transfer root and
+ * every listed/implied directory from `entry_rels` so -i/--out-format emits the
+ * same root and ancestor lines the recursive scan does.  `root_emitted` is true
+ * when the generator itself emits the root entry (bare `-d <dir>`), whose
+ * data-pass line must not be duplicated.  Returns false only on allocation
+ * failure. */
+static bool progress_precount_synthesize_dirs(const Config* config, ProgressPrecount* out,
+                                              const ArrayList* entry_rels, bool root_emitted) {
+  for (int i = 0; i < entry_rels->size; i++) {
+    const char* rel = (const char*)entry_rels->items[i];
+    if (rel == NULL)
+      continue;
+    size_t len = strlen(rel);
+    for (size_t j = 1; j < len; j++) {
+      if (rel[j] != '/')
+        continue;
+      /* --no-implied-dirs: rsync neither creates nor itemizes an implied parent,
+         so only explicitly listed directories get a line. */
+      if (config->no_implied_dirs)
+        break;
+      char* prefix = malloc(j + 1);
+      if (prefix == NULL)
+        return false;
+      memcpy(prefix, rel, j);
+      prefix[j] = '\0';
+      if (!progress_precount_add_dir(out, prefix)) {
+        free(prefix);
+        return false;
+      }
+      free(prefix);
+    }
+  }
+  progress_precount_dedup_dirs(out->dir_paths);
+  for (int i = 0; i < out->dir_paths->size; i++) {
+    const char* rel = (const char*)out->dir_paths->items[i];
+    File* dir = progress_precount_make_dir(config, rel);
+    if (dir == NULL)
+      continue;
+    if (!array_list_add(out->dir_files, dir)) {
+      file_destroy(dir);
+      return false;
+    }
+  }
+  /* Emit the transfer root only when the generator actually emitted an entry:
+     --prune-empty-dirs (or an empty --files-from list) transfers nothing, and
+     rsync prints no root line then either. */
+  if (!root_emitted && entry_rels->size > 0) {
+    File* root = progress_precount_make_dir(config, "");
+    if (root != NULL && !array_list_add(out->dir_files, root)) {
+      file_destroy(root);
+      return false;
+    }
+  }
+  return true;
+}
+
 /* Metadata-only walk collecting the full file-list total and every directory
  * name.  It uses its own scanner (fresh filter compilation and hard-link table)
  * so the data pass's link-group state is never perturbed. */
@@ -689,9 +811,21 @@ static bool progress_precount_scan(const Config* config, ProgressPrecount* out) 
     return false;
   }
   out->total = 0;
+  /* The -d/--files-from dirs generator never calls scanner_capture_dir_time, so
+     the walk below captures no directory Files.  Record every emitted entry's
+     transfer-relative name so the implied ancestors can be synthesized once the
+     walk is done. */
+  bool synthesize = g_change_dirs_active && config->dirs;
+  ArrayList* entry_rels = synthesize ? array_list_create(free) : NULL;
+  if (synthesize && entry_rels == NULL) {
+    progress_precount_dispose(out);
+    return false;
+  }
+  bool root_emitted = false;
   PreparedScanner prepared;
   memset(&prepared, 0, sizeof(prepared));
   if (!prepare_scanner(config, 0, &prepared)) {
+    array_list_delete(entry_rels);
     progress_precount_dispose(out);
     return false;
   }
@@ -722,8 +856,23 @@ static bool progress_precount_scan(const Config* config, ProgressPrecount* out) 
       out->total += (unsigned long long)chunk->element_count;
       for (int i = 0; i < chunk->element_count && ok; i++) {
         const File* f = chunk->items[i];
-        if (f != NULL && f->is_dir)
-          ok = progress_precount_add_dir(out, delete_display_path(config, file_wire_path(f)));
+        if (f == NULL)
+          continue;
+        const char* rel = delete_display_path(config, file_wire_path(f));
+        if (f->is_dir) {
+          if (rel != NULL && rel[0] == '\0')
+            root_emitted = true;
+          ok = progress_precount_add_dir(out, rel);
+          if (!ok)
+            break;
+        }
+        if (synthesize && rel != NULL) {
+          char* dup = str_dup(rel);
+          if (dup == NULL || !array_list_add(entry_rels, dup)) {
+            free(dup);
+            ok = false;
+          }
+        }
       }
       chunk_destroy(chunk);
     }
@@ -733,8 +882,17 @@ static bool progress_precount_scan(const Config* config, ProgressPrecount* out) 
   }
   prepared_scanner_destroy(&prepared);
   if (!ok) {
+    array_list_delete(entry_rels);
     progress_precount_dispose(out);
     return false;
+  }
+  if (synthesize) {
+    bool synth_ok = progress_precount_synthesize_dirs(config, out, entry_rels, root_emitted);
+    array_list_delete(entry_rels);
+    if (!synth_ok) {
+      progress_precount_dispose(out);
+      return false;
+    }
   }
   /* Build the name -> File lookup from the captured directory Files. */
   for (int i = 0; i < out->dir_files->size; i++) {
@@ -821,9 +979,14 @@ void client_progress_prepare(const Config* config, const ArrayList* plan_dirs,
   g_change_dirs_active = config->itemize_changes || config->out_format != NULL;
   if (!g_progress_active && !g_change_dirs_active)
     return;
-  bool ok = plan_dirs != NULL ? progress_precount_from_plan_dirs(
-                                    config, plan_dirs, plan_non_dir_count, &g_progress_precount)
-                              : progress_precount_scan(config, &g_progress_precount);
+  /* -i/--out-format render directory metadata (%M/%B/%U/%G) that only the
+     metadata walk captures; the --delete-during/--delete-delay plan list has no
+     metadata, so prefer the walk whenever a change line is rendered.  Pure
+     --progress keeps reusing the plan list and its cheaper path-only pass. */
+  bool ok = (plan_dirs != NULL && !g_change_dirs_active)
+                ? progress_precount_from_plan_dirs(config, plan_dirs, plan_non_dir_count,
+                                                   &g_progress_precount)
+                : progress_precount_scan(config, &g_progress_precount);
   if (!ok) {
     g_progress_total = 0;
     return;
