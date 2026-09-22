@@ -146,6 +146,6 @@ void delete_skips_free(DeleteSkipSet* set);
 /* Convert one basis-directory path to the receive-root-relative protection
    prefix the delete walker uses (NULL when it lies outside the root).  Exposed
    for unit tests of the root-of-"/" and normalization edge cases. */
-char* file_receive_basis_delete_relative(const Config* config, const char* path);
+char* delete_basis_relative(const Config* config, const char* path);
 
 #endif

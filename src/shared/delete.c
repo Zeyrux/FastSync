@@ -550,7 +550,7 @@ bool delete_extras(const char* dest_root, const ArrayList* manifest) {
    its root-relative form, and one outside the root returns NULL (the walk
    cannot reach it, and it is not protected data beneath the root).  Exposed so
    tests can exercise the root-of-"/" child mapping directly. */
-char* file_receive_basis_delete_relative(const Config* config, const char* path) {
+char* delete_basis_relative(const Config* config, const char* path) {
   if (!path)
     return NULL;
   if (path[0] != '/')
@@ -616,7 +616,7 @@ bool delete_skips_build(const Config* config, const ArrayList* protected_paths,
     if (basis_root_relative) {
       /* An absolute basis outside the receive root is unreachable by this walk,
          so it contributes no protection prefix (and no slot). */
-      char* relative = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
+      char* relative = delete_basis_relative(config, config->basis_dirs[i].path);
       if (!relative)
         continue;
       out->owned_prefixes[i] = relative;

@@ -2255,26 +2255,26 @@ static void test_basis_delete_relative_root_slash() {
   EXPECT_NOT_NULL(cfg);
   cfg->receive_root_directory = str_dup("/");
 
-  char* rel = file_receive_basis_delete_relative(cfg, "/a");
+  char* rel = delete_basis_relative(cfg, "/a");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "a");
   free(rel);
-  rel = file_receive_basis_delete_relative(cfg, "/a/b");
+  rel = delete_basis_relative(cfg, "/a/b");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "a/b");
   free(rel);
   /* The root itself is not a child. */
-  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/"));
+  EXPECT_NULL(delete_basis_relative(cfg, "/"));
   /* A relative entry is already root-relative. */
-  rel = file_receive_basis_delete_relative(cfg, "x/y");
+  rel = delete_basis_relative(cfg, "x/y");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "x/y");
   free(rel);
   /* An absolute path outside a non-"/" root is unreachable. */
   free(cfg->receive_root_directory);
   cfg->receive_root_directory = str_dup("/root");
-  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/other/a"));
-  rel = file_receive_basis_delete_relative(cfg, "/root/a");
+  EXPECT_NULL(delete_basis_relative(cfg, "/other/a"));
+  rel = delete_basis_relative(cfg, "/root/a");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "a");
   free(rel);
