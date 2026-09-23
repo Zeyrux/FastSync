@@ -511,12 +511,30 @@ FilterRuleList* read_dir_filters(const ScannerOptions* options, const char* dir_
   }
   if (base) {
     for (int i = 0; i < base->dir_merge_count; i++) {
-      if (!filter_file_append(own, dir_path, base->dir_merge_names[i], rel, &opts, &exists, err,
-                              err_size))
+      if (!filter_dir_merge_append(own, dir_path, &base->dir_merges[i], rel, &opts, &exists, err,
+                                   err_size))
         goto fail;
       if (exists && any_exists)
         *any_exists = true;
     }
+  }
+  /* Mirror the directory's rules into the delete-carrier sink so the receiver
+   * can reconstruct its per-directory protect/risk set. */
+  if (options->per_dir_rules && own->count > 0) {
+    mtx_t* mtx = options->excluded_mutex;
+    if (mtx)
+      mtx_lock(mtx);
+    for (int i = 0; i < own->count; i++) {
+      FilterRule* copy = filter_rule_clone(own->items[i]);
+      if (!copy || !filter_rule_list_add(options->per_dir_rules, copy)) {
+        filter_rule_free(copy);
+        if (mtx)
+          mtx_unlock(mtx);
+        goto fail;
+      }
+    }
+    if (mtx)
+      mtx_unlock(mtx);
   }
   return own;
 fail:

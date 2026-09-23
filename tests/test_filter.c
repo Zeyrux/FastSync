@@ -1,6 +1,7 @@
 #include "test_filter.h"
 #include "filter.h"
 #include "test_utils.h"
+#include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,44 +65,47 @@ static void test_filter_list_rejects_unsupported_modifiers() {
 }
 
 /* rsync accepts the merge-file modifiers e/n/w/- on merge and dir-merge rules.
- * They must be consumed so they never leak into the merge filename. */
+ * They must be consumed so they never leak into the merge filename, and their
+ * semantics (exclude-self, no-inherit, word-split, no-prefixes) must be
+ * applied while the file is read. */
 static void test_filter_list_accepts_merge_modifiers() {
   char tmpl[] = "/tmp/fastsync_filter_mmod_XXXXXX";
   EXPECT_TRUE(mkdtemp(tmpl) != NULL);
-  char path[512];
-  snprintf(path, sizeof(path), "%s/rules", tmpl);
-  FILE* fp = fopen(path, "w");
+  char prefixed[512];
+  char bare[512];
+  char words[512];
+  snprintf(prefixed, sizeof(prefixed), "%s/prefixed", tmpl);
+  snprintf(bare, sizeof(bare), "%s/bare", tmpl);
+  snprintf(words, sizeof(words), "%s/words", tmpl);
+  FILE* fp = fopen(prefixed, "w");
   EXPECT_NOT_NULL(fp);
   fputs("- *.tmp\n", fp);
   fclose(fp);
+  fp = fopen(bare, "w");
+  EXPECT_NOT_NULL(fp);
+  fputs("*.log\n*.tmp\n", fp);
+  fclose(fp);
+  fp = fopen(words, "w");
+  EXPECT_NOT_NULL(fp);
+  fputs("*.log *.tmp\n", fp);
+  fclose(fp);
 
-  /* merge with e/n/w/- consumes the modifiers and reads the right file. */
-  static const char* const fmts[] = {
-      "merge,e %s", "merge,n %s", "merge,w %s", "merge,- %s", ".e %s", ".- %s",
-  };
-  for (size_t i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
-    FilterRuleList* list = filter_rule_list_create();
-    EXPECT_NOT_NULL(list);
-    char rule[600];
-    char err[256] = "";
-    snprintf(rule, sizeof(rule), fmts[i], path);
-    bool ok = filter_rule_list_parse_append(list, rule, NULL, NULL, err, sizeof(err));
-    if (!ok)
-      printf("    merge rule '%s' errored: %s\n", rule, err);
-    EXPECT_TRUE(ok);
-    EXPECT_EQ_INT(list->count, 1);
-    EXPECT_EQ_STR(list->items[0]->pattern, "*.tmp");
-    filter_rule_list_free(list);
-  }
-
-  /* dir-merge with e/n/w/- registers the basename without the modifiers. */
+  /* dir-merge with e/n/w/- registers the basename without the modifiers and
+   * records the modifier flags; 'e' appends an exclude-self rule. */
   static const struct {
     const char* rule;
     const char* want;
+    bool no_prefixes;
+    bool word_split;
+    bool no_inherit;
+    bool exclude_self;
   } drules[] = {
-      {"dir-merge,e .rules", ".rules"}, {"dir-merge,n .rules", ".rules"},
-      {"dir-merge,w .rules", ".rules"}, {"dir-merge,- .rules", ".rules"},
-      {":e .rules", ".rules"},          {":- .rules", ".rules"},
+      {"dir-merge,e .rules", ".rules", false, false, false, true},
+      {"dir-merge,n .rules", ".rules", false, false, true, false},
+      {"dir-merge,w .rules", ".rules", false, true, false, false},
+      {"dir-merge,- .rules", ".rules", true, false, false, false},
+      {":e .rules", ".rules", false, false, false, true},
+      {":- .rules", ".rules", true, false, false, false},
   };
   for (size_t i = 0; i < sizeof(drules) / sizeof(drules[0]); i++) {
     FilterRuleList* list = filter_rule_list_create();
@@ -112,11 +116,78 @@ static void test_filter_list_accepts_merge_modifiers() {
       printf("    dir-merge rule '%s' errored: %s\n", drules[i].rule, err);
     EXPECT_TRUE(ok);
     EXPECT_EQ_INT(list->dir_merge_count, 1);
-    EXPECT_EQ_STR(list->dir_merge_names[0], drules[i].want);
+    EXPECT_EQ_STR(list->dir_merges[0].name, drules[i].want);
+    EXPECT_EQ_INT(list->dir_merges[0].no_prefixes, drules[i].no_prefixes);
+    EXPECT_EQ_INT(list->dir_merges[0].word_split, drules[i].word_split);
+    EXPECT_EQ_INT(list->dir_merges[0].no_inherit, drules[i].no_inherit);
+    EXPECT_EQ_INT(list->dir_merges[0].exclude_self, drules[i].exclude_self);
+    if (drules[i].exclude_self) {
+      EXPECT_EQ_INT(list->count, 1);
+      EXPECT_EQ_STR(list->items[0]->pattern, ".rules");
+      EXPECT_EQ_INT(list->items[0]->action, FILTER_ACTION_EXCLUDE);
+    } else {
+      EXPECT_EQ_INT(list->count, 0);
+    }
     filter_rule_list_free(list);
   }
 
-  unlink(path);
+  /* merge,n reads the file normally; no-inherit is meaningless for a single
+   * merge so the rule is not marked. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    char err[256] = "";
+    char rule[600];
+    snprintf(rule, sizeof(rule), "merge,n %s", prefixed);
+    EXPECT_TRUE(filter_rule_list_parse_append(list, rule, NULL, NULL, err, sizeof(err)));
+    EXPECT_EQ_INT(list->count, 1);
+    EXPECT_EQ_STR(list->items[0]->pattern, "*.tmp");
+    EXPECT_FALSE(list->items[0]->no_inherit);
+    filter_rule_list_free(list);
+  }
+
+  /* merge,e adds an implicit exclude for the merge file's basename. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    char err[256] = "";
+    char rule[600];
+    snprintf(rule, sizeof(rule), "merge,e %s", prefixed);
+    EXPECT_TRUE(filter_rule_list_parse_append(list, rule, NULL, NULL, err, sizeof(err)));
+    EXPECT_EQ_INT(list->count, 2);
+    EXPECT_EQ_STR(list->items[0]->pattern, "prefixed");
+    EXPECT_EQ_INT(list->items[0]->action, FILTER_ACTION_EXCLUDE);
+    EXPECT_EQ_STR(list->items[1]->pattern, "*.tmp");
+    filter_rule_list_free(list);
+  }
+
+  /* merge,- reads the file as bare exclude patterns with no prefix parsing. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    char err[256] = "";
+    char rule[600];
+    snprintf(rule, sizeof(rule), "merge,- %s", bare);
+    EXPECT_TRUE(filter_rule_list_parse_append(list, rule, NULL, NULL, err, sizeof(err)));
+    EXPECT_EQ_INT(list->count, 2);
+    EXPECT_EQ_STR(list->items[0]->pattern, "*.log");
+    EXPECT_EQ_STR(list->items[1]->pattern, "*.tmp");
+    filter_rule_list_free(list);
+  }
+
+  /* merge,-w word-splits bare patterns on whitespace. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    char err[256] = "";
+    char rule[600];
+    snprintf(rule, sizeof(rule), "merge,w- %s", words);
+    EXPECT_TRUE(filter_rule_list_parse_append(list, rule, NULL, NULL, err, sizeof(err)));
+    EXPECT_EQ_INT(list->count, 2);
+    EXPECT_EQ_STR(list->items[0]->pattern, "*.log");
+    EXPECT_EQ_STR(list->items[1]->pattern, "*.tmp");
+    filter_rule_list_free(list);
+  }
+
+  unlink(prefixed);
+  unlink(bare);
+  unlink(words);
   rmdir(tmpl);
 }
 
@@ -283,6 +354,76 @@ static void test_filter_rules_apply_supported_modifiers() {
   }
 }
 
+static FilterRule* chain_rule(const char* owner, const char* pattern, FilterAction action,
+                              bool no_inherit) {
+  FilterRule* rule = calloc(1, sizeof(FilterRule));
+  if (!rule)
+    return NULL;
+  rule->action = action;
+  rule->sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
+  rule->owner = str_dup(owner);
+  rule->pattern = str_dup(pattern);
+  rule->no_inherit = no_inherit;
+  if (!rule->owner || !rule->pattern) {
+    filter_rule_free(rule);
+    return NULL;
+  }
+  return rule;
+}
+
+/* The receiver's per-directory chain: a containing directory's rules win over
+ * an ancestor's (deepest-first), root rules are inherited, and a no-inherit
+ * rule applies only to its own directory's direct children. */
+static void test_filter_dir_rules_chain(void) {
+  FilterRuleList* list = filter_rule_list_create();
+  EXPECT_NOT_NULL(list);
+  FilterRule* root_log = chain_rule("", "*.log", FILTER_ACTION_EXCLUDE, false);
+  FilterRule* sub_keep = chain_rule("sub", "keep.log", FILTER_ACTION_INCLUDE, false);
+  FilterRule* sub_tmp = chain_rule("sub", "*.tmp", FILTER_ACTION_EXCLUDE, true);
+  EXPECT_NOT_NULL(root_log);
+  EXPECT_NOT_NULL(sub_keep);
+  EXPECT_NOT_NULL(sub_tmp);
+  EXPECT_TRUE(filter_rule_list_add(list, root_log));
+  EXPECT_TRUE(filter_rule_list_add(list, sub_keep));
+  EXPECT_TRUE(filter_rule_list_add(list, sub_tmp));
+
+  /* Root rule inherited by every directory (leaf match). */
+  EXPECT_EQ_INT(filter_dir_rules_apply_side(list, "a.log", "a.log", false), FILTER_ACTION_PROTECT);
+  EXPECT_EQ_INT(filter_dir_rules_apply_side(list, "sub/a.log", "a.log", false),
+                FILTER_ACTION_PROTECT);
+  /* The deeper include overrides the inherited root exclude. */
+  EXPECT_EQ_INT(filter_dir_rules_apply_side(list, "sub/keep.log", "keep.log", false),
+                FILTER_ACTION_RISK);
+  /* No-inherit applies directly in its owner... */
+  EXPECT_EQ_INT(filter_dir_rules_apply_side(list, "sub/x.tmp", "x.tmp", false),
+                FILTER_ACTION_PROTECT);
+  /* ...but not below it. */
+  EXPECT_EQ_INT(filter_dir_rules_apply_side(list, "sub/deep/x.tmp", "x.tmp", false),
+                FILTER_ACTION_NONE);
+  /* No matching rule. */
+  EXPECT_EQ_INT(filter_dir_rules_apply_side(list, "sub/deep/plain.txt", "plain.txt", false),
+                FILTER_ACTION_NONE);
+  filter_rule_list_free(list);
+}
+
+static void test_filter_rule_clone_copies_every_field(void) {
+  char err[128] = "";
+  FilterRule* original = filter_rule_parse("-!p /a/*.o", NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(original);
+  FilterRule* copy = filter_rule_clone(original);
+  EXPECT_NOT_NULL(copy);
+  EXPECT_TRUE(copy != original);
+  EXPECT_EQ_INT(copy->action, original->action);
+  EXPECT_EQ_INT(copy->sides, original->sides);
+  EXPECT_EQ_INT(copy->anchored, original->anchored);
+  EXPECT_EQ_INT(copy->dir_only, original->dir_only);
+  EXPECT_EQ_INT(copy->negate, original->negate);
+  EXPECT_EQ_INT(copy->perishable, original->perishable);
+  EXPECT_EQ_STR(copy->pattern, original->pattern);
+  filter_rule_free(original);
+  filter_rule_free(copy);
+}
+
 void test_filter() {
   test_filter_list_rejects_xattr_modifier();
   test_filter_list_rejects_unsupported_modifiers();
@@ -291,4 +432,6 @@ void test_filter() {
   test_filter_list_merge_file_still_supported();
   test_filter_rule_parse_rejects_unsupported_and_keeps_supported();
   test_filter_rules_apply_supported_modifiers();
+  test_filter_dir_rules_chain();
+  test_filter_rule_clone_copies_every_field();
 }

@@ -48,6 +48,7 @@ struct DeletePlanSender {
   const ArrayList* protected_prefixes;
   const ArrayList* size_skipped;
   const ArrayList* missing_args;
+  const FilterRuleList* per_dir_rules;
   size_t entries;
   /* Transmitted FILE entries only.  The caller's "empty scan" safety guard keys
      off this (an I/O error that hid every file must refuse to delete even when
@@ -284,12 +285,14 @@ bool delete_plan_sender_empty(const DeletePlanSender* sender) {
 }
 
 void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* protected_prefixes,
-                                   const ArrayList* size_skipped, const ArrayList* missing_args) {
+                                   const ArrayList* size_skipped, const ArrayList* missing_args,
+                                   const FilterRuleList* per_dir_rules) {
   if (!sender)
     return;
   sender->protected_prefixes = protected_prefixes;
   sender->size_skipped = size_skipped;
   sender->missing_args = missing_args;
+  sender->per_dir_rules = per_dir_rules;
 }
 
 /* True when `dir` is `root` itself or a descendant of it (path-component
@@ -320,6 +323,160 @@ static int send_str_section(int fd, const ArrayList* list) {
   return 0;
 }
 
+/* The directory a rule belongs to (its owner, or the transfer root for ""). */
+static const char* filter_dir_rule_owner(const FilterRule* rule) {
+  return (rule && rule->owner) ? rule->owner : "";
+}
+
+/* Transmit the received-side per-directory filter rules (protocol 2.30.0) as a
+ * self-describing list of directory groups: a group count, then for each group
+ * the relative owner directory followed by that directory's rule records (run
+ * order = the sender's traversal/rule order).  Rules of one directory are
+ * appended to the sink contiguously, so runs reproduce the compilation order.
+ * Bounded by MAX_FILTER_RULES / MAX_FILTER_BYTES and MAX_PROTECT_PATTERN_LEN so
+ * the peer never sees a frame it would reject. */
+bool delete_filter_dir_rules_send(int fd, const FilterRuleList* rules) {
+  int count = rules ? rules->count : 0;
+  if (count < 0 || count > MAX_FILTER_RULES) {
+    log_message(LOG_LEVEL_ERROR, "too many per-directory filter rules: %d (maximum %d)", count,
+                MAX_FILTER_RULES);
+    return false;
+  }
+  for (int i = 0; i < count; i++) {
+    const FilterRule* rule = rules->items[i];
+    size_t pattern_len = rule && rule->pattern ? strlen(rule->pattern) : 0;
+    if (!rule || !rule->pattern || pattern_len == 0 || pattern_len > MAX_PROTECT_PATTERN_LEN) {
+      log_message(LOG_LEVEL_ERROR, "invalid per-directory filter pattern");
+      return false;
+    }
+  }
+  int groups = 0;
+  for (int i = 0; i < count;) {
+    const char* owner = filter_dir_rule_owner(rules->items[i]);
+    groups++;
+    i++;
+    while (i < count && strcmp(filter_dir_rule_owner(rules->items[i]), owner) == 0)
+      i++;
+  }
+  if (!send_int(fd, groups))
+    return false;
+  for (int i = 0; i < count;) {
+    const char* owner = filter_dir_rule_owner(rules->items[i]);
+    int start = i;
+    i++;
+    while (i < count && strcmp(filter_dir_rule_owner(rules->items[i]), owner) == 0)
+      i++;
+    if (!send_wire_str(fd, owner) || !send_int(fd, i - start))
+      return false;
+    for (int j = start; j < i; j++) {
+      const FilterRule* rule = rules->items[j];
+      if (!send_int(fd, (int)rule->action) || !send_int(fd, (int)rule->sides) ||
+          !send_int(fd, rule->anchored ? 1 : 0) || !send_int(fd, rule->dir_only ? 1 : 0) ||
+          !send_int(fd, rule->negate ? 1 : 0) || !send_int(fd, rule->no_inherit ? 1 : 0) ||
+          !send_wire_str(fd, rule->pattern))
+        return false;
+    }
+  }
+  return true;
+}
+
+/* Read one wire flag (an int restricted to 0/1). */
+static bool receive_flag(int fd, bool* value) {
+  int raw;
+  if (!receive_int(fd, &raw) || (raw != 0 && raw != 1))
+    return false;
+  *value = raw != 0;
+  return true;
+}
+
+/* Read the per-directory filter block emitted by delete_filter_dir_rules_send.
+ * Reconstructs a flat FilterRuleList whose rules carry their owner directory;
+ * `*out` is NULL when the sender transmitted no rules.  Every bound is enforced
+ * (group/rule counts, owner/pattern bytes, pattern length, action/sides domain)
+ * so a malicious peer can neither overread nor allocate unboundedly.  Returns
+ * false on a malformed frame (the caller signals STATUS_ERROR). */
+bool delete_filter_dir_rules_receive(int fd, FilterRuleList** out) {
+  if (!out)
+    return false;
+  *out = NULL;
+  int groups;
+  if (!receive_int(fd, &groups) || groups < 0 || groups > MAX_FILTER_RULES)
+    return false;
+  if (groups == 0)
+    return true;
+  FilterRuleList* list = filter_rule_list_create();
+  if (!list)
+    return false;
+  int total_rules = 0;
+  size_t bytes = 0;
+  for (int g = 0; g < groups; g++) {
+    char* dir = receive_wire_str(fd);
+    if (!dir)
+      goto fail;
+    size_t dir_bytes = strlen(dir);
+    if (!(dir[0] == '\0' || (dir[0] != '/' && !has_path_traversal(dir))) ||
+        dir_bytes > MAX_FILTER_BYTES - bytes) {
+      free(dir);
+      goto fail;
+    }
+    bytes += dir_bytes;
+    int rule_count;
+    if (!receive_int(fd, &rule_count) || rule_count < 0 || rule_count > MAX_FILTER_RULES ||
+        rule_count > MAX_FILTER_RULES - total_rules) {
+      free(dir);
+      goto fail;
+    }
+    for (int r = 0; r < rule_count; r++) {
+      int action, sides;
+      bool anchored, dir_only, negate, no_inherit;
+      if (!receive_int(fd, &action) ||
+          (action != FILTER_ACTION_EXCLUDE && action != FILTER_ACTION_INCLUDE) ||
+          !receive_int(fd, &sides) || sides < (int)FILTER_SIDE_SENDER ||
+          sides > (int)(FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER) ||
+          !receive_flag(fd, &anchored) || !receive_flag(fd, &dir_only) ||
+          !receive_flag(fd, &negate) || !receive_flag(fd, &no_inherit)) {
+        free(dir);
+        goto fail;
+      }
+      char* pattern = receive_wire_str(fd);
+      size_t pattern_bytes = pattern ? strlen(pattern) : 0;
+      if (!pattern || pattern_bytes == 0 || pattern_bytes > MAX_PROTECT_PATTERN_LEN ||
+          pattern_bytes > MAX_FILTER_BYTES - bytes) {
+        free(pattern);
+        free(dir);
+        goto fail;
+      }
+      bytes += pattern_bytes;
+      FilterRule* rule = calloc(1, sizeof(FilterRule));
+      if (!rule) {
+        free(pattern);
+        free(dir);
+        goto fail;
+      }
+      rule->action = (FilterAction)action;
+      rule->sides = (unsigned)sides;
+      rule->anchored = anchored;
+      rule->dir_only = dir_only;
+      rule->negate = negate;
+      rule->no_inherit = no_inherit;
+      rule->owner = str_dup(dir);
+      rule->pattern = pattern;
+      if (!rule->owner || !filter_rule_list_add(list, rule)) {
+        filter_rule_free(rule);
+        free(dir);
+        goto fail;
+      }
+      total_rules++;
+    }
+    free(dir);
+  }
+  *out = list;
+  return true;
+fail:
+  filter_rule_list_free(list);
+  return false;
+}
+
 static int send_plan_node(int fd, DeletePlanSender* sender, PlanNode* node) {
   if (!send_status(fd, STATUS_DELETE_PLAN))
     return -1;
@@ -328,7 +485,8 @@ static int send_plan_node(int fd, DeletePlanSender* sender, PlanNode* node) {
   if (!sender->config_sent) {
     if (send_str_section(fd, sender->protected_prefixes) != 0 ||
         send_str_section(fd, sender->size_skipped) != 0 ||
-        send_str_section(fd, sender->missing_args) != 0)
+        send_str_section(fd, sender->missing_args) != 0 ||
+        !delete_filter_dir_rules_send(fd, sender->per_dir_rules))
       return -1;
     sender->config_sent = true;
   }
@@ -355,7 +513,8 @@ static int send_config_only(int fd, DeletePlanSender* sender) {
     return -1;
   if (send_str_section(fd, sender->protected_prefixes) != 0 ||
       send_str_section(fd, sender->size_skipped) != 0 ||
-      send_str_section(fd, sender->missing_args) != 0)
+      send_str_section(fd, sender->missing_args) != 0 ||
+      !delete_filter_dir_rules_send(fd, sender->per_dir_rules))
     return -1;
   sender->config_sent = true;
   if (!send_int(fd, 0)) /* apply = false */
@@ -472,6 +631,10 @@ struct DeletePlanSession {
   ArrayList* protected_prefixes;
   ArrayList* size_skipped;
   ArrayList* missing;
+  /* Received per-directory filter rules (protocol 2.30.0), or NULL.  Evaluated
+     deepest-directory-first for every candidate extra so a destination-only
+     entry matching only a per-directory rule is protected. */
+  FilterRuleList* per_dir_rules;
   ArrayList* deferred;
   DeletePathObserver observer;
   void* observer_context;
@@ -532,6 +695,7 @@ void delete_plan_session_destroy(DeletePlanSession* session) {
   array_list_delete(session->protected_prefixes);
   array_list_delete(session->size_skipped);
   array_list_delete(session->missing);
+  filter_rule_list_free(session->per_dir_rules);
   array_list_delete(session->deferred);
   free(session);
 }
@@ -604,16 +768,18 @@ static int open_plan_dir(const Config* config, const char* dir) {
 
 typedef struct {
   DeleteSkipSet set;
-  /* Receiver-side delete-protection rules received on the config frame (NULL
-     when the sender sent none).  Evaluated per extra so a protect/risk rule is
+  /* Receiver-side delete-protection rules.  `base` is the config-frame
+     command-line set and `dir` the received per-directory set (both NULL when
+     the sender sent none).  Evaluated per extra so a protect/risk rule is
      honored under --delete-during/--delete-delay exactly like the whole-tree
      commit walker. */
-  const FilterRuleList* protect_rules;
+  DeleteProtectRules protect;
 } PlanSkips;
 
 static bool build_plan_skips(const Config* config, const DeletePlanSession* session,
                              PlanSkips* out) {
-  out->protect_rules = config->protect_rules;
+  out->protect.base_rules = config->protect_rules;
+  out->protect.dir_rules = session->per_dir_rules;
   /* The per-directory plan walk keeps each basis path verbatim (it does not
      convert an absolute under-root path to its root-relative form, unlike the
      whole-tree commit walk). */
@@ -778,10 +944,8 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
     bool is_dir = entries[i].is_dir;
     bool in_keep_dirs = is_dir && list_contains_str(keep_dirs, entries[i].name);
     bool in_keep_files = !is_dir && list_contains_str(keep_files, entries[i].name);
-    bool rule_protected =
-        skips->protect_rules &&
-        filter_rules_apply_side(skips->protect_rules, child_rel, entries[i].name, is_dir,
-                                FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT;
+    bool rule_protected = delete_protect_verdict(&skips->protect, child_rel, entries[i].name,
+                                                 is_dir) == FILTER_ACTION_PROTECT;
     if (in_keep_dirs || in_keep_files || rule_protected) {
       shielded[i] = true;
       local_survives = true;
@@ -903,7 +1067,8 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
   if (has_config) {
     if (session->config_seen || !read_section(fd, session->protected_prefixes, true, &bytes) ||
         !read_section(fd, session->size_skipped, true, &bytes) ||
-        !read_section(fd, session->missing, true, &bytes)) {
+        !read_section(fd, session->missing, true, &bytes) ||
+        !delete_filter_dir_rules_receive(fd, &session->per_dir_rules)) {
       send_status(fd, STATUS_ERROR);
       return -1;
     }

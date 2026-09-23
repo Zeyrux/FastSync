@@ -1033,7 +1033,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
        and wait for the receiver to delete extras before streaming any data. */
     if (!send_delete_manifest_early(client, context->manifest, context->excluded_paths,
                                     context->size_skipped_paths, context->missing_args,
-                                    context->synced_dirs)) {
+                                    context->synced_dirs, context->per_dir_rules)) {
       pipeline_cancel(context);
       disconnect_transfer_client(client);
       mark_sender_done(context);
@@ -1163,7 +1163,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
     } else if (send_delete_manifest(client->file_descriptor, context->manifest,
                                     context->excluded_paths, context->size_skipped_paths,
-                                    context->missing_args, context->synced_dirs) != 0) {
+                                    context->missing_args, context->synced_dirs,
+                                    context->per_dir_rules) != 0) {
       goto send_fail;
     }
   } else if (context->config->delete_missing_args && !context->early_delete &&
@@ -1171,7 +1172,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     /* --delete-missing-args without --delete: no keep-set is built, but the
        exact-delete paths still ride the same manifest frame (commit once the
        transfer succeeded). */
-    if (send_delete_manifest(client->file_descriptor, NULL, NULL, NULL, context->missing_args,
+    if (send_delete_manifest(client->file_descriptor, NULL, NULL, NULL, context->missing_args, NULL,
                              NULL) != 0)
       goto send_fail;
   }
@@ -1285,6 +1286,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
      its protected lists, so the data pass must not append to them again. */
   if (!context->early_delete && !context->delete_plans) {
     prepared.options.excluded_paths = context->excluded_paths;
+    prepared.options.per_dir_rules = context->per_dir_rules;
     /* The root marker for a full recursive transfer is already in the list; do
        not let the scanner append every directory to it. */
     if (context->config->files_from_set != NULL)
@@ -1518,6 +1520,8 @@ typedef struct {
   ArrayList* synced_dirs;
   ArrayList* plan_dirs;
   ArrayList* missing_args;
+  /* Per-directory filter rules compiled by the scan (protocol 2.30.0). */
+  FilterRuleList* per_dir_rules;
   PreparedScanner prepared;
   StopCondition stop;
   TransferStats transfer_stats;
@@ -1562,9 +1566,11 @@ static bool send_files_prepare(Config* config, SendFilesState* state) {
     }
     state->size_skipped = array_list_create(free);
     state->synced_dirs = array_list_create(free);
-    if (!state->size_skipped || !state->synced_dirs)
+    state->per_dir_rules = filter_rule_list_create();
+    if (!state->size_skipped || !state->synced_dirs || !state->per_dir_rules)
       return false;
     state->prepared.options.size_skipped_paths = state->size_skipped;
+    state->prepared.options.per_dir_rules = state->per_dir_rules;
     /* Only a --files-from subset confines the extras walk to the directories
        the scan synchronized; a full recursive transfer deletes throughout the
        receive root, so mark the root itself (the "." sentinel) and let the
@@ -1629,9 +1635,9 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
         log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
         skip_delete = true;
       } else {
-        early_ok =
-            send_delete_manifest_early(client, early_manifest, state->excluded, state->size_skipped,
-                                       state->missing_args, state->synced_dirs);
+        early_ok = send_delete_manifest_early(client, early_manifest, state->excluded,
+                                              state->size_skipped, state->missing_args,
+                                              state->synced_dirs, state->per_dir_rules);
       }
     }
     array_list_delete(early_manifest);
@@ -1640,6 +1646,7 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
     state->prepared.options.excluded_paths = NULL;
     state->prepared.options.size_skipped_paths = NULL;
     state->prepared.options.synced_dirs = NULL;
+    state->prepared.options.per_dir_rules = NULL;
     if (!prescan_ok || (!early_ok && !skip_delete)) {
       array_list_delete(prescan_chunks);
       return false;
@@ -1669,7 +1676,7 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
           config->files_from_set ? state->synced_dirs : (walk_root ? state->synced_dirs : NULL);
       delete_plan_sender_finalize(state->plan_sender, scope, walk_root);
       delete_plan_sender_set_config(state->plan_sender, state->excluded, state->size_skipped,
-                                    state->missing_args);
+                                    state->missing_args, state->per_dir_rules);
       if (state->had_scan_io && delete_plan_sender_empty(state->plan_sender)) {
         log_message(LOG_LEVEL_ERROR,
                     "source scan hit an I/O error before finding any file; refusing to delete "
@@ -1693,6 +1700,7 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
     state->prepared.options.size_skipped_paths = NULL;
     state->prepared.options.synced_dirs = NULL;
     state->prepared.options.plan_dirs = NULL;
+    state->prepared.options.per_dir_rules = NULL;
     if (!prescan_ok || (!plans_ok && !skip_delete))
       return false;
   } else if (config->use_delete) {
@@ -1874,7 +1882,8 @@ static int send_files_finalize(const Config* config, SendFilesState* state) {
          modes the deletion already went out with the data, so nothing is
          re-sent here. */
       if (send_delete_manifest(client->file_descriptor, state->manifest, state->excluded,
-                               state->size_skipped, state->missing_args, state->synced_dirs) != 0) {
+                               state->size_skipped, state->missing_args, state->synced_dirs,
+                               state->per_dir_rules) != 0) {
         if (state->manifest) {
           array_list_delete(state->manifest);
           state->manifest = NULL;
@@ -1949,6 +1958,8 @@ static void send_files_cleanup(SendFilesState* state) {
     array_list_delete(state->plan_dirs);
   if (state->missing_args)
     array_list_delete(state->missing_args);
+  if (state->per_dir_rules)
+    filter_rule_list_free(state->per_dir_rules);
   if (state->remove_sources)
     array_list_delete(state->remove_sources);
   if (state->dir_entries)
@@ -2130,7 +2141,8 @@ static int send_files_multithreaded_impl(Config* config) {
        confined; only a --files-from subset records concrete directories. */
     context->size_skipped_paths = array_list_create(free);
     context->synced_dirs = array_list_create(free);
-    if (!context->size_skipped_paths || !context->synced_dirs) {
+    context->per_dir_rules = filter_rule_list_create();
+    if (!context->size_skipped_paths || !context->synced_dirs || !context->per_dir_rules) {
       pipeline_context_sender_destroy(context);
       return 1;
     }
@@ -2159,6 +2171,7 @@ static int send_files_multithreaded_impl(Config* config) {
         if (context->excluded_paths)
           prepared.options.excluded_paths = context->excluded_paths;
         prepared.options.size_skipped_paths = context->size_skipped_paths;
+        prepared.options.per_dir_rules = context->per_dir_rules;
         /* The root marker for a full recursive transfer is already in the list;
            only a --files-from subset needs the scanner to record directories. */
         if (config->files_from_set != NULL)
@@ -2199,7 +2212,8 @@ static int send_files_multithreaded_impl(Config* config) {
                                                         : (walk_root ? context->synced_dirs : NULL);
         delete_plan_sender_finalize(context->delete_plans, scope, walk_root);
         delete_plan_sender_set_config(context->delete_plans, context->excluded_paths,
-                                      context->size_skipped_paths, context->missing_args);
+                                      context->size_skipped_paths, context->missing_args,
+                                      context->per_dir_rules);
       }
       bool empty = per_dir
                        ? (context->delete_plans && delete_plan_sender_empty(context->delete_plans))

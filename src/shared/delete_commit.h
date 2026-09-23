@@ -4,6 +4,7 @@
 #include "array_list.h"
 #include "config.h"
 #include "delete.h"
+#include "filter.h"
 #include <stdbool.h>
 
 /* Delete-commit module: delete-manifest receive plus the budgeted extras and
@@ -30,6 +31,13 @@ typedef struct DeleteManifest {
      leave untransmitted directories and the unlisted parts of listed ones
      alone, matching rsync's "delete only in synchronized directories". */
   ArrayList* dirs;
+  /* Per-directory filter rules the sender compiled while scanning (protocol
+     2.30.0), each carrying its owner directory and no-inherit flag.  The
+     receiver evaluates them (deepest before ancestors, then the command-line
+     base rules) against every candidate extra so a destination-only entry that
+     matches ONLY a per-directory `.rsync-filter`/dir-merge rule is shielded.
+     NULL when the sender transmitted none. */
+  FilterRuleList* per_dir_rules;
 } DeleteManifest;
 
 void delete_manifest_free(DeleteManifest* manifest);

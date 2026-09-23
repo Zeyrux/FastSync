@@ -115,6 +115,13 @@ typedef struct {
    * directories, exactly like rsync; the receive root is the "." sentinel.
    * Guarded by `excluded_mutex`. */
   ArrayList* synced_dirs;
+  /* Per-directory filter-rule sink (optional): when non-NULL the scanner appends
+   * a deep copy of every rule it reads from a per-directory merge file, each
+   * carrying its owner directory and no-inherit flag (see filter.h).  The delete
+   * carriers transmit them so the receiver re-derives the per-directory
+   * protect/risk set for destination-only entries.  Guarded by `excluded_mutex`
+   * like the other sinks. */
+  FilterRuleList* per_dir_rules;
   /* Delete-plan directory sink (optional): when non-NULL the scanner appends
    * the destination-relative path of every directory it traverses (except the
    * receive root).  The per-directory --delete-during/--delete-delay plan

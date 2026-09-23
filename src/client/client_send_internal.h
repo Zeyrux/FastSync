@@ -102,9 +102,10 @@ int send_dry_run_manifest(const Config* config);
 int send_list_only(const Config* config);
 int send_dry_run_remote(Config* config);
 int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes,
-                         ArrayList* size_skipped, ArrayList* missing_args, ArrayList* synced_dirs);
+                         ArrayList* size_skipped, ArrayList* missing_args, ArrayList* synced_dirs,
+                         const FilterRuleList* per_dir_rules);
 bool send_delete_manifest_early(Client* client, ArrayList* manifest, ArrayList* protected_prefixes,
                                 ArrayList* size_skipped, ArrayList* missing_args,
-                                ArrayList* synced_dirs);
+                                ArrayList* synced_dirs, const FilterRuleList* per_dir_rules);
 
 #endif

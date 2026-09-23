@@ -3,6 +3,7 @@
 
 #include "array_list.h"
 #include "config.h"
+#include "filter.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/stat.h>
@@ -28,6 +29,24 @@ typedef enum {
      possible, mirroring the delete pass). */
   DELETE_WALK_ERROR
 } DeleteWalkResult;
+
+/* Receiver-side delete-protection rules for one walk.  `base_rules` is the
+ * command-line rule set the config frame carried (owner "" rules); `dir_rules`
+ * is the received per-directory rule set (rules carrying their owner directory
+ * and no-inherit flag).  Either may be NULL. */
+typedef struct {
+  const FilterRuleList* base_rules;
+  const FilterRuleList* dir_rules;
+} DeleteProtectRules;
+
+/* rsync's first-match-wins receiver verdict for one candidate extra: the
+ * per-directory chain is evaluated first (the containing directory's rules,
+ * then each ancestor's, then the receive root's), then the base rules.  Returns
+ * FILTER_ACTION_PROTECT when the entry is shielded by a receiver-side exclude,
+ * FILTER_ACTION_RISK when an include explicitly leaves it at risk, or
+ * FILTER_ACTION_NONE when no rule matched. */
+FilterAction delete_protect_verdict(const DeleteProtectRules* protect, const char* rel_path,
+                                    const char* leaf, bool is_dir);
 
 /* One protected entry for the delete walker.  When top_level_only is true the
    prefix is skipped only as a DIRECT child of dest_root (the --delay-updates
@@ -100,7 +119,7 @@ int delete_dir_entry_cmp_asc(const void* a, const void* b);
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,
-                                       const FilterRuleList* protect_rules, size_t* deleted_out,
+                                       const DeleteProtectRules* protect, size_t* deleted_out,
                                        size_t* skipped_out);
 
 /* Entry kind of a removed path, reported to the delete observer so the receiver
@@ -124,14 +143,14 @@ DeleteEntryType delete_entry_type_of_mode(mode_t mode);
 
 /* `delete_extras_limited_observed` is delete_extras_limited with an optional
  * observer; the observer is invoked only for entries truly removed.  When
- * `protect_rules` is non-NULL its receiver-side verdict is evaluated for every
+ * `protect` is non-NULL its receiver-side verdict is evaluated for every
  * candidate extra: a first-match PROTECT leaves the entry (and, for a
  * directory, its whole subtree) in place, while RISK/NONE fall through to the
  * ordinary skip-prefix/keep-set logic. */
 DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
                                                 const ArrayList* synced_dirs, size_t max_delete,
                                                 const DeleteSkipEntry* skips, int skip_count,
-                                                const FilterRuleList* protect_rules,
+                                                const DeleteProtectRules* protect,
                                                 size_t* deleted_out, size_t* skipped_out,
                                                 DeletePathObserver observer,
                                                 void* observer_context);
@@ -142,7 +161,7 @@ DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const Arr
    strings appended to `out` and receives their count in *count_out. */
 bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
                         const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
-                        const FilterRuleList* protect_rules, ArrayList* out, size_t* count_out);
+                        const DeleteProtectRules* protect, ArrayList* out, size_t* count_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
 
 /* Build the delete walk's skip-prefix set from the config's --delay-updates

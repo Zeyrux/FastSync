@@ -536,3 +536,78 @@ class TestFilterProtect:
         assert "extra.log" not in result.stdout, result.stdout
         assert os.path.exists(os.path.join(received, "extra.log"))
         assert os.path.exists(os.path.join(received, "other.txt"))
+
+    @pytest.mark.ci
+    def test_perdir_protect_dest_only_matches_rsync(self):
+        """#315: a `P` rule inside a per-directory `.rsync-filter` is carried to
+        the receiver, so a destination-only extra matching ONLY that rule is
+        shielded under --delete.  Both roots carry the same filter file (rsync's
+        receiver reads the destination one; FastSync carries the source's)."""
+        source = os.path.join(TEST_DATA_DIR, "fpdp_src")
+        dest = os.path.join(TEST_DATA_DIR, "fpdp_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "fpdp_rdst")
+        clean_dir(source)
+        _write(os.path.join(source, "keep.txt"), b"keep\n")
+        _write(os.path.join(source, ".rsync-filter"), b"P extra.log\n")
+        clean_dir(rdst)
+        _write(os.path.join(rdst, ".rsync-filter"), b"P extra.log\n")
+        _write(os.path.join(rdst, "extra.log"), b"extra\n")
+        _write(os.path.join(rdst, "other.txt"), b"other\n")
+
+        rsync_result = _rsync(["-aF", "--delete", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        assert os.path.exists(os.path.join(rdst, "extra.log")), "rsync did not protect extra.log"
+        assert not os.path.exists(os.path.join(rdst, "other.txt"))
+
+        clean_dir(dest)
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(received, exist_ok=True)
+        _write(os.path.join(received, ".rsync-filter"), b"P extra.log\n")
+        _write(os.path.join(received, "extra.log"), b"extra\n")
+        _write(os.path.join(received, "other.txt"), b"other\n")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["-aF", "--delete"], port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert os.path.exists(os.path.join(received, "extra.log")), (
+            "FastSync must protect a destination-only per-directory P match like rsync")
+        assert not os.path.exists(os.path.join(received, "other.txt"))
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_perdir_protect_dry_run_enumeration(self, shared_server):
+        """#315: the -n/--dry-run would-delete enumeration also honors the
+        carried per-directory rules, matching rsync's `*deleting` set: a
+        destination-only entry matching only a `.rsync-filter` P rule is not
+        reported (nor removed)."""
+        source = os.path.join(TEST_DATA_DIR, "fpdp_nd_src")
+        dest = os.path.join(TEST_DATA_DIR, "fpdp_nd_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "fpdp_nd_rdst")
+        clean_dir(source)
+        _write(os.path.join(source, "keep.txt"), b"keep\n")
+        _write(os.path.join(source, ".rsync-filter"), b"P extra.log\n")
+        received = get_dest_received_dir(dest, source)
+        clean_dir(rdst)
+        clean_dir(received)
+        for root in (rdst, received):
+            _write(os.path.join(root, "keep.txt"), b"keep\n")
+            _write(os.path.join(root, ".rsync-filter"), b"P extra.log\n")
+            _write(os.path.join(root, "extra.log"), b"extra\n")
+            _write(os.path.join(root, "other.txt"), b"other\n")
+
+        rsync_result = _rsync(["-an", "-i", "-F", "--delete", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        rsync_del = sorted(l for l in rsync_result.stdout.splitlines()
+                           if l.startswith("*deleting"))
+        assert rsync_del == ["*deleting   other.txt"], f"unexpected rsync set: {rsync_del}"
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["-aF", "-n", "-i", "--delete"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        fs_del = sorted(l for l in (result.stdout or "").splitlines()
+                        if l.startswith("*deleting"))
+        assert fs_del == rsync_del, f"rsync={rsync_del}\nfastsync={fs_del}"
+        assert os.path.exists(os.path.join(received, "extra.log"))
+        assert os.path.exists(os.path.join(received, "other.txt"))

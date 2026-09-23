@@ -11,6 +11,8 @@
 /* Write a diagnostic message into the caller's optional buffer. */
 #define filter_set_error utils_set_error
 
+static bool set_rule_owner(FilterRule* rule, const char* owner);
+
 /* ---- Ordered rule lists ---- */
 
 void filter_rule_free(FilterRule* rule) {
@@ -19,6 +21,28 @@ void filter_rule_free(FilterRule* rule) {
   free(rule->pattern);
   free(rule->owner);
   free(rule);
+}
+
+FilterRule* filter_rule_clone(const FilterRule* rule) {
+  if (!rule)
+    return NULL;
+  FilterRule* copy = calloc(1, sizeof(FilterRule));
+  if (!copy)
+    return NULL;
+  copy->action = rule->action;
+  copy->sides = rule->sides;
+  copy->anchored = rule->anchored;
+  copy->dir_only = rule->dir_only;
+  copy->negate = rule->negate;
+  copy->perishable = rule->perishable;
+  copy->no_inherit = rule->no_inherit;
+  copy->owner = str_dup(rule->owner ? rule->owner : "");
+  copy->pattern = str_dup(rule->pattern ? rule->pattern : "");
+  if (!copy->owner || !copy->pattern) {
+    filter_rule_free(copy);
+    return NULL;
+  }
+  return copy;
 }
 
 FilterRuleList* filter_rule_list_create(void) {
@@ -48,33 +72,76 @@ void filter_rule_list_free(FilterRuleList* list) {
   for (int i = 0; i < list->count; i++)
     filter_rule_free(list->items[i]);
   for (int i = 0; i < list->dir_merge_count; i++)
-    free(list->dir_merge_names[i]);
-  free(list->dir_merge_names);
+    free(list->dir_merges[i].name);
+  free(list->dir_merges);
   free(list->items);
   free(list);
+}
+
+/* Append an implicit exclude rule for the merge file itself (rsync's 'e'
+ * modifier).  The rule is owned by the transfer root and matches the basename
+ * anywhere, exactly like rsync's EXCLUDE_SELF (a dual-sided exclude: it hides
+ * the file and protects its destination mirror from --delete). */
+static bool filter_list_add_exclude_self(FilterRuleList* list, const char* name) {
+  const char* base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  if (base[0] == '\0')
+    return true;
+  FilterRule* rule = calloc(1, sizeof(FilterRule));
+  if (!rule)
+    return false;
+  rule->action = FILTER_ACTION_EXCLUDE;
+  rule->sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
+  rule->pattern = str_dup(base);
+  if (!rule->pattern || !set_rule_owner(rule, "")) {
+    filter_rule_free(rule);
+    return false;
+  }
+  if (!filter_rule_list_add(list, rule)) {
+    filter_rule_free(rule);
+    return false;
+  }
+  return true;
 }
 
 /* Register a per-directory merge-file basename (for "dir-merge NAME"/": NAME"
  * and -F's .rsync-filter).  Duplicate names are ignored. */
 bool filter_rule_list_add_dir_merge(FilterRuleList* list, const char* name) {
+  return filter_rule_list_add_dir_merge_ex(list, name, false, false, false, false, false);
+}
+
+bool filter_rule_list_add_dir_merge_ex(FilterRuleList* list, const char* name, bool no_prefixes,
+                                       bool include, bool word_split, bool no_inherit,
+                                       bool exclude_self) {
   if (!list || !name || name[0] == '\0')
     return false;
   for (int i = 0; i < list->dir_merge_count; i++) {
-    if (strcmp(list->dir_merge_names[i], name) == 0)
+    if (strcmp(list->dir_merges[i].name, name) == 0)
       return true;
   }
   if (list->dir_merge_count == list->dir_merge_capacity) {
     int new_cap = list->dir_merge_capacity > 0 ? list->dir_merge_capacity * 2 : 4;
-    char** grown = realloc(list->dir_merge_names, (size_t)new_cap * sizeof(char*));
+    FilterDirMerge* grown = realloc(list->dir_merges, (size_t)new_cap * sizeof(*grown));
     if (!grown)
       return false;
-    list->dir_merge_names = grown;
+    list->dir_merges = grown;
     list->dir_merge_capacity = new_cap;
   }
   char* dup = str_dup(name);
   if (!dup)
     return false;
-  list->dir_merge_names[list->dir_merge_count++] = dup;
+  if (exclude_self && !filter_list_add_exclude_self(list, name)) {
+    free(dup);
+    return false;
+  }
+  FilterDirMerge* entry = &list->dir_merges[list->dir_merge_count];
+  entry->name = dup;
+  entry->no_prefixes = no_prefixes;
+  entry->include = include;
+  entry->word_split = word_split;
+  entry->no_inherit = no_inherit;
+  entry->exclude_self = exclude_self;
+  list->dir_merge_count++;
   return true;
 }
 
@@ -177,10 +244,11 @@ static bool is_unsupported_modifier_char(char c) {
   return c == 'e' || c == 'n' || c == 'w';
 }
 
-/* Merge-file modifiers rsync accepts on merge/dir-merge rules: 'e', 'n', 'w'
- * and '-' (do not transfer the merge file). */
+/* Merge-file modifiers rsync accepts on merge/dir-merge rules: 'e' (exclude
+ * self), 'n' (no inherit), 'w' (word split), '-' (bare excludes) and '+'
+ * (bare includes). */
 static bool is_merge_modifier_char(char c) {
-  return c == 'e' || c == 'n' || c == 'w' || c == '-';
+  return c == 'e' || c == 'n' || c == 'w' || c == '-' || c == '+';
 }
 
 /* Characters that count as part of a modifier run for `kind` when deciding
@@ -228,8 +296,10 @@ static char unsupported_modifier_in_token(const char* tok, RuleKind kind) {
  * generic syntax error so callers can emit a precise diagnostic. */
 static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
                               bool* sides_explicit, bool* negate, bool* anchored_mod,
-                              bool* perishable, bool* xattr, bool* cvs_inject,
-                              const char** pat_start, size_t* pat_len, char* bad_mod) {
+                              bool* perishable, bool* xattr, bool* cvs_inject, bool* no_prefixes,
+                              bool* include_defaults, bool* word_split, bool* no_inherit,
+                              bool* exclude_self, const char** pat_start, size_t* pat_len,
+                              char* bad_mod) {
   const char* p = text;
   *sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
   *sides_explicit = false;
@@ -238,6 +308,11 @@ static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
   *perishable = false;
   *xattr = false;
   *cvs_inject = false;
+  *no_prefixes = false;
+  *include_defaults = false;
+  *word_split = false;
+  *no_inherit = false;
+  *exclude_self = false;
   *pat_start = NULL;
   *pat_len = 0;
   *bad_mod = '\0';
@@ -312,6 +387,21 @@ static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
     case 'C':
       *cvs_inject = true;
       break;
+    case '-':
+      *no_prefixes = true;
+      break;
+    case '+':
+      *include_defaults = true;
+      break;
+    case 'e':
+      *exclude_self = true;
+      break;
+    case 'n':
+      *no_inherit = true;
+      break;
+    case 'w':
+      *word_split = true;
+      break;
     default:
       break;
     }
@@ -347,11 +437,13 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
   RuleKind kind = RULE_KIND_UNKNOWN;
   unsigned sides;
   bool sides_explicit, negate, anchored_mod, perishable, xattr, cvs_inject;
+  bool no_prefixes, include_defaults, word_split, no_inherit, exclude_self;
   const char* pat;
   size_t pat_len;
   char bad_mod;
   if (!parse_rule_syntax(p, &kind, &sides, &sides_explicit, &negate, &anchored_mod, &perishable,
-                         &xattr, &cvs_inject, &pat, &pat_len, &bad_mod)) {
+                         &xattr, &cvs_inject, &no_prefixes, &include_defaults, &word_split,
+                         &no_inherit, &exclude_self, &pat, &pat_len, &bad_mod)) {
     if (bad_mod != '\0')
       filter_set_error(err, err_size, "unsupported filter modifier '%c'", bad_mod);
     else
@@ -522,14 +614,128 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
                                            const FilterParseOptions* opts, const char* base_dir,
                                            int depth, char* err, size_t err_size);
 
-/* Read a merge file and splice its rules into `list`.  A relative path is
- * resolved below `base_dir` when given, else used as-is (rsync resolves a
- * command-line merge file relative to the current directory). */
+/* Append one merge-file token/line to `list`, honoring the merge rule's
+ * no-prefix/include mode.  In no-prefix mode the token is a bare pattern whose
+ * include/exclude default comes from the merge rule (rsync's "-"/"+" merge
+ * modifiers); otherwise the token is parsed as a full filter rule. */
+static bool filter_merge_append_token(FilterRuleList* list, const char* token,
+                                      const FilterDirMerge* spec, const FilterParseOptions* opts,
+                                      const char* base_dir, int depth, char* err, size_t err_size) {
+  if (spec->no_prefixes || spec->include) {
+    size_t tlen = strlen(token);
+    char* text = malloc(tlen + 3);
+    if (!text) {
+      filter_set_error(err, err_size, "memory allocation failed");
+      return false;
+    }
+    text[0] = spec->include ? '+' : '-';
+    text[1] = ' ';
+    memcpy(text + 2, token, tlen + 1);
+    bool ok = filter_list_parse_append_depth(list, text, opts, base_dir, depth + 1, err, err_size);
+    free(text);
+    return ok;
+  }
+  return filter_list_parse_append_depth(list, token, opts, base_dir, depth + 1, err, err_size);
+}
+
+/* Read a merge file's tokens/lines into `list` for `spec`.  A `w` merge rule
+ * word-splits on whitespace (turning comments off); otherwise lines are parsed
+ * and whole-line `#` comments skipped.  When `owner_rel` is non-NULL the newly
+ * added rules are owned by that directory; a no-inherit spec marks them so they
+ * apply only there.  Returns false on parse/allocation failure. */
+static bool filter_merge_read(FilterRuleList* list, FILE* fp, const char* display_path,
+                              const FilterDirMerge* spec, const FilterParseOptions* opts,
+                              const char* base_dir, const char* owner_rel, int depth, char* err,
+                              size_t err_size) {
+  int rules_before = list->count;
+  char* line = NULL;
+  size_t cap = 0;
+  bool ok = true;
+  while (ok) {
+    ssize_t n = utils_getdelim_bounded(fp, &line, &cap, '\n', UTILS_MAX_LINE_LEN);
+    if (n < 0) {
+      if (errno == EFBIG)
+        filter_set_error(err, err_size, "line in %s exceeds %d bytes", display_path,
+                         (int)UTILS_MAX_LINE_LEN);
+      else
+        filter_set_error(err, err_size, "error reading %s: %s", display_path, strerror(errno));
+      ok = false;
+      break;
+    }
+    if (n == 0)
+      break;
+    if (spec->word_split) {
+      /* Whitespace-separated tokens; newlines are ordinary separators and
+       * comments are disabled. */
+      const char* s = line;
+      while (*s) {
+        while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+          s++;
+        if (*s == '\0')
+          break;
+        const char* start = s;
+        while (*s != '\0' && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r')
+          s++;
+        size_t tlen = (size_t)(s - start);
+        char* token = malloc(tlen + 1);
+        if (!token) {
+          filter_set_error(err, err_size, "memory allocation failed");
+          ok = false;
+          break;
+        }
+        memcpy(token, start, tlen);
+        token[tlen] = '\0';
+        if (!filter_merge_append_token(list, token, spec, opts, base_dir, depth, err, err_size))
+          ok = false;
+        free(token);
+      }
+    } else {
+      const char* lp = line;
+      while (*lp == ' ' || *lp == '\t')
+        lp++;
+      if (*lp == '\0' || *lp == '\n' || *lp == '\r' || *lp == '#')
+        continue;
+      if (!filter_merge_append_token(list, lp, spec, opts, base_dir, depth, err, err_size))
+        ok = false;
+    }
+  }
+  free(line);
+  if (!ok) {
+    /* Drop the rules this read appended (a "clear" inside the file may have
+     * freed earlier rules too; clamp like filter_file_rollback). */
+    int first = rules_before < list->count ? rules_before : list->count;
+    for (int i = first; i < list->count; i++)
+      filter_rule_free(list->items[i]);
+    list->count = first;
+    return false;
+  }
+  for (int i = rules_before; i < list->count; i++) {
+    FilterRule* rule = list->items[i];
+    if (spec->no_inherit)
+      rule->no_inherit = true;
+    if (owner_rel && !set_rule_owner(rule, owner_rel)) {
+      filter_set_error(err, err_size, "memory allocation failed");
+      for (int j = rules_before; j < list->count; j++)
+        filter_rule_free(list->items[j]);
+      list->count = rules_before;
+      return false;
+    }
+  }
+  return true;
+}
+
+/* Read a single-instance merge file and splice its rules into `list`.  A
+ * relative path is resolved below `base_dir` when given, else used as-is (rsync
+ * resolves a command-line merge file relative to the current directory). */
 static bool filter_list_merge_file(FilterRuleList* list, const char* name,
-                                   const FilterParseOptions* opts, const char* base_dir, int depth,
-                                   char* err, size_t err_size) {
+                                   const FilterDirMerge* spec, const FilterParseOptions* opts,
+                                   const char* base_dir, int depth, char* err, size_t err_size) {
   if (name[0] == '\0') {
     filter_set_error(err, err_size, "merge requires a filename");
+    return false;
+  }
+  if (spec->exclude_self && !filter_list_add_exclude_self(list, name)) {
+    filter_set_error(err, err_size, "memory allocation failed");
     return false;
   }
   char* path =
@@ -544,29 +750,7 @@ static bool filter_list_merge_file(FilterRuleList* list, const char* name,
     free(path);
     return false;
   }
-  char* line = NULL;
-  size_t cap = 0;
-  bool ok = true;
-  while (true) {
-    ssize_t n = utils_getdelim_bounded(fp, &line, &cap, '\n', UTILS_MAX_LINE_LEN);
-    if (n < 0) {
-      filter_set_error(err, err_size, "error reading merge file '%s'", path);
-      ok = false;
-      break;
-    }
-    if (n == 0)
-      break;
-    const char* lp = line;
-    while (*lp == ' ' || *lp == '\t')
-      lp++;
-    if (*lp == '\0' || *lp == '\n' || *lp == '\r' || *lp == '#')
-      continue;
-    if (!filter_list_parse_append_depth(list, lp, opts, base_dir, depth + 1, err, err_size)) {
-      ok = false;
-      break;
-    }
-  }
-  free(line);
+  bool ok = filter_merge_read(list, fp, path, spec, opts, base_dir, NULL, depth, err, err_size);
   fclose(fp);
   free(path);
   return ok;
@@ -590,11 +774,13 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
   RuleKind kind = RULE_KIND_UNKNOWN;
   unsigned sides;
   bool sides_explicit, negate, anchored_mod, perishable, xattr, cvs_inject;
+  bool no_prefixes, include_defaults, word_split, no_inherit, exclude_self;
   const char* pat;
   size_t pat_len;
   char bad_mod;
   if (!parse_rule_syntax(p, &kind, &sides, &sides_explicit, &negate, &anchored_mod, &perishable,
-                         &xattr, &cvs_inject, &pat, &pat_len, &bad_mod)) {
+                         &xattr, &cvs_inject, &no_prefixes, &include_defaults, &word_split,
+                         &no_inherit, &exclude_self, &pat, &pat_len, &bad_mod)) {
     if (bad_mod != '\0')
       filter_set_error(err, err_size, "unsupported filter modifier '%c': %s", bad_mod, p);
     else
@@ -640,7 +826,15 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
     }
     memcpy(name, pat, pat_len);
     name[pat_len] = '\0';
-    bool ok = filter_list_merge_file(list, name, opts, base_dir, depth, err, err_size);
+    /* A single-instance merge has no inheritance, so 'n' is meaningless; the
+     * other merge modifiers still shape how the file is read. */
+    FilterDirMerge spec = {.name = name,
+                           .no_prefixes = no_prefixes,
+                           .include = include_defaults,
+                           .word_split = word_split,
+                           .no_inherit = false,
+                           .exclude_self = exclude_self};
+    bool ok = filter_list_merge_file(list, name, &spec, opts, base_dir, depth, err, err_size);
     free(name);
     return ok;
   }
@@ -656,7 +850,8 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
     }
     memcpy(name, pat, pat_len);
     name[pat_len] = '\0';
-    bool ok = filter_rule_list_add_dir_merge(list, name);
+    bool ok = filter_rule_list_add_dir_merge_ex(list, name, no_prefixes, include_defaults,
+                                                word_split, no_inherit, exclude_self);
     free(name);
     if (!ok) {
       filter_set_error(err, err_size, "memory allocation failed");
@@ -718,26 +913,30 @@ FilterRuleList* filter_base_build(const char* const* rule_texts, int rule_count,
  * leaving the caller's earlier content intact.  A "clear" rule inside the file
  * frees every rule, including the caller's; clamp to the surviving count so
  * those already-freed rules are never resurrected and freed a second time. */
+/* Undo the rules and dir-merge registrations that one merge file appended,
+ * leaving the caller's earlier content intact.  A "clear" rule inside the file
+ * frees every rule, including the caller's; clamp to the surviving count so
+ * those already-freed rules are never resurrected and freed a second time. */
 static void filter_file_rollback(FilterRuleList* list, int rules_before, int dir_merges_before) {
   int first = rules_before < list->count ? rules_before : list->count;
   for (int i = first; i < list->count; i++)
     filter_rule_free(list->items[i]);
   list->count = first;
   for (int i = dir_merges_before; i < list->dir_merge_count; i++)
-    free(list->dir_merge_names[i]);
+    free(list->dir_merges[i].name);
   list->dir_merge_count = dir_merges_before;
 }
 
-bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* name,
-                        const char* owner_rel, const FilterParseOptions* opts, bool* exists,
-                        char* err, size_t err_size) {
+bool filter_dir_merge_append(FilterRuleList* list, const char* dir_path, const FilterDirMerge* spec,
+                             const char* owner_rel, const FilterParseOptions* opts, bool* exists,
+                             char* err, size_t err_size) {
   if (err && err_size > 0)
     err[0] = '\0';
   if (exists)
     *exists = false;
-  if (!list)
+  if (!list || !spec || !spec->name)
     return false;
-  char* filter_path = path_cat(dir_path, name);
+  char* filter_path = path_cat(dir_path, spec->name);
   if (!filter_path) {
     filter_set_error(err, err_size, "memory allocation failed");
     return false;
@@ -748,7 +947,7 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
     if (errno == ENOENT || errno == ENOTDIR)
       return true;
     char* escaped_dir = output_escape(dir_path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_WARNING, "Could not read %s in %s: %s", name,
+    log_message(LOG_LEVEL_WARNING, "Could not read %s in %s: %s", spec->name,
                 escaped_dir ? escaped_dir : "<allocation failed>", strerror(errno));
     free(escaped_dir);
     return true;
@@ -757,49 +956,23 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
     *exists = true;
   int rules_before = list->count;
   int dir_merges_before = list->dir_merge_count;
-  char* line = NULL;
-  size_t line_cap = 0;
-  bool ok = true;
-  while (true) {
-    ssize_t n = utils_getdelim_bounded(fp, &line, &line_cap, '\n', UTILS_MAX_LINE_LEN);
-    if (n < 0) {
-      if (errno == EFBIG) {
-        filter_set_error(err, err_size, "line in %s exceeds %d bytes", name,
-                         (int)UTILS_MAX_LINE_LEN);
-      } else {
-        filter_set_error(err, err_size, "error reading %s: %s", name, strerror(errno));
-      }
-      ok = false;
-      break;
-    }
-    if (n == 0)
-      break;
-    const char* p = line;
-    while (*p == ' ' || *p == '\t')
-      p++;
-    if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#')
-      continue;
-    /* Merge files inside a per-directory file resolve relative to that
-       directory. */
-    if (!filter_list_parse_append_depth(list, p, opts, dir_path, 0, err, err_size)) {
-      ok = false;
-      break;
-    }
-  }
-  free(line);
+  /* Merge files inside a per-directory file resolve relative to that
+     directory. */
+  bool ok =
+      filter_merge_read(list, fp, spec->name, spec, opts, dir_path, owner_rel, 0, err, err_size);
   fclose(fp);
   if (!ok) {
     filter_file_rollback(list, rules_before, dir_merges_before);
     return false;
   }
-  for (int i = rules_before; i < list->count; i++) {
-    if (!set_rule_owner(list->items[i], owner_rel)) {
-      filter_set_error(err, err_size, "memory allocation failed");
-      filter_file_rollback(list, rules_before, dir_merges_before);
-      return false;
-    }
-  }
   return true;
+}
+
+bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* name,
+                        const char* owner_rel, const FilterParseOptions* opts, bool* exists,
+                        char* err, size_t err_size) {
+  FilterDirMerge spec = {.name = (char*)name};
+  return filter_dir_merge_append(list, dir_path, &spec, owner_rel, opts, exists, err, err_size);
 }
 
 FilterRuleList* filter_file_read_named(const char* dir_path, const char* name,
@@ -855,6 +1028,10 @@ static FilterAction rule_matches(const FilterRule* rule, const char* rel_path, c
   }
   if (rel2[0] == '\0')
     return FILTER_ACTION_NONE;
+  /* A no-inherit rule ('n' on its dir-merge) applies only to direct children of
+   * its owner directory, never to deeper entries. */
+  if (rule->no_inherit && strchr(rel2, '/') != NULL)
+    return FILTER_ACTION_NONE;
   bool matched;
   if (rule->dir_only && !is_dir)
     matched = false;
@@ -881,6 +1058,44 @@ FilterAction filter_rules_apply_side(const FilterRuleList* list, const char* rel
     FilterAction action = rule_matches(list->items[i], rel_path, leaf, is_dir, side);
     if (action != FILTER_ACTION_NONE)
       return action;
+  }
+  return FILTER_ACTION_NONE;
+}
+
+FilterAction filter_dir_rules_apply_side(const FilterRuleList* dir_rules, const char* rel_path,
+                                         const char* leaf, bool is_dir) {
+  if (!dir_rules || !rel_path)
+    return FILTER_ACTION_NONE;
+  size_t len = strlen(rel_path);
+  if (len == 0)
+    return FILTER_ACTION_NONE;
+  /* The containing directory of rel_path is the prefix before its final '/'. */
+  size_t owner_len = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (rel_path[i] == '/')
+      owner_len = i;
+  }
+  for (;;) {
+    for (int i = 0; i < dir_rules->count; i++) {
+      const FilterRule* rule = dir_rules->items[i];
+      size_t rule_owner_len = rule && rule->owner ? strlen(rule->owner) : 0;
+      if (rule_owner_len != owner_len)
+        continue;
+      if (owner_len != 0 && memcmp(rule->owner, rel_path, owner_len) != 0)
+        continue;
+      FilterAction action = rule_matches(rule, rel_path, leaf, is_dir, FILTER_SIDE_RECEIVER);
+      if (action != FILTER_ACTION_NONE)
+        return action;
+    }
+    if (owner_len == 0)
+      break;
+    /* Move to the parent directory: the last '/' before owner_len. */
+    size_t parent = 0;
+    for (size_t j = 0; j < owner_len; j++) {
+      if (rel_path[j] == '/')
+        parent = j;
+    }
+    owner_len = parent;
   }
   return FILTER_ACTION_NONE;
 }

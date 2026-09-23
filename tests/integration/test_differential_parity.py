@@ -128,6 +128,39 @@ def seed_filter_protect(_src, rroot, froot):
         _mk(os.path.join(root, "sub", "other2.txt"), b"nested dest-only other\n", _OLD_MTIME)
 
 
+def seed_perdir_protect(_src, rroot, froot):
+    """Per-directory `.rsync-filter` carrying `P` rules on the source and both
+    destinations, plus destination-only extras.  The `.log` extras must survive
+    --delete under every timing while the other extras go; the source's
+    `.rsync-filter` (which FastSync carries to the receiver) and the seeded
+    destination one (which rsync's receiver reads) are byte-identical."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, ".rsync-filter"), b"P extra.log\nP nested.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "extra.log"), b"dest-only protected\n", _OLD_MTIME)
+        _mk(os.path.join(root, "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "nested.log"), b"nested protected\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other2.txt"), b"nested deleted\n", _OLD_MTIME)
+
+
+def seed_perdir_exclude(_src, rroot, froot):
+    """Per-directory unqualified exclude (`-`): dual-sided, so it protects the
+    matching destination-only extra (and is opted back in by
+    --delete-excluded)."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, ".rsync-filter"), b"- extra.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "extra.log"), b"dest-only excluded\n", _OLD_MTIME)
+        _mk(os.path.join(root, "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+
+
+def _seed_rules(content):
+    def seed(_src, _rroot, _froot):
+        _mk(os.path.join(_src, ".rules"), content)
+
+    return seed
+
+
 def seed_max_delete(_src, rroot, froot):
     for root in (rroot, froot):
         _mk(os.path.join(root, "extra1.txt"), b"e1\n", _OLD_MTIME)
@@ -272,6 +305,50 @@ _CASES = [
            ["-a", "--delete-after", "--filter=P *.log"],
            seed=seed_filter_protect, server_args=DELETE, ci=True,
            ref="--filter P/--protect under the whole-tree --delete-after commit"),
+    # Per-directory merge rules (#315): the receiver must re-derive the
+    # protect/risk verdict from the carried per-directory rules, so a
+    # destination-only entry matching ONLY a per-directory rule is shielded.
+    H.Case("filter_perdir_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under the default --delete timing"),
+    H.Case("filter_perdir_protect_during", "filters",
+           ["-a", "-F", "--delete-during"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under --delete-during"),
+    H.Case("filter_perdir_protect_delay", "filters",
+           ["-a", "-F", "--delete-delay"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under --delete-delay"),
+    H.Case("filter_perdir_protect_before", "filters",
+           ["-a", "-F", "--delete-before"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under the whole-tree --delete-before commit"),
+    H.Case("filter_perdir_protect_after", "filters",
+           ["-a", "-F", "--delete-after"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under the whole-tree --delete-after commit"),
+    H.Case("filter_perdir_exclude_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_exclude, server_args=DELETE, ci=True,
+           ref="-F per-directory exclude protects its destination mirror"),
+    H.Case("filter_perdir_exclude_deleted", "filters",
+           ["-a", "-F", "--delete", "--delete-excluded"],
+           seed=seed_perdir_exclude, server_args=DELETE, ci=True,
+           ref="-F per-directory exclude under --delete-excluded is at risk"),
+    # Merge-file modifiers (#315): e/n/w/- semantics match rsync 3.4.1.
+    H.Case("dir_merge_e", "filters", ["-a", "--filter=:e .rules"],
+           seed=_seed_rules(b"- *.log\n"), ci=True,
+           ref="dir-merge,e excludes the merge file itself"),
+    H.Case("dir_merge_n", "filters", ["-a", "--filter=:n .rules"],
+           seed=_seed_rules(b"- *.log\n"), ci=True,
+           ref="dir-merge,n does not inherit into subdirectories"),
+    H.Case("dir_merge_dash", "filters", ["-a", "--filter=:- .rules"],
+           seed=_seed_rules(b"*.log\n*.bin\n"), ci=True,
+           ref="dir-merge,- reads the file as bare exclude patterns"),
+    H.Case("dir_merge_w", "filters", ["-a", "--filter=:-w .rules"],
+           seed=_seed_rules(b"*.log *.bin\n"), ci=True,
+           ref="dir-merge,w word-splits bare patterns on whitespace"),
 
     # --- relative / dirs --------------------------------------------------
     H.Case("relative_general", "basic", ["-a", "-R"], layout=H.MIRROR_ABS,

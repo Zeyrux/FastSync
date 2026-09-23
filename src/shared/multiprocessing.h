@@ -67,6 +67,12 @@ typedef struct {
      them in the manifest frame's third section and the receiver deletes each as
      an explicit request. */
   ArrayList* missing_args;
+  /* Per-directory filter rules the source scan compiled (protocol 2.30.0),
+     sent with the delete manifest/plan config so the receiver can re-derive the
+     per-directory protect/risk set.  NULL when --delete is off.  Populated by
+     the scanner (parallel workers append under mutex_scanner) or the early
+     pre-scan. */
+  FilterRuleList* per_dir_rules;
   /* A source I/O error (unreadable directory) was recorded during the scan.
      Set by the pre-scan (before the threads start) or by the scanner thread
      under mutex_scanner; the caller turns it into a non-zero exit when
