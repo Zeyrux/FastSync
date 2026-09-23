@@ -170,7 +170,8 @@ static bool delete_extras_budgeted_observed(const Config* config, const DeleteMa
   size_t deleted = 0;
   size_t skipped = 0;
   DeleteProtectRules protect = {.base_rules = config->protect_rules,
-                                .dir_rules = manifest->per_dir_rules};
+                                .dir_rules = manifest->per_dir_rules,
+                                .backup_suffix = delete_backup_suffix(config)};
   DeleteWalkResult result = delete_extras_limited_observed(
       config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips.entries,
       skips.count, &protect, &deleted, &skipped, observer, observer_context);
@@ -398,7 +399,8 @@ bool manifest_would_delete_list(const Config* config, const DeleteManifest* mani
   if (!delete_skips_build(config, manifest->protected, NULL, true, &skips))
     return false;
   DeleteProtectRules protect = {.base_rules = config->protect_rules,
-                                .dir_rules = manifest->per_dir_rules};
+                                .dir_rules = manifest->per_dir_rules,
+                                .backup_suffix = delete_backup_suffix(config)};
   bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
                                skips.entries, skips.count, &protect, out, count_out);
   delete_skips_free(&skips);

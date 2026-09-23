@@ -797,15 +797,27 @@ int receiver_process_pending_ctx(Config* config, int file_descriptor, const Rece
     log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
     goto receive_error;
   }
+  /* --delay-updates: publish every staged file BEFORE the deferred delete
+     commit, matching rsync's --delete-after ordering (all updates land first,
+     then extras are removed).  The single-threaded receiver stores files
+     synchronously, so every staged file is complete here.  The -m receiver
+     hands both publication and deletion to its caller via
+     pending_manifest/pending_plans; that caller publishes first, after its disk
+     writer has drained. */
+  bool handoff = state.pending_manifest != NULL || state.pending_plans != NULL;
+  if (!handoff && !config->dry_run && config->delay_updates && config->delay_context) {
+    if (!delay_updates_publish(config->delay_context, config)) {
+      send_status(file_descriptor, STATUS_ERROR);
+      goto fail;
+    }
+  }
   /* Commit-style (late) deletion: every data frame has been received and the
      sender proved the whole tree with STATUS_FINISHED.  The single-threaded
-     receiver stores files synchronously, so everything is on disk here and the
-     deletion can be committed before the --delay-updates publication in
-     send_success (the walker skips the staging dir, so staged files are never
-     treated as extras).  The -m receiver passes `pending_manifest` because its
-     disk writer may still be draining; the caller commits after the writer has
-     joined so no extra file is removed unless the transfer is known to have
-     succeeded. */
+     receiver stores files synchronously, so everything is on disk here (and a
+     --delay-updates run has already published above).  The -m receiver passes
+     `pending_manifest` because its disk writer may still be draining; the
+     caller commits after the writer has joined so no extra file is removed
+     unless the transfer is known to have succeeded. */
   if (state.deferred_manifest) {
     if (state.pending_manifest) {
       *state.pending_manifest = state.deferred_manifest;
@@ -989,21 +1001,10 @@ static bool receiver_send_success_frame(int fd, void* context_pointer) {
      nothing to publish and no directory times to stamp. */
   if (context->config->dry_run)
     return receiver_send_final_success(fd, context->config, &context->outcomes, final_status);
-  /* --delay-updates: the whole protocol stream (including manifest/delete
-     handling, which ran inside receiver_process) has succeeded and every
-     staged file was fully written.  Publish them atomically now, before the
-     success/outcome frame tells a --remove-source-files sender it may delete
-     its sources. */
-  if (context->config->delay_updates && context->config->delay_context) {
-    if (!delay_updates_publish(context->config->delay_context, context->config)) {
-      send_status(fd, STATUS_ERROR);
-      return false;
-    }
-  }
-  /* P7 Wave D: every child is now written and the delete / --delay-updates
-     phases have committed, so it is finally safe to stamp directory times.
-     This runs after the deferred deletion because receiver_process commits it
-     before calling this success frame. */
+  /* P7 Wave D: every child is now written and the --delay-updates publication
+     (done in receiver_process before the delete commit) plus the deferred
+     deletion have both committed, so it is finally safe to stamp directory
+     times. */
   dir_metadata_list_apply(&context->dir_times, context->config->receive_root_directory,
                           context->config);
   return receiver_send_final_success(fd, context->config, &context->outcomes, final_status);

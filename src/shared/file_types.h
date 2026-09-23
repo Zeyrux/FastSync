@@ -62,6 +62,11 @@ typedef struct {
    * This lets a basis larger than any whole-file bound materialize without
    * buffering it; the source metadata on `metadata` is applied afterwards. */
   char* basis_copy;
+  /* Receiver-only.  When set, `basis_copy` points at a receiver-created spool
+   * temp file holding a STREAMED whole-file payload (rather than a --copy-dest
+   * basis).  file_destroy unlinks it after the install consumes it, so an
+   * over-limit file leaves no scratch behind. */
+  bool data_spool;
   /* --hard-links (-H), sender + receiver wire state.  link_group is a run-local
    * id shared by every member of one source inode (0 = not part of a group).
    * The FIRST member (link_first == true) carries its data on the wire and is

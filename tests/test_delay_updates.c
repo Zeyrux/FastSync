@@ -87,8 +87,10 @@ static void test_delay_updates_no_final_before_publish() {
   const char* final_path = "test_delay_tmp/sub/file.txt";
   /* Before publication the final destination must not contain the file. */
   EXPECT_FALSE(file_path_exists_secure(final_path));
-  /* The complete staged copy must live inside the staging tree. */
-  char* staged = path_cat("test_delay_tmp/.fastsync-stage", "/sub/file.txt");
+  /* The complete staged copy must live inside the per-run staging tree. */
+  EXPECT_NOT_NULL(cfg->delay_context->staging_name);
+  EXPECT_EQ_INT(strncmp(cfg->delay_context->staging_name, ".fastsync-stage.", 16), 0);
+  char* staged = path_cat(cfg->delay_context->staging_root, "/sub/file.txt");
   EXPECT_NOT_NULL(staged);
   // cppcheck-suppress knownConditionTrueFalse
   if (staged) {
@@ -125,6 +127,8 @@ static void test_delay_updates_publish_installs_files() {
   const char* final_path = "test_delay_pub_tmp/sub/file.txt";
   EXPECT_FALSE(file_path_exists_secure(final_path));
 
+  char* staging_root = str_dup(cfg->delay_context->staging_root);
+  EXPECT_NOT_NULL(staging_root);
   EXPECT_TRUE(delay_updates_publish(cfg->delay_context, cfg));
   /* After a successful publish the file is installed and staging is gone. */
   char* content = read_all(final_path);
@@ -134,7 +138,8 @@ static void test_delay_updates_publish_installs_files() {
     EXPECT_EQ_STR(content, "published payload");
     free(content);
   }
-  EXPECT_FALSE(file_path_exists_secure("test_delay_pub_tmp/.fastsync-stage"));
+  EXPECT_FALSE(file_path_exists_secure(staging_root));
+  free(staging_root);
 
 out:
   file_destroy(f);
@@ -158,11 +163,17 @@ static void test_delay_updates_cleanup_removes_staged() {
     goto out;
 
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
-  EXPECT_TRUE(file_path_exists_secure("test_delay_clean_tmp/.fastsync-stage/sub/file.txt"));
+  char* staged_file = path_cat(cfg->delay_context->staging_root, "/sub/file.txt");
+  char* staging_root = str_dup(cfg->delay_context->staging_root);
+  EXPECT_NOT_NULL(staged_file);
+  EXPECT_NOT_NULL(staging_root);
+  EXPECT_TRUE(file_path_exists_secure(staged_file));
 
   delay_updates_cleanup(cfg->delay_context);
-  EXPECT_FALSE(file_path_exists_secure("test_delay_clean_tmp/.fastsync-stage"));
+  EXPECT_FALSE(file_path_exists_secure(staging_root));
   EXPECT_FALSE(file_path_exists_secure("test_delay_clean_tmp/sub/file.txt"));
+  free(staged_file);
+  free(staging_root);
 
 out:
   file_destroy(f);
@@ -274,6 +285,55 @@ out:
   remove_tree(root);
 }
 
+/* Every context picks its own staging directory name, so two delayed
+   transfers to the same root can never share (and corrupt) a staging tree. */
+static void test_delay_updates_unique_staging_name() {
+  DelayUpdatesContext* first = delay_updates_context_create("test_delay_uniq_tmp");
+  DelayUpdatesContext* second = delay_updates_context_create("test_delay_uniq_tmp");
+  EXPECT_NOT_NULL(first);
+  EXPECT_NOT_NULL(second);
+  /* cppcheck-suppress knownConditionTrueFalse -- the EXPECT_NOT_NULL checks above return on NULL */
+  if (first && second) {
+    EXPECT_EQ_INT(strncmp(first->staging_name, ".fastsync-stage.", 16), 0);
+    EXPECT_EQ_INT(strncmp(second->staging_name, ".fastsync-stage.", 16), 0);
+    EXPECT_TRUE(strcmp(first->staging_name, second->staging_name) != 0);
+    EXPECT_TRUE(strcmp(first->staging_root, second->staging_root) != 0);
+  }
+  delay_updates_context_destroy(first);
+  delay_updates_context_destroy(second);
+}
+
+/* A pre-existing destination entry at the exact (random) staging path is not
+   ours: prepare() must refuse rather than wipe it. */
+static void test_delay_updates_prepare_refuses_non_owned_collision() {
+  const char* root = "test_delay_collide_tmp";
+  remove_tree(root);
+  DelayUpdatesContext* context = delay_updates_context_create(root);
+  EXPECT_NOT_NULL(context);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (!context)
+    return;
+  /* Plant a genuine directory with user data at the exact staging path. */
+  EXPECT_TRUE(file_ensure_directory_secure(context->staging_root));
+  char* inner = path_cat(context->staging_root, "keepme.txt");
+  EXPECT_NOT_NULL(inner);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (inner) {
+    EXPECT_TRUE(file_write_to_disk(inner, "genuine", 7, false, false));
+    EXPECT_FALSE(delay_updates_prepare(context));
+    char* content = read_all(inner);
+    EXPECT_NOT_NULL(content);
+    // cppcheck-suppress knownConditionTrueFalse
+    if (content) {
+      EXPECT_EQ_STR(content, "genuine");
+      free(content);
+    }
+    free(inner);
+  }
+  delay_updates_context_destroy(context);
+  remove_tree(root);
+}
+
 /* The reserved staging name must be recognizable for validation, including
    with a trailing slash. */
 static void test_delay_updates_reserved_name_helper() {
@@ -288,6 +348,8 @@ static void test_delay_updates_reserved_name_helper() {
 
 void test_delay_updates() {
   test_delay_updates_reserved_name_helper();
+  test_delay_updates_unique_staging_name();
+  test_delay_updates_prepare_refuses_non_owned_collision();
   test_delay_updates_no_final_before_publish();
   test_delay_updates_publish_installs_files();
   test_delay_updates_cleanup_removes_staged();

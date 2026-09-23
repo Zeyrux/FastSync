@@ -112,8 +112,9 @@ layout is unchanged (golden length still 886).
   wording, and symlink/empty-directory quick-checks.
 - `--delete-before`'s phase-0 late-file divergence remains (rsync's pre-scan
   fixes the file list before the data pass).
-- A single file larger than 256 MiB cannot be streamed in the default path
-  (a general whole-file limit, not basis-specific).
+- A whole-file sender that cannot stream its codec (lz4's one-shot block
+  format) or a `--append`/delta source above the bound still buffers; the
+  default zstd/zlib and the uncompressed paths stream (see #318).
 - `--stats` byte totals and `--msgs2stderr` stay documented divergences.
 
 ### Security

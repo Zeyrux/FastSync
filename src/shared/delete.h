@@ -37,6 +37,11 @@ typedef enum {
 typedef struct {
   const FilterRuleList* base_rules;
   const FilterRuleList* dir_rules;
+  /* When non-NULL and non-empty, a destination entry whose name ends with this
+     suffix is protected from deletion.  rsync never treats a --backup file as
+     an extra, so a backup created at --delay-updates publication (or a
+     pre-existing one) survives the delete-after pass. */
+  const char* backup_suffix;
 } DeleteProtectRules;
 
 /* rsync's first-match-wins receiver verdict for one candidate extra: the
@@ -47,6 +52,11 @@ typedef struct {
  * FILTER_ACTION_NONE when no rule matched. */
 FilterAction delete_protect_verdict(const DeleteProtectRules* protect, const char* rel_path,
                                     const char* leaf, bool is_dir);
+
+/* The backup suffix the delete walker must shield from deletion, or NULL when
+   --backup is inactive or the configured suffix is unusable (empty, or holding
+   a path separator).  Matches the suffix file_save uses for backups. */
+const char* delete_backup_suffix(const Config* config);
 
 /* One protected entry for the delete walker.  When top_level_only is true the
    prefix is skipped only as a DIRECT child of dest_root (the --delay-updates

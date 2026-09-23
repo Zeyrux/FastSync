@@ -5,6 +5,8 @@
 #include "file.h"
 #include "file_receive.h"
 #include "data.h"
+#include "compression.h"
+#include "delta.h"
 #include "config.h"
 #include "charset.h"
 #include "utils.h"
@@ -2465,7 +2467,172 @@ static void test_manifest_would_delete_protects_absolute_basis() {
   free(extra);
 }
 
+/* #318: a whole-file payload above the streaming bound must be written to a
+ * spool temp file in bounded chunks, not materialized in memory.  Exercises the
+ * raw and zstd-compressed paths and asserts the exact bytes land in the spool. */
+static void test_file_receive_payload_streams(void) {
+  const char* dir = "test_file_stream_tmp";
+  char dest_path[512];
+  snprintf(dest_path, sizeof(dest_path), "%s/out.bin", dir);
+  mkdir(dir, 0777);
+
+  const unsigned long long stream_limit = 4096;
+  size_t size = 20000;
+  unsigned char* payload = malloc(size);
+  EXPECT_NOT_NULL(payload);
+  for (size_t i = 0; i < size; i++)
+    payload[i] = (unsigned char)((i * 7 + 3) & 0xff);
+
+  /* Raw (uncompressed) streamed payload. */
+  {
+    int p[2];
+    EXPECT_EQ_INT(pipe(p), 0);
+    unsigned long long hdr = size;
+    EXPECT_TRUE(send_n_data(p[1], &hdr, sizeof(hdr)));
+    EXPECT_TRUE(send_n_data(p[1], payload, size));
+    Data* buffer = NULL;
+    char* spool = NULL;
+    unsigned long long out_size = 0;
+    EXPECT_TRUE(file_receive_payload(p[0], false, size, dest_path, stream_limit, &buffer, &spool,
+                                     &out_size));
+    EXPECT_NULL(buffer);
+    EXPECT_NOT_NULL(spool);
+    EXPECT_TRUE(out_size == size);
+    /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+     * failure */
+    if (spool) {
+      FILE* fh = fopen(spool, "rb");
+      EXPECT_NOT_NULL(fh);
+      /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+       * failure */
+      if (fh) {
+        unsigned char* got = malloc(size);
+        EXPECT_TRUE(fread(got, 1, size, fh) == size);
+        EXPECT_EQ_INT(memcmp(got, payload, size), 0);
+        free(got);
+        fclose(fh);
+      }
+      unlink(spool);
+      free(spool);
+    }
+    close(p[0]);
+    close(p[1]);
+  }
+
+  /* zstd-compressed payload whose logical size exceeds the bound: the frame is
+   * decompressed incrementally straight into the spool. */
+  {
+    unsigned char* copy = malloc(size);
+    EXPECT_NOT_NULL(copy);
+    memcpy(copy, payload, size);
+    Data* raw = data_create(copy, size); /* data_create takes ownership of copy */
+    Data* compressed = data_compress_codec(raw, COMPRESSION_ALGO_ZSTD, 3, 0);
+    data_destroy(raw);
+    EXPECT_NOT_NULL(compressed);
+    /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+     * failure */
+    if (compressed) {
+      int p[2];
+      EXPECT_EQ_INT(pipe(p), 0);
+      EXPECT_TRUE(send_data(p[1], compressed));
+      Data* buffer = NULL;
+      char* spool = NULL;
+      unsigned long long out_size = 0;
+      EXPECT_TRUE(file_receive_payload(p[0], true, size, dest_path, stream_limit, &buffer, &spool,
+                                       &out_size));
+      EXPECT_NULL(buffer);
+      EXPECT_NOT_NULL(spool);
+      EXPECT_TRUE(out_size == size);
+      /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+       * failure */
+      if (spool) {
+        FILE* fh = fopen(spool, "rb");
+        EXPECT_NOT_NULL(fh);
+        /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+         * failure */
+        if (fh) {
+          unsigned char* got = malloc(size);
+          EXPECT_TRUE(fread(got, 1, size, fh) == size);
+          EXPECT_EQ_INT(memcmp(got, payload, size), 0);
+          free(got);
+          fclose(fh);
+        }
+        unlink(spool);
+        free(spool);
+      }
+      close(p[0]);
+      close(p[1]);
+      data_destroy(compressed);
+    }
+  }
+
+  free(payload);
+  unlink(dest_path);
+  rmdir(dir);
+}
+
+/* #318: the fd-based delta helpers must match the in-memory ones and stream the
+ * reconstruction to a descriptor without allocating the whole output. */
+static void test_delta_stream_helpers(void) {
+  const unsigned char basis[] = {0x11, 0x22, 0x33, 0x44};
+  const char* basis_path = "test_file_delta_basis.bin";
+  int bfd = open(basis_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  EXPECT_TRUE(bfd >= 0);
+  EXPECT_TRUE(write(bfd, basis, sizeof(basis)) == (ssize_t)sizeof(basis));
+  EXPECT_TRUE(lseek(bfd, 0, SEEK_SET) == 0);
+
+  DeltaSignature* fd_sig = delta_signature_create_fd_seeded(bfd, sizeof(basis), 4, 0);
+  DeltaSignature* mem_sig = delta_signature_create_seeded(basis, sizeof(basis), 4, 0);
+  EXPECT_NOT_NULL(fd_sig);
+  EXPECT_NOT_NULL(mem_sig);
+  /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+   * failure */
+  if (fd_sig && mem_sig) {
+    EXPECT_TRUE(fd_sig->block_count == mem_sig->block_count);
+    for (uint32_t i = 0; i < fd_sig->block_count; i++) {
+      EXPECT_TRUE(fd_sig->blocks[i].adler32 == mem_sig->blocks[i].adler32);
+      EXPECT_TRUE(fd_sig->blocks[i].xxhash == mem_sig->blocks[i].xxhash);
+    }
+  }
+  delta_signature_destroy(fd_sig);
+  delta_signature_destroy(mem_sig);
+
+  DeltaInstruction instrs[2];
+  instrs[0].type = DELTA_INSTR_BLOCK_MATCH;
+  instrs[0].match.block_index = 0;
+  instrs[0].match.block_offset = 0;
+  instrs[0].match.length = 4;
+  instrs[1].type = DELTA_INSTR_LITERAL;
+  instrs[1].literal.data = (uint8_t*)"XY";
+  instrs[1].literal.length = 2;
+  Delta delta;
+  delta.new_file_size = 6;
+  delta.instruction_count = 2;
+  delta.instructions = instrs;
+  delta.delta_size = 0;
+
+  int out[2];
+  EXPECT_EQ_INT(pipe(out), 0);
+  EXPECT_TRUE(delta_apply_to_fd(NULL, bfd, sizeof(basis), &delta, 4, out[1]));
+  close(out[1]);
+  unsigned char got[6] = {0};
+  size_t total = 0;
+  while (total < sizeof(got)) {
+    ssize_t n = read(out[0], got + total, sizeof(got) - total);
+    if (n <= 0)
+      break;
+    total += (size_t)n;
+  }
+  EXPECT_TRUE(total == sizeof(got));
+  EXPECT_TRUE(memcmp(got, "\x11\x22\x33\x44XY", 6) == 0);
+  close(out[0]);
+  close(bfd);
+  unlink(basis_path);
+}
+
 void test_file() {
+  test_file_receive_payload_streams();
+  test_delta_stream_helpers();
   test_file_create();
   test_file_special_rdev_valid();
   test_file_destroy_null();

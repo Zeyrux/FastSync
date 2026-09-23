@@ -3,6 +3,7 @@
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
+#include <errno.h>
 #include <limits.h>
 #include <lz4.h>
 #include <stdatomic.h>
@@ -715,4 +716,380 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
 
 Data* data_decompress(Data* compressed_data) {
   return data_decompress_limited(compressed_data, MAX_DECOMPRESSED_SIZE);
+}
+
+/* ---- streaming decompression ---- */
+
+#define STREAM_DECOMPRESS_OUT_CHUNK (256 * 1024)
+
+struct CompressionStreamDecompressor {
+  CompressionAlgo algo;
+  unsigned long long expected_out;
+  unsigned long long total;
+  int out_fd;
+  unsigned char* out_buf;
+  ZSTD_DCtx* dctx;
+  z_stream zs;
+  bool zs_initialized;
+  bool failed;
+};
+
+static bool stream_write_all(int fd, const void* data, size_t size) {
+  const unsigned char* p = data;
+  size_t done = 0;
+  while (done < size) {
+    ssize_t n = write(fd, p + done, size - done);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return false;
+    done += (size_t)n;
+  }
+  return true;
+}
+
+CompressionStreamDecompressor*
+compression_stream_decompressor_create(CompressionAlgo algo, unsigned long long expected_out) {
+  CompressionStreamDecompressor* d = calloc(1, sizeof(*d));
+  if (!d)
+    return NULL;
+  d->algo = algo;
+  d->expected_out = expected_out;
+  d->out_fd = -1;
+  d->out_buf = malloc(STREAM_DECOMPRESS_OUT_CHUNK);
+  if (!d->out_buf) {
+    free(d);
+    return NULL;
+  }
+  if (algo == COMPRESSION_ALGO_ZSTD) {
+    d->dctx = ZSTD_createDCtx();
+    if (!d->dctx) {
+      free(d->out_buf);
+      free(d);
+      return NULL;
+    }
+  } else if (algo == COMPRESSION_ALGO_ZLIB || algo == COMPRESSION_ALGO_ZLIBX) {
+    if (inflateInit(&d->zs) != Z_OK) {
+      free(d->out_buf);
+      free(d);
+      return NULL;
+    }
+    d->zs_initialized = true;
+  } else if (algo != COMPRESSION_ALGO_NONE) {
+    /* lz4's block format cannot be decompressed incrementally. */
+    free(d->out_buf);
+    free(d);
+    return NULL;
+  }
+  return d;
+}
+
+static bool stream_emit(CompressionStreamDecompressor* d, const void* buf, size_t len) {
+  if (len == 0)
+    return true;
+  if (d->expected_out != 0 && (d->total > d->expected_out || len > d->expected_out - d->total)) {
+    d->failed = true;
+    return false;
+  }
+  if (!stream_write_all(d->out_fd, buf, len)) {
+    d->failed = true;
+    return false;
+  }
+  d->total += len;
+  return true;
+}
+
+static bool stream_feed_none(CompressionStreamDecompressor* d, const void* in, size_t in_len,
+                             bool* done) {
+  if (!stream_emit(d, in, in_len))
+    return false;
+  /* NONE has no end marker; the caller knows the frame length. */
+  *done = true;
+  return true;
+}
+
+static bool stream_feed_zstd(CompressionStreamDecompressor* d, const void* in, size_t in_len,
+                             bool* done) {
+  ZSTD_inBuffer input = {in, in_len, 0};
+  while (input.pos < input.size) {
+    ZSTD_outBuffer output = {d->out_buf, STREAM_DECOMPRESS_OUT_CHUNK, 0};
+    size_t ret = ZSTD_decompressStream(d->dctx, &output, &input);
+    if (ZSTD_isError(ret)) {
+      d->failed = true;
+      return false;
+    }
+    if (!stream_emit(d, d->out_buf, output.pos))
+      return false;
+    if (ret == 0) {
+      *done = true;
+      /* Trailing bytes after a complete frame are malformed; stop consuming. */
+      if (input.pos < input.size) {
+        d->failed = true;
+        return false;
+      }
+      return true;
+    }
+  }
+  return true;
+}
+
+static bool stream_feed_zlib(CompressionStreamDecompressor* d, const void* in, size_t in_len,
+                             bool* done) {
+  d->zs.next_in = (Bytef*)in;
+  d->zs.avail_in = (uInt)in_len;
+  while (d->zs.avail_in > 0) {
+    d->zs.next_out = d->out_buf;
+    d->zs.avail_out = STREAM_DECOMPRESS_OUT_CHUNK;
+    int rc = inflate(&d->zs, Z_NO_FLUSH);
+    if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+      d->failed = true;
+      return false;
+    }
+    size_t produced = STREAM_DECOMPRESS_OUT_CHUNK - d->zs.avail_out;
+    if (!stream_emit(d, d->out_buf, produced))
+      return false;
+    if (rc == Z_STREAM_END) {
+      *done = true;
+      return d->zs.avail_in == 0;
+    }
+    if (rc == Z_BUF_ERROR && produced == 0) {
+      /* Need more input. */
+      break;
+    }
+  }
+  return true;
+}
+
+bool compression_stream_decompressor_feed(CompressionStreamDecompressor* d, const void* in,
+                                          size_t in_len, int out_fd, bool* done) {
+  if (!d || d->failed)
+    return false;
+  d->out_fd = out_fd;
+  if (done)
+    *done = false;
+  switch (d->algo) {
+  case COMPRESSION_ALGO_NONE:
+    return stream_feed_none(d, in, in_len, done);
+  case COMPRESSION_ALGO_ZSTD:
+    return stream_feed_zstd(d, in, in_len, done);
+  case COMPRESSION_ALGO_ZLIB:
+  case COMPRESSION_ALGO_ZLIBX:
+    return stream_feed_zlib(d, in, in_len, done);
+  case COMPRESSION_ALGO_LZ4:
+    break;
+  }
+  d->failed = true;
+  return false;
+}
+
+unsigned long long compression_stream_decompressor_total(const CompressionStreamDecompressor* d) {
+  return d ? d->total : 0;
+}
+
+void compression_stream_decompressor_destroy(CompressionStreamDecompressor* d) {
+  if (!d)
+    return;
+  if (d->dctx)
+    ZSTD_freeDCtx(d->dctx);
+  if (d->zs_initialized)
+    inflateEnd(&d->zs);
+  free(d->out_buf);
+  free(d);
+}
+
+/* ---- streaming compression ---- */
+
+struct CompressionStreamCompressor {
+  CompressionAlgo algo;
+  int level;
+  ZSTD_CCtx* cctx;
+  z_stream zs;
+  bool zs_initialized;
+  unsigned char* out_buf;
+  bool failed;
+};
+
+bool compression_stream_compress_supported(CompressionAlgo algo) {
+  return algo == COMPRESSION_ALGO_ZSTD || algo == COMPRESSION_ALGO_ZLIB ||
+         algo == COMPRESSION_ALGO_ZLIBX;
+}
+
+CompressionStreamCompressor* compression_stream_compressor_create(CompressionAlgo algo, int level,
+                                                                  int threads) {
+  (void)threads;
+  if (!compression_algo_valid((int)algo) || algo == COMPRESSION_ALGO_LZ4)
+    return NULL;
+  CompressionStreamCompressor* c = calloc(1, sizeof(*c));
+  if (!c)
+    return NULL;
+  c->algo = algo;
+  c->level = level;
+  c->out_buf = malloc(STREAM_DECOMPRESS_OUT_CHUNK);
+  if (!c->out_buf) {
+    free(c);
+    return NULL;
+  }
+  if (algo == COMPRESSION_ALGO_ZSTD) {
+    c->cctx = ZSTD_createCCtx();
+    if (!c->cctx) {
+      free(c->out_buf);
+      free(c);
+      return NULL;
+    }
+  } else if (algo == COMPRESSION_ALGO_ZLIB || algo == COMPRESSION_ALGO_ZLIBX) {
+    if (deflateInit(&c->zs, level < 1 ? Z_DEFAULT_COMPRESSION : level) != Z_OK) {
+      free(c->out_buf);
+      free(c);
+      return NULL;
+    }
+    c->zs_initialized = true;
+  }
+  return c;
+}
+
+bool compression_stream_compressor_begin(CompressionStreamCompressor* c,
+                                         unsigned long long raw_size, int out_fd) {
+  if (!c || c->failed)
+    return false;
+  unsigned char hdr[1 + 4];
+  size_t hdr_len = 1;
+  hdr[0] = (unsigned char)c->algo;
+  if (c->algo == COMPRESSION_ALGO_ZLIB || c->algo == COMPRESSION_ALGO_ZLIBX) {
+    uint32_t size32 = raw_size > UINT32_MAX ? UINT32_MAX : (uint32_t)raw_size;
+    for (int i = 0; i < 4; i++)
+      hdr[1 + i] = (uint8_t)((size32 >> (8 * i)) & 0xff);
+    hdr_len = 5;
+  }
+  if (c->algo == COMPRESSION_ALGO_ZSTD) {
+    /* Pledge the source size and force the frame content-size field so the
+       receiver can decide whether to stream from the frame header alone. */
+    if (ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(c->cctx, raw_size)) ||
+        ZSTD_isError(ZSTD_CCtx_setParameter(c->cctx, ZSTD_c_compressionLevel, c->level)) ||
+        ZSTD_isError(ZSTD_CCtx_setParameter(c->cctx, ZSTD_c_contentSizeFlag, 1))) {
+      c->failed = true;
+      return false;
+    }
+    if (ZSTD_isError(ZSTD_CCtx_setParameter(c->cctx, ZSTD_c_checksumFlag, 0))) {
+      c->failed = true;
+      return false;
+    }
+  }
+  if (!stream_write_all(out_fd, hdr, hdr_len)) {
+    c->failed = true;
+    return false;
+  }
+  return true;
+}
+
+static bool stream_compress_zlib(CompressionStreamCompressor* c, const void* in, size_t in_len,
+                                 int out_fd, int flush) {
+  c->zs.next_in = (Bytef*)in;
+  c->zs.avail_in = (uInt)in_len;
+  do {
+    c->zs.next_out = c->out_buf;
+    c->zs.avail_out = STREAM_DECOMPRESS_OUT_CHUNK;
+    int rc = deflate(&c->zs, flush);
+    if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+      c->failed = true;
+      return false;
+    }
+    size_t produced = STREAM_DECOMPRESS_OUT_CHUNK - c->zs.avail_out;
+    if (!stream_write_all(out_fd, c->out_buf, produced)) {
+      c->failed = true;
+      return false;
+    }
+    if (rc == Z_STREAM_END)
+      return true;
+    if (rc == Z_BUF_ERROR && produced == 0)
+      break;
+  } while (c->zs.avail_in > 0 || flush == Z_FINISH);
+  return true;
+}
+
+bool compression_stream_compressor_feed(CompressionStreamCompressor* c, const void* in,
+                                        size_t in_len, int out_fd) {
+  if (!c || c->failed)
+    return false;
+  if (c->algo == COMPRESSION_ALGO_NONE)
+    return stream_write_all(out_fd, in, in_len);
+  if (c->algo == COMPRESSION_ALGO_ZSTD) {
+    ZSTD_inBuffer input = {in, in_len, 0};
+    while (input.pos < input.size) {
+      ZSTD_outBuffer output = {c->out_buf, STREAM_DECOMPRESS_OUT_CHUNK, 0};
+      size_t ret = ZSTD_compressStream2(c->cctx, &output, &input, ZSTD_e_continue);
+      if (ZSTD_isError(ret)) {
+        c->failed = true;
+        return false;
+      }
+      if (!stream_write_all(out_fd, c->out_buf, output.pos)) {
+        c->failed = true;
+        return false;
+      }
+      if (output.pos == 0 && input.pos < input.size)
+        break; /* avoid spinning; zstd buffers the rest internally */
+    }
+    return true;
+  }
+  return stream_compress_zlib(c, in, in_len, out_fd, Z_NO_FLUSH);
+}
+
+bool compression_stream_compressor_finish(CompressionStreamCompressor* c, int out_fd) {
+  if (!c || c->failed)
+    return false;
+  if (c->algo == COMPRESSION_ALGO_NONE)
+    return true;
+  if (c->algo == COMPRESSION_ALGO_ZSTD) {
+    size_t ret;
+    do {
+      ZSTD_inBuffer input = {NULL, 0, 0};
+      ZSTD_outBuffer output = {c->out_buf, STREAM_DECOMPRESS_OUT_CHUNK, 0};
+      ret = ZSTD_compressStream2(c->cctx, &output, &input, ZSTD_e_end);
+      if (ZSTD_isError(ret)) {
+        c->failed = true;
+        return false;
+      }
+      if (!stream_write_all(out_fd, c->out_buf, output.pos)) {
+        c->failed = true;
+        return false;
+      }
+    } while (ret > 0);
+    return true;
+  }
+  return stream_compress_zlib(c, NULL, 0, out_fd, Z_FINISH);
+}
+
+void compression_stream_compressor_destroy(CompressionStreamCompressor* c) {
+  if (!c)
+    return;
+  if (c->cctx)
+    ZSTD_freeCCtx(c->cctx);
+  if (c->zs_initialized)
+    deflateEnd(&c->zs);
+  free(c->out_buf);
+  free(c);
+}
+
+unsigned long long compression_peek_frame_content_size(const void* buf, size_t len) {
+  if (!buf || len < 1)
+    return 0;
+  const uint8_t* p = buf;
+  uint8_t codec = p[0];
+  if (!compression_algo_valid(codec))
+    return 0;
+  if (codec == (uint8_t)COMPRESSION_ALGO_NONE)
+    return len - 1;
+  if (codec == (uint8_t)COMPRESSION_ALGO_ZSTD) {
+    if (len < 2)
+      return 0;
+    unsigned long long size = ZSTD_getFrameContentSize(p + 1, len - 1);
+    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN)
+      return 0;
+    return size;
+  }
+  if (len < 1 + LZ4_SIZE_PREFIX_LEN)
+    return 0;
+  uint32_t raw = 0;
+  for (int i = 0; i < LZ4_SIZE_PREFIX_LEN; i++)
+    raw |= (uint32_t)p[1 + i] << (8 * i);
+  return raw;
 }

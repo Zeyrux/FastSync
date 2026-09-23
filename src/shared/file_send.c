@@ -44,12 +44,138 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                                           send_path, NULL, -1, 0, false);
 }
 
+/* Stream-compress a whole source file into a temp file, then transmit it as the
+ * normal length-prefixed data frame.  Used when the source was too large to
+ * load (File.data.data == NULL): the source is read in bounded chunks through a
+ * streaming codec, so neither the raw nor the compressed image is held in
+ * memory.  The compressed length must be known before the frame is sent (the
+ * wire is length-prefixed), so the stream lands in a private temp file first. */
+bool file_send_compressed_stream_with_skip(File* file, int file_descriptor, bool use_metadata,
+                                           int compression_level, bool send_path,
+                                           char* const* skip_suffixes, int skip_count,
+                                           int compression_threads, bool send_xattrs) {
+  /* The caller has already decided this file compresses; the skip list is part
+     of the public signature for symmetry with the buffered path. */
+  (void)skip_suffixes;
+  (void)skip_count;
+  if (!file || !file->path || !file->data || file->data->size == 0 || file->data->data != NULL)
+    return false;
+  CompressionAlgo algo = compression_get_algo();
+  CompressionStreamCompressor* compressor =
+      compression_stream_compressor_create(algo, compression_level, compression_threads);
+  if (!compressor) {
+    log_message(LOG_LEVEL_ERROR, "streaming compression is not available for this codec; "
+                                 "the source was not loaded for the buffered path");
+    return false;
+  }
+
+  int src = file_open_for_read(file->path);
+  if (src < 0) {
+    compression_stream_compressor_destroy(compressor);
+    return false;
+  }
+  struct stat src_st;
+  if (fstat(src, &src_st) != 0 || !S_ISREG(src_st.st_mode) ||
+      (unsigned long long)src_st.st_size < file->data->size) {
+    close(src);
+    compression_stream_compressor_destroy(compressor);
+    return false;
+  }
+
+  const char* tmpdir = getenv("TMPDIR");
+  if (!tmpdir || tmpdir[0] == '\0')
+    tmpdir = "/tmp";
+  size_t tmplen = strlen(tmpdir) + strlen("/fastsync-z-XXXXXX") + 1;
+  char* tmpl = malloc(tmplen);
+  if (!tmpl) {
+    close(src);
+    compression_stream_compressor_destroy(compressor);
+    return false;
+  }
+  snprintf(tmpl, tmplen, "%s/fastsync-z-XXXXXX", tmpdir);
+  int tmp_fd = mkstemp(tmpl);
+  if (tmp_fd < 0) {
+    log_perror("Could not create compression temp file");
+    free(tmpl);
+    close(src);
+    compression_stream_compressor_destroy(compressor);
+    return false;
+  }
+  unlink(tmpl);
+  free(tmpl);
+
+  bool ok = compression_stream_compressor_begin(compressor, file->data->size, tmp_fd);
+  unsigned char buf[64 * 1024];
+  unsigned long long remaining = file->data->size;
+  while (ok && remaining > 0) {
+    size_t want = remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+    ssize_t got = read(src, buf, want);
+    if (got <= 0) {
+      ok = false;
+      break;
+    }
+    if (!compression_stream_compressor_feed(compressor, buf, (size_t)got, tmp_fd))
+      ok = false;
+    remaining -= (unsigned long long)got;
+  }
+  if (ok)
+    ok = compression_stream_compressor_finish(compressor, tmp_fd);
+  close(src);
+  compression_stream_compressor_destroy(compressor);
+  if (!ok) {
+    close(tmp_fd);
+    return false;
+  }
+  struct stat tmp_st;
+  if (fstat(tmp_fd, &tmp_st) != 0 || tmp_st.st_size < 0) {
+    close(tmp_fd);
+    return false;
+  }
+  unsigned long long compressed_size = (unsigned long long)tmp_st.st_size;
+  if (lseek(tmp_fd, 0, SEEK_SET) == (off_t)-1) {
+    close(tmp_fd);
+    return false;
+  }
+
+  ok = true;
+  if (send_path && !send_wire_str(file_descriptor, file_wire_path(file)))
+    ok = false;
+  if (ok && use_metadata && !metadata_send(file_descriptor, file->metadata))
+    ok = false;
+  if (ok && send_xattrs && !xattr_send(file_descriptor, file ? file->xattrs : NULL))
+    ok = false;
+  if (ok && !send_n_data(file_descriptor, &compressed_size, sizeof(compressed_size)))
+    ok = false;
+  unsigned long long left = compressed_size;
+  while (ok && left > 0) {
+    size_t want = left < sizeof(buf) ? (size_t)left : sizeof(buf);
+    ssize_t got = read(tmp_fd, buf, want);
+    if (got <= 0 || !send_n_data(file_descriptor, buf, (size_t)got)) {
+      ok = false;
+      break;
+    }
+    left -= (unsigned long long)got;
+  }
+  close(tmp_fd);
+  return ok;
+}
+
 bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_metadata,
                                       int compression_level, bool send_path,
                                       char* const* skip_suffixes, int skip_count,
                                       int compression_threads, bool send_xattrs) {
-  if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data))
+  if (!file || !file->path || !file->data)
     return false;
+  /* A source too large to load is streamed: compression streams through a
+   * temp file, no compression must have taken the sendfile path instead. */
+  if (file->data->size != 0 && file->data->data == NULL) {
+    if (compression_level <= 0 ||
+        compression_should_skip_with_suffixes(file->path, skip_suffixes, skip_count))
+      return false;
+    return file_send_compressed_stream_with_skip(file, file_descriptor, use_metadata,
+                                                 compression_level, send_path, skip_suffixes,
+                                                 skip_count, compression_threads, send_xattrs);
+  }
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
   if (compression_level > 0 &&
