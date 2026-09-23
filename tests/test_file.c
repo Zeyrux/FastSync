@@ -2498,9 +2498,13 @@ static void test_file_receive_payload_streams(void) {
     EXPECT_NULL(buffer);
     EXPECT_NOT_NULL(spool);
     EXPECT_TRUE(out_size == size);
+    /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+     * failure */
     if (spool) {
       FILE* fh = fopen(spool, "rb");
       EXPECT_NOT_NULL(fh);
+      /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+       * failure */
       if (fh) {
         unsigned char* got = malloc(size);
         EXPECT_TRUE(fread(got, 1, size, fh) == size);
@@ -2525,6 +2529,8 @@ static void test_file_receive_payload_streams(void) {
     Data* compressed = data_compress_codec(raw, COMPRESSION_ALGO_ZSTD, 3, 0);
     data_destroy(raw);
     EXPECT_NOT_NULL(compressed);
+    /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+     * failure */
     if (compressed) {
       int p[2];
       EXPECT_EQ_INT(pipe(p), 0);
@@ -2537,9 +2543,13 @@ static void test_file_receive_payload_streams(void) {
       EXPECT_NULL(buffer);
       EXPECT_NOT_NULL(spool);
       EXPECT_TRUE(out_size == size);
+      /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+       * failure */
       if (spool) {
         FILE* fh = fopen(spool, "rb");
         EXPECT_NOT_NULL(fh);
+        /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+         * failure */
         if (fh) {
           unsigned char* got = malloc(size);
           EXPECT_TRUE(fread(got, 1, size, fh) == size);
@@ -2575,9 +2585,11 @@ static void test_delta_stream_helpers(void) {
   DeltaSignature* mem_sig = delta_signature_create_seeded(basis, sizeof(basis), 4, 0);
   EXPECT_NOT_NULL(fd_sig);
   EXPECT_NOT_NULL(mem_sig);
+  /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL/EXPECT_TRUE above returns on
+   * failure */
   if (fd_sig && mem_sig) {
     EXPECT_TRUE(fd_sig->block_count == mem_sig->block_count);
-    for (uint32_t i = 0; i < fd_sig->block_count && i < mem_sig->block_count; i++) {
+    for (uint32_t i = 0; i < fd_sig->block_count; i++) {
       EXPECT_TRUE(fd_sig->blocks[i].adler32 == mem_sig->blocks[i].adler32);
       EXPECT_TRUE(fd_sig->blocks[i].xxhash == mem_sig->blocks[i].xxhash);
     }

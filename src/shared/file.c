@@ -424,7 +424,7 @@ static int file_spool_create(const char* dest_path, char** out_spool_path) {
       continue;
     }
     char* copy = str_dup(dest_path);
-    char* dir = copy ? dirname(copy) : NULL;
+    const char* dir = copy ? dirname(copy) : NULL;
     size_t need = dir ? strlen(dir) + 1 + strlen(name) + 1 : 0;
     char* full = need ? malloc(need) : NULL;
     if (!full) {

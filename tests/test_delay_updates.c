@@ -292,6 +292,7 @@ static void test_delay_updates_unique_staging_name() {
   DelayUpdatesContext* second = delay_updates_context_create("test_delay_uniq_tmp");
   EXPECT_NOT_NULL(first);
   EXPECT_NOT_NULL(second);
+  /* cppcheck-suppress knownConditionTrueFalse -- the EXPECT_NOT_NULL checks above return on NULL */
   if (first && second) {
     EXPECT_EQ_INT(strncmp(first->staging_name, ".fastsync-stage.", 16), 0);
     EXPECT_EQ_INT(strncmp(second->staging_name, ".fastsync-stage.", 16), 0);
