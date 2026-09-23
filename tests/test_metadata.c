@@ -339,7 +339,7 @@ static void test_file_restore_metadata_applies_atime() {
   m.crtime_sec = 0;
   m.crtime_nsec = 0;
 
-  file_restore_metadata(path, &m, (FileAttrPolicy){true, true, true, false});
+  file_restore_metadata(path, &m, (FileAttrPolicy){true, true, true, false, true});
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -378,7 +378,7 @@ static void test_file_restore_metadata() {
                     .atime_valid = false,
                     .crtime_valid = false};
 
-  file_restore_metadata(path, &m, (FileAttrPolicy){true, true, false, false});
+  file_restore_metadata(path, &m, (FileAttrPolicy){true, true, false, false, true});
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -395,7 +395,7 @@ static void test_file_restore_executability_only() {
 
   FileMetadata m = {
       .mode = 0751, .uid = getuid(), .gid = getgid(), .mtime_sec = 0, .mtime_nsec = 0};
-  file_restore_metadata(path, &m, (FileAttrPolicy){false, false, false, true});
+  file_restore_metadata(path, &m, (FileAttrPolicy){false, false, false, true, true});
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -409,7 +409,7 @@ static void test_directory_restore_executability_only() {
 
   FileMetadata m = {
       .mode = 0755, .uid = getuid(), .gid = getgid(), .mtime_sec = 0, .mtime_nsec = 0};
-  file_restore_metadata(path, &m, (FileAttrPolicy){false, false, false, true});
+  file_restore_metadata(path, &m, (FileAttrPolicy){false, false, false, true, true});
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -437,7 +437,7 @@ static void test_file_restore_executability_rsync_rule() {
     EXPECT_TRUE(file_write_to_disk(path, "x", 1, false, false));
     EXPECT_EQ_INT(chmod(path, cases[i].dest), 0);
     FileMetadata m = {.mode = cases[i].src, .uid = getuid(), .gid = getgid()};
-    file_restore_metadata(path, &m, (FileAttrPolicy){false, false, false, true});
+    file_restore_metadata(path, &m, (FileAttrPolicy){false, false, false, true, true});
     struct stat st;
     EXPECT_EQ_INT(stat(path, &st), 0);
     EXPECT_EQ_INT(st.st_mode & 0777, cases[i].want);
@@ -453,34 +453,60 @@ static void test_file_restore_executability_rsync_rule() {
  * bits from the destination and --perms wins when both are set. */
 static void test_metadata_mode_for_policy() {
   mode_t out = 0xdead;
-  EXPECT_FALSE(
-      metadata_mode_for_policy(0777, 0644, (FileAttrPolicy){false, false, false, false}, &out));
+  EXPECT_FALSE(metadata_mode_for_policy(0777, 0644,
+                                        (FileAttrPolicy){false, false, false, false, true}, &out));
   EXPECT_EQ_INT((int)out, 0xdead); /* untouched when no change is requested */
 
-  EXPECT_TRUE(
-      metadata_mode_for_policy(0777, 0644, (FileAttrPolicy){true, false, false, false}, &out));
+  EXPECT_TRUE(metadata_mode_for_policy(0777, 0644,
+                                       (FileAttrPolicy){true, false, false, false, true}, &out));
   EXPECT_EQ_INT((int)(out & 0777), 0777); /* group/other write is preserved */
 
   mode_t specials = (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0672);
-  EXPECT_TRUE(
-      metadata_mode_for_policy(specials, 0644, (FileAttrPolicy){true, false, false, false}, &out));
+  EXPECT_TRUE(metadata_mode_for_policy(specials, 0644,
+                                       (FileAttrPolicy){true, false, false, false, true}, &out));
   EXPECT_EQ_INT((int)(out & (S_ISUID | S_ISGID | S_ISVTX | 0777)),
                 (int)(S_ISUID | S_ISGID | S_ISVTX | 0672));
 
+  /* SUPER_MODE_OFF: the special bits are stripped even under -p (this also
+   * covers bits introduced by --chmod, whose result is fed in as source_mode),
+   * while the ordinary permission bits are still copied. */
+  EXPECT_TRUE(metadata_mode_for_policy(specials, 0644,
+                                       (FileAttrPolicy){true, false, false, false, false}, &out));
+  EXPECT_EQ_INT((int)(out & (S_ISUID | S_ISGID | S_ISVTX)), 0);
+  EXPECT_EQ_INT((int)(out & 0777), 0672);
+  EXPECT_TRUE(metadata_mode_for_policy(04755, 0644,
+                                       (FileAttrPolicy){true, false, false, false, false}, &out));
+  EXPECT_EQ_INT((int)(out & 07777), 0755);
+  /* The same holds for a special bit introduced by --chmod=+s. */
+  mode_t chmodded = 0;
+  EXPECT_TRUE(chmod_apply(0755, "u+s", &chmodded));
+  EXPECT_TRUE(metadata_mode_for_policy(chmodded, 0644,
+                                       (FileAttrPolicy){true, false, false, false, false}, &out));
+  EXPECT_EQ_INT((int)(out & 07777), 0755);
+
+  /* -E: a destination's own special bits survive unless super-user activities
+   * are forbidden, in which case they are stripped from the derived base. */
+  EXPECT_TRUE(metadata_mode_for_policy(0755, (mode_t)(S_ISUID | 0750),
+                                       (FileAttrPolicy){false, false, false, true, true}, &out));
+  EXPECT_EQ_INT((int)(out & (S_ISUID | 0777)), (int)(S_ISUID | 0750));
+  EXPECT_TRUE(metadata_mode_for_policy(0755, (mode_t)(S_ISUID | 0750),
+                                       (FileAttrPolicy){false, false, false, true, false}, &out));
+  EXPECT_EQ_INT((int)(out & (S_ISUID | 0777)), 0750);
+
   /* -E: exec bits derive from the DESTINATION's read bits. */
-  EXPECT_TRUE(
-      metadata_mode_for_policy(0755, 0644, (FileAttrPolicy){false, false, false, true}, &out));
+  EXPECT_TRUE(metadata_mode_for_policy(0755, 0644,
+                                       (FileAttrPolicy){false, false, false, true, true}, &out));
   EXPECT_EQ_INT((int)(out & 0777), 0755);
-  EXPECT_TRUE(
-      metadata_mode_for_policy(0644, 0755, (FileAttrPolicy){false, false, false, true}, &out));
+  EXPECT_TRUE(metadata_mode_for_policy(0644, 0755,
+                                       (FileAttrPolicy){false, false, false, true, true}, &out));
   EXPECT_EQ_INT((int)(out & 0777), 0644);
-  EXPECT_TRUE(
-      metadata_mode_for_policy(0755, 0600, (FileAttrPolicy){false, false, false, true}, &out));
+  EXPECT_TRUE(metadata_mode_for_policy(0755, 0600,
+                                       (FileAttrPolicy){false, false, false, true, true}, &out));
   EXPECT_EQ_INT((int)(out & 0777), 0700);
 
   /* --perms wins over -E when both are set. */
   EXPECT_TRUE(
-      metadata_mode_for_policy(0700, 0644, (FileAttrPolicy){true, false, false, true}, &out));
+      metadata_mode_for_policy(0700, 0644, (FileAttrPolicy){true, false, false, true, true}, &out));
   EXPECT_EQ_INT((int)(out & 0777), 0700);
 }
 
@@ -493,8 +519,8 @@ static void test_new_file_mode_from_source_and_umask() {
   mode_t want = (mode_t)(0751 & 0777 & ~(mode_t)file_process_umask());
 
   bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
-                                      (FileAttrPolicy){false, false, false, false}, false, false,
-                                      false, NULL, false, false, NULL);
+                                      (FileAttrPolicy){false, false, false, false, true}, false,
+                                      false, false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -503,8 +529,8 @@ static void test_new_file_mode_from_source_and_umask() {
 
   /* -E on top of the source&~umask base (src 0751, umask 022 -> 0751). */
   ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
-                                 (FileAttrPolicy){false, false, false, true}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, true, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(path, &st), 0);
   mode_t want_e =
@@ -529,7 +555,7 @@ static void test_file_restore_attribute_split() {
                     .crtime_valid = false};
 
   /* times only: mtime changes, mode stays 0640. */
-  file_restore_metadata(path, &m, (FileAttrPolicy){false, true, false, false});
+  file_restore_metadata(path, &m, (FileAttrPolicy){false, true, false, false, true});
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT(st.st_mode & 0777, 0640);
@@ -543,7 +569,7 @@ static void test_file_restore_attribute_split() {
   FileMetadata m2 = m;
   m2.mode = 0700;
   m2.mtime_sec = 1600000000;
-  file_restore_metadata(path, &m2, (FileAttrPolicy){false, false, false, false});
+  file_restore_metadata(path, &m2, (FileAttrPolicy){false, false, false, false, true});
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT(st.st_mode & 0777, 0640);
   EXPECT_EQ_INT((int)st.st_mtime, 1000000000);
@@ -569,6 +595,11 @@ static void test_file_attr_policy_from_config() {
   EXPECT_TRUE(p.times);
   EXPECT_TRUE(p.atimes);
   EXPECT_TRUE(p.executability);
+  /* Default super mode (AUTO) permits special bits. */
+  EXPECT_TRUE(p.super_permitted);
+  c->super_mode = SUPER_MODE_OFF;
+  p = file_attr_policy_from_config(c);
+  EXPECT_FALSE(p.super_permitted);
   config_delete(c);
 }
 
@@ -582,8 +613,8 @@ static void test_perms_preserves_special_bits() {
       .mode = (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0755), .uid = getuid(), .gid = getgid()};
 
   bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
-                                      (FileAttrPolicy){true, false, false, false}, false, false,
-                                      false, NULL, false, false, NULL);
+                                      (FileAttrPolicy){true, false, false, false, true}, false,
+                                      false, false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -670,7 +701,8 @@ static void test_file_restore_symlink_metadata() {
 
   /* Positive path: a non-omitted apply stamps the link's own mtime. */
   FileMetadata applied = {.mtime_sec = 1000000000, .mtime_nsec = 0};
-  file_restore_symlink_metadata(link, &applied, (FileAttrPolicy){false, true, false, false}, false);
+  file_restore_symlink_metadata(link, &applied, (FileAttrPolicy){false, true, false, false, true},
+                                false);
   struct stat st;
   EXPECT_EQ_INT(lstat(link, &st), 0);
   EXPECT_TRUE(S_ISLNK(st.st_mode));
@@ -679,7 +711,8 @@ static void test_file_restore_symlink_metadata() {
 
   /* -J: a different time must be left untouched. */
   FileMetadata newer = {.mtime_sec = 1234567890, .mtime_nsec = 0};
-  file_restore_symlink_metadata(link, &newer, (FileAttrPolicy){false, true, false, false}, true);
+  file_restore_symlink_metadata(link, &newer, (FileAttrPolicy){false, true, false, false, true},
+                                true);
   EXPECT_EQ_INT(lstat(link, &st), 0);
   EXPECT_EQ_INT((int)st.st_mtime, (int)t1);
   if (symlink_times_supported)
@@ -723,14 +756,14 @@ static void test_file_restore_metadata_fd_attribute_split() {
 
   /* perms-only: mode applied, mtime untouched. */
   EXPECT_EQ_INT(fstat(fd, &before), 0);
-  EXPECT_TRUE(file_restore_metadata_fd(fd, &m, (FileAttrPolicy){true, false, false, false}));
+  EXPECT_TRUE(file_restore_metadata_fd(fd, &m, (FileAttrPolicy){true, false, false, false, true}));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT(st.st_mode & 0777, 0755);
   EXPECT_EQ_INT((int)st.st_mtime, (int)before.st_mtime);
 
   /* times-only: mtime applied, mode untouched. */
   EXPECT_EQ_INT(chmod(path, 0600), 0);
-  EXPECT_TRUE(file_restore_metadata_fd(fd, &m, (FileAttrPolicy){false, true, false, false}));
+  EXPECT_TRUE(file_restore_metadata_fd(fd, &m, (FileAttrPolicy){false, true, false, false, true}));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT(st.st_mode & 0777, 0600);
   EXPECT_EQ_INT((int)st.st_mtime, 1234567890);
@@ -740,7 +773,7 @@ static void test_file_restore_metadata_fd_attribute_split() {
                               {.tv_sec = 1000000000, .tv_nsec = 0}};
   EXPECT_EQ_INT(futimens(fd, reset), 0);
   EXPECT_EQ_INT(fstat(fd, &before), 0);
-  EXPECT_TRUE(file_restore_metadata_fd(fd, &m, (FileAttrPolicy){false, false, true, false}));
+  EXPECT_TRUE(file_restore_metadata_fd(fd, &m, (FileAttrPolicy){false, false, true, false, true}));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)st.st_atime, 999999999);
   EXPECT_EQ_INT((int)st.st_mtime, (int)before.st_mtime);
@@ -753,7 +786,8 @@ static void test_file_restore_metadata_fd_attribute_split() {
   m2.mode = 0700;
   m2.mtime_sec = 1600000000;
   m2.atime_sec = 1700000000;
-  EXPECT_TRUE(file_restore_metadata_fd(fd, &m2, (FileAttrPolicy){false, false, false, false}));
+  EXPECT_TRUE(
+      file_restore_metadata_fd(fd, &m2, (FileAttrPolicy){false, false, false, false, true}));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT(st.st_mode & 0777, 0640);
   EXPECT_EQ_INT((int)st.st_mtime, 1000000000);

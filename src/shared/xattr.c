@@ -7,6 +7,7 @@
 #include "utils.h"
 #include "file_types.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,16 +134,23 @@ static bool xattr_name_is_posix_acl(const char* name) {
 
 /* ---- SENDER: capture ---- */
 
-FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
+/* The two syscall families differ only in whether the FINAL component is
+ * followed (`listxattr`/`getxattr` follow; `llistxattr`/`lgetxattr` do not), so
+ * one common implementation backs both public entry points. */
+typedef ssize_t (*XattrListFn)(const char* path, char* list, size_t size);
+typedef ssize_t (*XattrGetFn)(const char* path, const char* name, void* value, size_t size);
+
+static FileXattrList* xattr_capture_common(const char* path, bool preserve_acls,
+                                           XattrListFn list_fn, XattrGetFn get_fn) {
   if (!path)
     return NULL;
-  ssize_t list_size = listxattr(path, NULL, 0);
+  ssize_t list_size = list_fn(path, NULL, 0);
   if (list_size <= 0)
     return NULL; /* no xattrs, ENOTSUP, or error: nothing appliable */
   char* names = malloc((size_t)list_size);
   if (!names)
     return NULL;
-  ssize_t got = listxattr(path, names, (size_t)list_size);
+  ssize_t got = list_fn(path, names, (size_t)list_size);
   if (got < 0) {
     free(names);
     return NULL;
@@ -165,7 +173,7 @@ FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
        negotiated.  Without it a plain -X capture never carries an ACL. */
     if (!xattr_name_appliable(name, preserve_acls))
       continue;
-    ssize_t value_size = getxattr(path, name, NULL, 0);
+    ssize_t value_size = get_fn(path, name, NULL, 0);
     if (value_size < 0)
       continue;
     if (value_size > XATTR_VALUE_MAX)
@@ -178,7 +186,7 @@ FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
       free(names);
       return NULL;
     }
-    ssize_t read_len = getxattr(path, name, buffer, (size_t)value_size);
+    ssize_t read_len = get_fn(path, name, buffer, (size_t)value_size);
     if (read_len < 0 || read_len != value_size) {
       free(buffer);
       continue;
@@ -198,6 +206,14 @@ FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
     return NULL;
   }
   return list;
+}
+
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
+  return xattr_capture_common(path, preserve_acls, listxattr, getxattr);
+}
+
+FileXattrList* xattr_capture_path_nofollow(const char* path, bool preserve_acls) {
+  return xattr_capture_common(path, preserve_acls, llistxattr, lgetxattr);
 }
 
 /* ---- WIRE ---- */
@@ -363,16 +379,74 @@ bool xattr_apply_fd(int fd, const FileXattrList* list) {
   return true;
 }
 
-/* ---- --fake-super: park ownership/mode/mtime in a reserved xattr ---- */
+/* Symlink counterpart of xattr_apply_fd(): target the link ITSELF, never its
+ * referent.  fsetxattr cannot be used (no *at xattr syscall exists, and the
+ * kernel rejects xattr syscalls on an O_PATH descriptor), so the already-open,
+ * confinement-checked parent directory is addressed through /proc/self/fd and
+ * the final component is applied with lsetxattr, which does not follow it.
+ *
+ * The list is trusted to come from xattr_receive() (already whitelisted), but
+ * every name is re-validated here so this path-based primitive is confined on
+ * its own -- this is the only apply primitive that addresses a path, and the
+ * header promises a whitelisted apply.  The apply is best-effort: if /proc is
+ * not mounted (the anchor cannot be formed) or the kernel refuses the set, the
+ * failure is skipped and never fails the transfer.  See xattr.h for the bounded
+ * residual TOCTOU between link creation and lsetxattr. */
+bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list,
+                               bool preserve_acls) {
+  if (parent_fd < 0 || !leaf || leaf[0] == '\0' || strchr(leaf, '/') != NULL || !list)
+    return false;
+  if (list->count == 0)
+    return true;
+  char prefix[64];
+  int prefix_len = snprintf(prefix, sizeof(prefix), "/proc/self/fd/%d/", parent_fd);
+  if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix))
+    return false;
+  size_t leaf_len = strlen(leaf);
+  char* path = malloc((size_t)prefix_len + leaf_len + 1);
+  if (!path)
+    return false;
+  memcpy(path, prefix, (size_t)prefix_len);
+  memcpy(path + prefix_len, leaf, leaf_len + 1);
+  bool warned = false;
+  int first_errno = 0;
+  for (int i = 0; i < list->count; i++) {
+    const FileXattr* xa = &list->items[i];
+    /* Defense in depth: re-validate against the receiver's full whitelist, so a
+       hand-crafted list can never apply a privileged namespace or the reserved
+       --fake-super key through this path-based primitive. */
+    if (!xattr_name_appliable(xa->name, preserve_acls))
+      continue;
+    if (lsetxattr(path, xa->name, xa->value, xa->value_len, 0) != 0) {
+      if (!warned) {
+        warned = true;
+        first_errno = errno;
+      }
+    }
+  }
+  if (warned)
+    log_message(LOG_LEVEL_WARNING,
+                "could not set one or more xattrs on the destination symlink: %s",
+                strerror(first_errno));
+  free(path);
+  return true;
+}
 
-void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int64_t mtime_sec,
-                         int64_t mtime_nsec) {
+/* ---- --fake-super: park ownership/mode/rdev in a reserved xattr ---- */
+
+void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, uint32_t rdev_major,
+                         uint32_t rdev_minor) {
   if (fd < 0)
     return;
-  char record[128];
-  int len =
-      snprintf(record, sizeof(record), "%lu:%lu:%03o:%lld:%ld", (unsigned long)uid,
-               (unsigned long)gid, (unsigned)mode & 0777U, (long long)mtime_sec, (long)mtime_nsec);
+  /* rsync 3.4.1's exact grammar: "<octal full st_mode> <rdev_major>,<rdev_minor>
+   * <uid>:<gid>".  The octal mode carries the S_IFMT bits (e.g. 0104711 for a
+   * setuid regular file, 020644 for a char device); the rdev pair is 0,0 for a
+   * non-device.  No mtime field: rsync leaves the file's own timestamp in
+   * charge of mtime.  This value is what rsync reads back to restore a
+   * fake-super tree, so the field order and separators must not change. */
+  char record[96];
+  int len = snprintf(record, sizeof(record), "%o %u,%u %u:%u", (unsigned)mode, (unsigned)rdev_major,
+                     (unsigned)rdev_minor, (unsigned)uid, (unsigned)gid);
   if (len <= 0 || (size_t)len >= sizeof(record))
     return;
   if (fsetxattr(fd, FAKESUPER_XATTR, record, (size_t)len, 0) != 0) {
@@ -381,11 +455,64 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
   }
 }
 
-/* --fake-super replay: read the freshly-stored record and re-apply mode/mtime
- * fd-relative.  The recorded uid/gid are retained for a later privileged
- * restore but are NEVER chowned here: --fake-super only RECORDS ownership, it
- * must not real-chown the recorded (resolved) owner.  Mode/mtime still apply so
- * unprivileged --fake-super keeps working. */
+/* Parse rsync's `user.rsync.%stat` grammar strictly:
+ *   "<octal st_mode> <rdev_major>,<rdev_minor> <uid>:<gid>"
+ * Every field is parsed with strtoul() so an out-of-range value is a clean
+ * rejection rather than the undefined behavior sscanf("%u") exhibited, each
+ * field is range-checked against the same bounds the wire validator uses, and
+ * the whole record must be consumed (only trailing whitespace is tolerated) so
+ * trailing garbage is refused.  Returns false on any malformed input. */
+static bool fake_super_parse_stat(const char* record, unsigned* mode_out, unsigned* rdev_major_out,
+                                  unsigned* rdev_minor_out, unsigned* uid_out, unsigned* gid_out) {
+  if (!record)
+    return false;
+  char* end = NULL;
+  const char* p = record;
+  errno = 0;
+  unsigned long mode = strtoul(p, &end, 8);
+  if (errno != 0 || end == p || mode > (unsigned long)UINT_MAX || *end != ' ')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long rdev_major = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || rdev_major > 0xffffUL || *end != ',')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long rdev_minor = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || rdev_minor > 0x00ffffffUL || *end != ' ')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long uid = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || uid > (unsigned long)UINT_MAX || *end != ':')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long gid = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || gid > (unsigned long)UINT_MAX)
+    return false;
+  p = end;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    p++;
+  if (*p != '\0')
+    return false;
+  *mode_out = (unsigned)mode;
+  *rdev_major_out = (unsigned)rdev_major;
+  *rdev_minor_out = (unsigned)rdev_minor;
+  *uid_out = (unsigned)uid;
+  *gid_out = (unsigned)gid;
+  return true;
+}
+
+/* --fake-super replay: read the freshly-stored record and re-apply its
+ * permission bits fd-relative.  The recorded uid/gid are retained for a later
+ * privileged restore but are NEVER chowned here: --fake-super only RECORDS
+ * ownership, it must not real-chown the recorded (resolved) owner.  The
+ * recorded rdev is likewise parsed for grammar compatibility but is not acted
+ * on (device recreation is a separate, privilege-gated path).  mtime is not in
+ * the record: the normal metadata path applies it (policy.times), exactly as
+ * rsync relies on the file's own timestamp. */
 bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
   if (fd < 0)
     return false;
@@ -394,24 +521,25 @@ bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
   if (len < 0)
     return false; /* absent or filesystem without xattrs: silent no-op */
   record[len] = '\0';
-  unsigned long ul_uid, ul_gid, ul_mode;
-  long long mtime_sec;
-  long mtime_nsec;
-  if (sscanf(record, "%lu:%lu:%lo:%lld:%ld", &ul_uid, &ul_gid, &ul_mode, &mtime_sec, &mtime_nsec) !=
-      5)
+  unsigned ul_mode, rdev_major, rdev_minor, ul_uid, ul_gid;
+  if (!fake_super_parse_stat(record, &ul_mode, &rdev_major, &rdev_minor, &ul_uid, &ul_gid))
     return false; /* malformed record: skip, never fatal */
 
-  /* --fake-super NEVER performs a real chown: that would defeat the whole
-     point of the flag (record privileged ownership on an unprivileged receiver
-     for a later privileged restore).  The uid/gid parsed above are retained in
-     the record for that later restore, but no ownership change happens here. */
+  /* --fake-super NEVER performs a real chown: that would defeat the whole point
+     of the flag (record privileged ownership on an unprivileged receiver for a
+     later privileged restore).  The uid/gid parsed above are retained in the
+     record for that later restore, but no ownership change happens here.  The
+     rdev is retained for the same reason. */
+  (void)rdev_major;
+  (void)rdev_minor;
   (void)ul_uid;
   (void)ul_gid;
   /* Mode is applied only when the per-attribute policy asks for it, through the
-     SAME shared helper the normal metadata path uses (metadata_mode_for_policy):
-     under --perms the recorded source mode is copied exactly, including
-     group/other write and setuid/setgid/sticky bits (rsync parity), and the -E
-     rule derives exec bits from the destination's read bits exactly like
+     SAME shared helper the normal metadata path uses (metadata_mode_for_policy).
+     The recorded special bits are stripped first: rsync's fake-super receiver
+     stores the full mode in the xattr but never installs setuid/setgid/sticky on
+     the real file, so only the 0777 permission bits may be replayed.  The -E
+     rule then derives exec bits from the destination's read bits exactly like
      file_restore_metadata_fd. */
   if (policy.perms || policy.executability) {
     struct stat cur;
@@ -419,19 +547,12 @@ bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
     if (fstat(fd, &cur) != 0) {
       log_message(LOG_LEVEL_WARNING, "--fake-super: could not read destination mode: %s",
                   strerror(errno));
-    } else if (metadata_mode_for_policy((mode_t)ul_mode, cur.st_mode, policy, &want)) {
+    } else if (metadata_mode_for_policy((mode_t)(ul_mode & 0777U), cur.st_mode, policy, &want)) {
       if (fchmod(fd, want) != 0)
         log_message(LOG_LEVEL_WARNING,
                     "--fake-super: could not restore mode on destination file: %s",
                     strerror(errno));
     }
-  }
-  if (policy.times) {
-    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-                                {.tv_sec = (time_t)mtime_sec, .tv_nsec = mtime_nsec}};
-    if (futimens(fd, times) != 0)
-      log_message(LOG_LEVEL_WARNING,
-                  "--fake-super: could not restore mtime on destination file: %s", strerror(errno));
   }
   return true;
 }

@@ -4,6 +4,207 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [Unreleased]
+
+## [2.29.0] - 2026-09-23
+
+The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).
+`RSYNC_COMPAT.md` moves from **116 ✅ / 14 ⚠️ / 27 ❌** to
+**120 ✅ / 10 ⚠️ / 27 ❌** of 157 rows.
+
+An audit cycle follows on the same wire version (`PROTOCOL_VERSION` stays
+2.28.0): a security-and-correctness pass over the parity-2.29 baseline, plus a
+set of audit follow-ups (filter merge modifiers, the `--inplace`/`--partial-dir`
+conflict, credential-file hardening, and small leak/log/test fixes). It fixes
+a `--temp-dir` symlink escape, gates client-controlled special permission bits,
+corrects `--partial-dir`/`--bwlimit`/`-z` behavior, handles unsupported filter
+modifiers, and tightens client and wire validation. The only parity
+reclassification is `--filter=RULE` moving ✅ → ⚠️, because its merge-only
+`e`/`n`/`w`/`-` modifiers are now accepted and consumed but their semantics
+remain unimplemented (accepted-but-ignored); the matrix is therefore **119 ✅ /
+11 ⚠️ / 27 ❌** of 157 rows. The affected rows' notes and the summary tally in
+`RSYNC_COMPAT.md` were updated. A following triage-fix cycle (see **Triage
+fixes** below) moves `-F` and `-i` to ⚠️, for a final **117 ✅ / 13 ⚠️ / 27 ❌**
+of 157 rows.
+
+A no-wire parity burn-down cycle follows on 2.28.0: it accepts
+`--inc-recursive`/`--no-inc-recursive` as inert no-ops, accepts an absolute
+`--temp-dir` that canonicalizes inside the receive root, closes the
+`--delete-before` phase-0 divergence (both the single-threaded and `--threads`
+data passes replay the pre-scan list), makes `--fake-super` interoperable with
+rsync's `user.rsync.%stat` key/grammar (regular files and char/block devices
+faked as regular files), turns a failed device `mknod` into a continuing
+per-entry failure, and accepts a practical subset of rsync's `rsyncd.conf`
+grammar (modules are read-only by default, and accepted-but-unenforced
+access-control keys emit a startup warning). The matrix moves to **119 ✅ /
+14 ⚠️ / 24 ❌** of 157 rows.
+
+A structural cycle then lands a transport I/O vtable over TCP/TLS (fixing the
+TLS-multithreaded sendfile path and making the per-thread SSL resolution
+explicit) and bumps the wire to **2.29.0**: the `STATUS_SYMLINK` frame grows an
+optional symlink-xattr block (captured no-follow with `llistxattr`/`lgetxattr`,
+applied no-follow with `lsetxattr`). Because the handshake is strict, 2.28.0 and
+2.29.0 peers are incompatible. Note: Linux refuses to associate xattrs with a
+symlink at all, so the symlink-xattr block is a no-op on Linux and is carried
+for correctness on platforms/filesystems that do support it; the config-frame
+layout is unchanged (golden length still 886).
+
+### Changed
+
+- **rsync-exact traversal order.** The sequential scanner now walks each
+  directory's entries in rsync 3.4.1's flist order (non-directories ascending,
+  then directories ascending, depth-first), so `--info=name`, the
+  `--delete-during`/`--delete-delay`/`-n` would-delete order and the partial
+  `--max-delete` survivor set match rsync byte-for-byte. `--threads` has no
+  rsync analogue and stays unordered.
+- **Delete timing.** The complete `--delete-during`/`--delete-delay`
+  per-directory plan set is transmitted before the first data frame, so a
+  mid-transfer abort has already removed every planned extra like rsync's
+  generator; `-d/--dirs` uses per-directory plans (shielded untraversed
+  subdirectories) instead of the end-of-transfer commit. `-n`, `--delete`,
+  `--del`/`--delete-during` and `--delete-delay` are now ✅ Parity.
+- **Basis directories.** A relative `--compare-dest`/`--copy-dest`/`--link-dest`
+  DIR resolves against the destination directory with the transfer-relative
+  name appended, exactly like rsync 3.4.1.
+- **`-y`/`--fuzzy`.** The candidate search no longer inherits the ordinary delta
+  engine's 16 KiB minimum or 10× size-ratio bound, so an oversized or
+  sub-16-KiB sibling is reused exactly as rsync reuses it.
+- `--info=mount` prints rsync's mount-point skip line (repeated `-xx` drops the
+  mount-point directory); `--info=stats` enables the `--stats` block; `-x` is
+  repeatable. `--stats` counts traversed directories for the `Number of files`
+  breakdown under a plain `-r` scan. `--debug` emits real output for
+  `flist`/`del`/`hash`/`deltasum`/`recv`/`filter`/`send`.
+
+### Known residuals
+
+- `--progress` and `--info` still need a receiver→sender event channel for the
+  root `./` line, ancestor-directory suppression, receiver-side `skip`/`backup`
+  wording, and symlink/empty-directory quick-checks.
+- `--delete-before`'s phase-0 late-file divergence remains (rsync's pre-scan
+  fixes the file list before the data pass).
+- A single file larger than 256 MiB cannot be streamed in the default path
+  (a general whole-file limit, not basis-specific).
+- `--stats` byte totals and `--msgs2stderr` stay documented divergences.
+
+### Security
+
+- **`--temp-dir` symlink escape fixed.** The receiver's scratch directory was
+  opened with a bare `open()`, so a symlink planted under the receive root could
+  redirect receiver scratch files outside the authorized root. The opened
+  directory is now judged by the real path of its fd (`/proc/self/fd` via
+  `realpath`) and an escaping target is refused (`EACCES`, logged); an in-root
+  link to another filesystem (the `EXDEV` fallback case) still works.
+- **Client-controlled special bits masked when super-user activities are not
+  permitted.** Setuid/setgid/sticky bits (`--perms`, `--chmod`, the symlink and
+  special-node paths, and deferred directory modes) are now stripped when the
+  connection forbids super activities (`--no-super`, a non-opted daemon module,
+  a privileged listener without `--allow-super`); exact rsync semantics are
+  preserved wherever super activities are permitted.
+- **Daemon umask no longer forced to `0`.** `daemonize()` now sets the
+  conventional `022`, so implied parent directories created without `-p` are no
+  longer world-writable `0777`.
+- **Daemon modules are read-only by default.** A `--daemon` module is now
+  served read-only unless it sets `read only = no` (or rsync's `write only =
+  yes`), matching rsync: a real `rsyncd.conf` that omits `read only` is no
+  longer silently writable. A global `read only` still sets the default for
+  later modules, and an explicit module value wins. This is a behavior change
+  for existing FastSync-native configs that relied on the old writable default;
+  add `read only = no` to keep them writable. An rsync `write only = yes` is
+  mapped to writability (FastSync is push-only, so a module can never be read
+  from the network).
+- **Accepted-but-unenforced rsync security keys now warn at startup.** The
+  rsync keys FastSync recognizes but does not implement — `secrets file`,
+  `refuse options`, `exclude`/`include`/`filter`, `max size`/`min size`,
+  `pre-xfer exec`/`post-xfer exec`, `incoming chmod`/`outgoing chmod`,
+  `name converter`, `use chroot`, `uid`/`gid`, and the rest of the
+  access-control set — load for migration compatibility but now emit a
+  `WARN` naming the key (and module) so an operator does not believe the
+  restriction is enforced. `auth users`/`secrets file` stay fail-closed: a
+  module declaring `auth users` still requires a FastSync credential store.
+- **Credentials and signal handling hardened.** Secret files are opened with
+  `O_NOFOLLOW|O_NONBLOCK` (while allowing fd-backed store paths and bound-waiting
+  a FIFO read for ~3 s so a slow process substitution works but a connected-but-
+  silent FIFO cannot hang), and signal handlers use `sigaction` with
+  async-signal-safe bodies.
+
+### Fixed
+
+- **`-z` on 100–256 MiB files.** The decompressor's internal ceiling was 100 MiB
+  while the receiver advertises and the sender compresses whole files up to
+  `MAX_RECEIVE_WHOLE_FILE_SIZE` (256 MiB), so `-z` on a 100–256 MiB regular file
+  failed with `Declared decompressed size exceeds 104857600 bytes`. The ceiling
+  is now defined in terms of the protocol whole-file bound (still an
+  allocation-clamped bomb guard).
+- **`--bwlimit` now paces `--sendfile`.** The plaintext-TCP `--sendfile` fast
+  path bypassed the protocol's token bucket, so the limit was ignored there. It
+  now throttles through the same per-session leaky bucket as the TLS path.
+- **`--partial-dir` implies `--partial`.** Matching rsync 3.4.1 (which sets
+  `keep_partial` after option parsing), `--partial-dir=DIR` alone retains an
+  interrupted transfer's partial and wins over an explicit `--no-partial`;
+  `--inplace` still bypasses the partial machinery, and combining `--inplace`
+  with `--partial-dir` is now rejected up front with rsync's message
+  (`--inplace cannot be used with --partial-dir`).
+- **Filter modifiers handled.** The `x` xattr-name modifier is rejected with a
+  clear error everywhere. The merge-only `e`/`n`/`w` and `-` modifiers are now
+  accepted and consumed on `merge`/`dir-merge` rules (so they no longer leak
+  into the merge filename) while still being rejected on non-merge rules,
+  matching rsync; their semantics remain unimplemented (accepted-but-ignored).
+  Glued patterns (`-newfile`, `-e2e`) and mixed tokens (`H,!secret`) keep their
+  historical parsing.
+- **Credential-file reads hardened.** Secret files (`--password-file`/
+  `--early-input`/`--hash-credentials` input) are opened with `O_NOFOLLOW`, so a
+  symlinked credential path now fails closed (`ELOOP`) instead of being followed
+  before the owner/mode gate; literal fd-backed paths (`/dev/fd/<digits>`,
+  `/proc/self/fd/<digits>`) are exempt so process substitution still works. A
+  FIFO/process-substitution read now waits under a bounded ~3 s deadline for its
+  writer, so a slow producer works while a connected-but-silent FIFO fails
+  instead of hanging.
+- **Miscellaneous correctness fixes:** `--filter` rule count is checked
+  client-side against `MAX_FILTER_RULES` before any network I/O (the receiver
+  still re-checks the expanded count); unknown wire `Status` values are rejected
+  as protocol errors; a mutex leak on an init-failure path, an `errno` read
+  after `free()` in deferred delete application, `log_perror` misuse for
+  non-`errno` conditions, and a `NULL` `server_host`/`ssh_destination`
+  allocation path were fixed (the `config_create` failure now releases through
+  `config_delete`); the decompression-limit log now prints the effective bound
+  rather than the compile-time ceiling; the daemon umask and root test fixtures
+  were hardened; `SSL_read` length is clamped and `sendfile` `poll()` retries on
+  `EINTR`.
+
+### Refactored / Docs
+
+- Dropped dead `filter_rules_apply` and dead `--old-args` plumbing, unified
+  `set_error`, deduplicated `path_is_within` and shared constants, and added
+  printf format attributes (fixing format mismatches). `RSYNC_COMPAT.md`,
+  `CHANGELOG.md` and `HANDOFF.md` were updated for the audit cycle; the
+  `RSYNC_COMPAT.md` summary tally was corrected to match the rows.
+
+### Triage fixes
+
+- **`--dirs` directory xattrs applied inline.** A `-d/--dirs` transfer now
+  applies captured directory `-X`/`-A` xattrs fd-relative on the directory entry
+  instead of dropping them, so directory xattrs survive the non-recursive path
+  (`src/shared/file_save.c`, `tests/test_xattr.c`).
+- **Directory/root itemize and `--out-format` lines.** `-i`/`--itemize-changes`
+  and `--out-format` now emit the transfer-root `./` line and per-directory
+  `cd...`/`.d..t...` lines, rendered by the shared itemize code. This matches
+  rsync's fresh-transfer output; because the root line is unconditional and an
+  incremental re-run may itemize directories/symlinks that rsync's quick-check
+  leaves silent, `-i` is now a ⚠️ Caveat row.
+- **FROM name globs for identity maps.** `--usermap`/`--groupmap` `FROM` tokens
+  now accept `*`/`?`/`[...]` globs, expanded sender-side against the passwd/group
+  database and collapsed into bounded numeric ranges (`MAX_IDENTITY_MAP`),
+  matching rsync.
+- **Transport fallback unit tests.** Added unit coverage for the TCP/TLS
+  transport fallback paths (`tests/test_transport_tcp.c`,
+  `tests/test_transport_tls.c`).
+- **Docs corrections.** `RSYNC_COMPAT.md`/`README.md` corrected stale parity
+  claims for issues #286–#297: the `-F` and `-i` reclassifications, the
+  `--munge-links` direction, the accepted checksum/compression name sets,
+  `--bwlimit` parsing, `--stop-at` grammar, `--trust-sender`, symlink xattrs, and
+  the native/non-interoperable batch and credential notes. The summary tally is
+  now **117 ✅ / 13 ⚠️ / 27 ❌** of 157 rows.
+
 ## [2.28.0] - 2026-09-20
 
 The rsync-parity cycle. `PROTOCOL_VERSION` moves `2.26.0 → 2.27.0 → 2.28.0`;

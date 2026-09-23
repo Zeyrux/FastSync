@@ -10,6 +10,8 @@
 #include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <fnmatch.h>
+#include <grp.h>
 #include <pwd.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -171,6 +173,38 @@ static void test_validate_config_unified_invariants() {
   config_delete(cfg);
 }
 
+/* The receiver enforces MAX_FILTER_RULES on the protect-rule block and would
+   otherwise fail the session with an opaque protocol error.  The client must
+   accept exactly the limit and reject one more up front, before any network
+   I/O, with an actionable message. */
+static void test_validate_config_filter_rule_limit() {
+  Config* cfg = valid_client_config();
+  cfg->filters = array_list_create(free);
+  EXPECT_NOT_NULL(cfg->filters);
+  for (int i = 0; i < MAX_FILTER_RULES; i++)
+    EXPECT_TRUE(array_list_add(cfg->filters, str_dup("- *.tmp")));
+  EXPECT_TRUE(validate_config(cfg)); /* exactly the limit is accepted */
+
+  FILE* log_capture = tmpfile();
+  EXPECT_NOT_NULL(log_capture);
+  log_set_file(log_capture);
+  EXPECT_TRUE(array_list_add(cfg->filters, str_dup("- *.bak")));
+  EXPECT_FALSE(validate_config(cfg)); /* one over the limit is rejected */
+  fflush(log_capture);
+  rewind(log_capture);
+  char line[512];
+  bool saw_message = false;
+  while (fgets(line, sizeof(line), log_capture) != NULL) {
+    if (strstr(line, "too many filter rules") != NULL && strstr(line, "(maximum 1024)") != NULL)
+      saw_message = true;
+  }
+  log_set_file(NULL);
+  fclose(log_capture);
+  EXPECT_TRUE(saw_message);
+
+  config_delete(cfg);
+}
+
 /* Test main() with --help flag (early return path, no server connection needed) */
 static void test_cli_help() {
   /* We can't easily call main() because it calls send_files which needs a server.
@@ -318,7 +352,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.28.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.29.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -328,7 +362,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.28.0"};
+                        "/dst",     "--protocol",   "2.29.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -341,7 +375,7 @@ static void test_parse_args_protocol_rejects_other_versions() {
   static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
                                              "2.18.0", "2.19.0", "2.20.0", "2.21.0", "2.22.0",
                                              "2.23.0", "2.24.0", "2.25.0", "2.26.0", "2.27.0",
-                                             "216",    "31",     "abc",    ""};
+                                             "2.28.0", "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -511,6 +545,66 @@ static void test_parse_args_ignore_existing() {
   config_delete(cfg);
 }
 
+/* --partial-dir=DIR implies --partial, matching rsync 3.4.1.  rsync resolves
+ * this after option parsing, so the implication wins over an explicit
+ * --no-partial in either order.  It is skipped under --inplace, where partial
+ * staging is bypassed and the destination is written in place. */
+static void test_parse_args_partial_dir_implies_partial() {
+  {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* Explicit --no-partial before --partial-dir: --partial-dir still wins. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--no-partial", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* Reversed order must not change the precedence. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--partial-dir=.partial", "--no-partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* --inplace bypasses partial staging, so parse_args must not set the
+       implied --partial; the combination itself is invalid (rsync parity:
+       "--inplace cannot be used with --partial-dir"), so validation rejects. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--inplace", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->partial);
+    cfg->send_directory = str_dup("/src");
+    cfg->receive_root_directory = str_dup("/dst");
+    EXPECT_FALSE(validate_config(cfg));
+    config_delete(cfg);
+  }
+  {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--no-partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->partial);
+    config_delete(cfg);
+  }
+}
+
 static void test_parse_args_executability() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "-E", "/src", "/dst"};
@@ -638,7 +732,7 @@ static void test_parse_args_port_alias() {
   EXPECT_EQ_INT(cfg->server_port, 9000);
   /* The default port is 8080; the explicit bit is what lets --dry-run tell an
      explicit remote target from the default and route to the server. */
-  EXPECT_TRUE(cfg->server_port_set);
+  EXPECT_TRUE(cfg->cli.server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -646,7 +740,7 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9001);
-  EXPECT_TRUE(cfg->server_port_set);
+  EXPECT_TRUE(cfg->cli.server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -654,7 +748,7 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9002);
-  EXPECT_TRUE(cfg->server_port_set);
+  EXPECT_TRUE(cfg->cli.server_port_set);
   config_delete(cfg);
 }
 
@@ -665,18 +759,18 @@ static void test_parse_args_server_host_sets_routing_bit() {
   Config* cfg = config_create();
   int positional_args[2];
   int positional_count = 0;
-  EXPECT_FALSE(cfg->server_host_set);
+  EXPECT_FALSE(cfg->cli.server_host_set);
   char* argv_space[] = {"fastsync", "--server-host", "example.test", "/src", "/dst"};
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->server_host, "example.test");
-  EXPECT_TRUE(cfg->server_host_set);
+  EXPECT_TRUE(cfg->cli.server_host_set);
   config_delete(cfg);
 
   cfg = config_create();
   char* argv_inline[] = {"fastsync", "--server-host=example.test", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->server_host_set);
+  EXPECT_TRUE(cfg->cli.server_host_set);
   config_delete(cfg);
 }
 
@@ -762,8 +856,9 @@ static void test_parse_args_debug_flags() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL);
-  EXPECT_EQ_INT(get_log_debug_flags(), LOG_DEBUG_ALL);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_IO | LOG_DEBUG_PROTO | LOG_DEBUG_PACK | LOG_DEBUG_UTIL);
+  EXPECT_EQ_INT(get_log_debug_flags(),
+                LOG_DEBUG_IO | LOG_DEBUG_PROTO | LOG_DEBUG_PACK | LOG_DEBUG_UTIL);
   config_delete(cfg);
 }
 
@@ -1241,33 +1336,76 @@ static void test_parse_args_delete_timing_without_delete_rejected() {
   config_delete(cfg);
 }
 
-/* Parsed-but-unimplemented options must fail instead of being silently accepted. */
-static void test_parse_args_rejects_unimplemented_options() {
-  static const char* const options[] = {"--silent",
-                                        "--queue-size",
-                                        "-A",
-                                        "--acls",
-                                        "-X",
-                                        "--xattrs",
-                                        "-D",
-                                        "--devices",
-                                        "--delete-excluded",
-                                        "--max-delete",
-                                        "--prune-empty-dirs",
-                                        "--bind-address",
-                                        "--daemon",
-                                        "--config",
-                                        "--server"};
+/* Truly-unknown options (including server-only spellings) must be rejected
+ * through the unknown-option path instead of being silently accepted. */
+static void test_parse_args_rejects_unknown_options() {
+  static const char* const options[] = {"--silent", "--queue-size", "--bind-address",
+                                        "--daemon", "--config",     "--server"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
-    char* argv[] = {"fastsync", (char*)options[i], "dummy", "/src", "/dst"};
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
 
-    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+}
+
+/* Options that are genuinely implemented must parse successfully and record
+ * their effect, rather than being lumped in with the unknown-option set. */
+static void test_parse_args_accepts_implemented_metadata_options() {
+  Config* cfg = config_create();
+  char* argv_x[] = {"fastsync", "-X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_x, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_acls[] = {"fastsync", "--acls", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_acls, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_acls);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_d[] = {"fastsync", "-D", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_d, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_devices[] = {"fastsync", "--devices", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_devices, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_delete_excluded[] = {"fastsync", "--delete-excluded", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_delete_excluded, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->delete_excluded);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_max_delete[] = {"fastsync", "--max-delete=5", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_max_delete, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->max_delete, 5);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_prune[] = {"fastsync", "--prune-empty-dirs", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_prune, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->prune_empty_dirs);
+  config_delete(cfg);
 }
 
 /* Test both rsync-compatible quiet spellings and option ordering. */
@@ -1421,10 +1559,9 @@ static void test_parse_args_info_name_and_help() {
   config_delete(cfg);
 }
 
-/* rsync 3.4.1's full --info/--debug vocabulary parses.  The info categories
- * with a FastSync event set their flag; the remaining rsync-only categories
- * (backup/mount/symsafe/syms) parse but stay silent.  Every --debug category
- * listed here is FastSync-silent, so debug_level stays 0. */
+/* rsync 3.4.1's full --info/--debug vocabulary parses.  The categories with a
+ * FastSync event set their flag; the remaining rsync-only categories
+ * (backup/symsafe/syms, acl/bind/chdir/...) parse but stay silent. */
 static void test_parse_args_rsync_flag_vocabulary_accepted() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--info=backup,del,flist,mount,nonreg,progress,remove,symsafe,syms",
@@ -1436,9 +1573,10 @@ static void test_parse_args_rsync_flag_vocabulary_accepted() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_NONREG |
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_MOUNT | LOG_INFO_NONREG |
                                      LOG_INFO_PROGRESS | LOG_INFO_REMOVE);
-  EXPECT_EQ_INT(cfg->debug_level, 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_DEL | LOG_DEBUG_FLIST | LOG_DEBUG_HASH |
+                                      LOG_DEBUG_RECV | LOG_DEBUG_FILTER | LOG_DEBUG_SEND);
   config_delete(cfg);
 }
 
@@ -1590,7 +1728,7 @@ static void test_parse_args_no_preserve_blocks_implicit_metadata() {
 
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
     EXPECT_FALSE(cfg->use_metadata);
-    EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+    EXPECT_TRUE(cfg->cli.metadata_explicitly_disabled);
     config_delete(cfg);
   }
 }
@@ -1641,7 +1779,7 @@ static void test_parse_args_checksum_choice_rejects_unsupported() {
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
-    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+    EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
     config_delete(cfg);
   }
 }
@@ -1681,7 +1819,7 @@ static void test_parse_args_checksum_choice_new_algos() {
     positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
     EXPECT_EQ_INT(cfg->checksum_algo, single[i]);
-    EXPECT_EQ_INT(cfg->checksum_transfer_algo, single[i]);
+    EXPECT_EQ_INT(cfg->cli.checksum_transfer_algo, single[i]);
     config_delete(cfg);
   }
 
@@ -1691,7 +1829,7 @@ static void test_parse_args_checksum_choice_new_algos() {
   char* argv5[] = {"fastsync", "--cc=sha1,md4", "/checksum/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_SHA1);
+  EXPECT_EQ_INT(cfg->cli.checksum_transfer_algo, (int)CHECKSUM_ALGO_SHA1);
   EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD4);
   config_delete(cfg);
 
@@ -1713,14 +1851,14 @@ static void test_parse_args_checksum_none_with_checksum_rejected() {
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
 
   cfg = config_create();
   char* argv2[] = {"fastsync", "--checksum", "--cc=md5,none", "/checksum/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
 
   /* "none" as the TRANSFER checksum with a real pre-transfer checksum is
@@ -1822,7 +1960,7 @@ static void test_parse_args_compress_choice_parity() {
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
-    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+    EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
     config_delete(cfg);
   }
 }
@@ -1942,6 +2080,9 @@ static void test_parse_args_temp_dir() {
   config_delete(cfg);
 }
 
+/* --old-args is accepted for rsync CLI compatibility as a documented no-op (the
+ * remote server path is always safely quoted); it stores no Config field, so
+ * parsing it must simply succeed and leave the positional arguments intact. */
 static void test_parse_args_old_args() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--old-args", "/src", "/dst"};
@@ -1949,7 +2090,7 @@ static void test_parse_args_old_args() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->old_args);
+  EXPECT_EQ_INT(positional_count, 2);
   config_delete(cfg);
 }
 
@@ -2583,7 +2724,7 @@ static void test_parse_args_compression_env_list() {
   cfg = config_create();
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
   unsetenv("RSYNC_COMPRESS_LIST");
 }
@@ -2598,7 +2739,7 @@ static void test_parse_args_checksum_env_list() {
   setenv("RSYNC_CHECKSUM_LIST", "md5", 1);
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
-  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_MD5);
+  EXPECT_EQ_INT(cfg->cli.checksum_transfer_algo, (int)CHECKSUM_ALGO_MD5);
   config_delete(cfg);
 
   /* An explicit --cc wins. */
@@ -2614,7 +2755,7 @@ static void test_parse_args_checksum_env_list() {
   cfg = config_create();
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
   unsetenv("RSYNC_CHECKSUM_LIST");
 }
@@ -3398,6 +3539,243 @@ static void test_parse_args_usermap_rsync_forms() {
   config_delete(cfg);
 }
 
+/* Independent oracle for the FROM name-glob tests: enumerate the sender's
+ * account database and fill `ids` with the DISTINCT ids whose name matches
+ * `glob`, sorted ascending.  Returns the count, or -1 if the matching set
+ * exceeds `max` distinct ids -- production has no such bound on the number of
+ * candidates it scans, so a truncated set would under-count runs and flake on
+ * hosts with very large account databases.  Callers must skip (not fail) on
+ * -1. */
+static int cli_collect_glob_ids(const char* glob, bool is_group, int32_t* ids, int max) {
+  int n = 0;
+  bool overflow = false;
+  if (is_group) {
+    setgrent();
+    struct group* gr;
+    while ((gr = getgrent()) != NULL) {
+      if (fnmatch(glob, gr->gr_name, 0) != 0)
+        continue;
+      if ((unsigned long)gr->gr_gid > (unsigned long)INT32_MAX)
+        continue;
+      int32_t id = (int32_t)gr->gr_gid;
+      bool dup = false;
+      for (int i = 0; i < n; i++)
+        if (ids[i] == id)
+          dup = true;
+      if (dup)
+        continue;
+      if (n >= max) {
+        overflow = true;
+        break;
+      }
+      ids[n++] = id;
+    }
+    endgrent();
+  } else {
+    setpwent();
+    struct passwd* pw;
+    while ((pw = getpwent()) != NULL) {
+      if (fnmatch(glob, pw->pw_name, 0) != 0)
+        continue;
+      if ((unsigned long)pw->pw_uid > (unsigned long)INT32_MAX)
+        continue;
+      int32_t id = (int32_t)pw->pw_uid;
+      bool dup = false;
+      for (int i = 0; i < n; i++)
+        if (ids[i] == id)
+          dup = true;
+      if (dup)
+        continue;
+      if (n >= max) {
+        overflow = true;
+        break;
+      }
+      ids[n++] = id;
+    }
+    endpwent();
+  }
+  for (int i = 1; i < n; i++) {
+    int32_t key = ids[i];
+    int j = i - 1;
+    while (j >= 0 && ids[j] > key) {
+      ids[j + 1] = ids[j];
+      j--;
+    }
+    ids[j + 1] = key;
+  }
+  return overflow ? -1 : n;
+}
+
+static int cli_count_runs(const int32_t* ids, int n) {
+  int runs = 0;
+  for (int i = 0; i < n; i++) {
+    if (i == 0 || ids[i - 1] == INT32_MAX || ids[i] != ids[i - 1] + 1)
+      runs++;
+  }
+  return runs;
+}
+
+/* #294: a FROM name wildcard must expand, at CLI-parse time, against the
+ * sender's account database into numeric id/range rules.  Prefer a prefix that
+ * matches >=2 DISTINCT NON-contiguous ids (exercising multi-rule expansion); if
+ * no such prefix exists on this host, fall back to one whose ids are contiguous
+ * (exercising range collapse).  The expected rules are derived independently by
+ * enumerating the same database. */
+static void test_parse_args_identity_map_from_name_glob(bool is_group) {
+  int32_t ids[512];
+  int chosen_n = 0;
+  int chosen_runs = 0;
+  char chosen_c = 0;
+  for (char c = 'a'; c <= 'z'; c++) {
+    const char glob[3] = {c, '*', '\0'};
+    int n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+    if (n < 2)
+      continue; /* no matches, or the set overflowed the oracle's buffer */
+    int runs = cli_count_runs(ids, n);
+    if (runs > MAX_IDENTITY_MAP)
+      continue; /* production would reject this expansion; try another prefix */
+    if (runs >= 2 || chosen_c == 0) {
+      chosen_c = c;
+      chosen_n = n;
+      chosen_runs = runs;
+    }
+    if (runs >= 2)
+      break;
+  }
+  if (chosen_c == 0)
+    return; /* no multi-match prefix on this host (skipped, not failed) */
+
+  const char glob[3] = {chosen_c, '*', '\0'};
+  chosen_n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+  if (chosen_n < 2)
+    return; /* account DB changed under us: skip, don't flake */
+  chosen_runs = cli_count_runs(ids, chosen_n);
+  EXPECT_TRUE(chosen_n >= 2);
+
+  char map_value[16];
+  snprintf(map_value, sizeof(map_value), "%s:@0", glob);
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", is_group ? "--groupmap" : "--usermap", map_value, "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+
+  int got = is_group ? cfg->groupmap_count : cfg->usermap_count;
+  EXPECT_EQ_INT(got, chosen_runs);
+  const IdentityMap* map = is_group ? cfg->groupmap : cfg->usermap;
+  /* Every matched id is covered by some expanded rule. */
+  for (int i = 0; i < chosen_n; i++) {
+    bool covered = false;
+    for (int r = 0; r < got; r++)
+      if (ids[i] >= map[r].from && ids[i] <= map[r].from_hi)
+        covered = true;
+    EXPECT_TRUE(covered);
+  }
+  /* Every id inside every expanded range is one the glob actually matched, so
+   * the range collapse cannot over-match a name that does not fit the glob. */
+  for (int r = 0; r < got; r++) {
+    EXPECT_EQ_INT(map[r].to, 0);
+    for (int32_t v = map[r].from; v <= map[r].from_hi; v++) {
+      bool expected = false;
+      for (int i = 0; i < chosen_n; i++)
+        if (ids[i] == v)
+          expected = true;
+      EXPECT_TRUE(expected);
+      if (v == INT32_MAX)
+        break;
+    }
+  }
+  config_delete(cfg);
+}
+
+static void test_parse_args_usermap_from_name_glob() {
+  test_parse_args_identity_map_from_name_glob(false);
+}
+
+static void test_parse_args_groupmap_from_name_glob() {
+  test_parse_args_identity_map_from_name_glob(true);
+}
+
+/* Regression for a leak in the FROM name-glob success path: the TO side is
+ * parsed into `parsed.to_name` before the glob is expanded, and every emitted
+ * rule takes its own str_dup of that name -- so the parse-time copy must be
+ * released before the branch continues.  A numeric TO has to_name == NULL and
+ * cannot expose the leak, hence this uses a NAME TO.  The name is resolved on
+ * the receiver (not here), so any well-formed non-glob name works.  Run this
+ * under ASan/valgrind to catch the leak. */
+static void test_parse_args_identity_map_from_name_glob_name_to(bool is_group) {
+  int32_t ids[512];
+  char chosen_c = 0;
+  for (char c = 'a'; c <= 'z'; c++) {
+    const char glob[3] = {c, '*', '\0'};
+    int n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+    if (n < 2)
+      continue;
+    if (cli_count_runs(ids, n) > MAX_IDENTITY_MAP)
+      continue;
+    chosen_c = c;
+    break;
+  }
+  if (chosen_c == 0)
+    return; /* no multi-match prefix on this host (skipped, not failed) */
+
+  const char glob[3] = {chosen_c, '*', '\0'};
+  char map_value[32];
+  snprintf(map_value, sizeof(map_value), "%s:nobody", glob);
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", is_group ? "--groupmap" : "--usermap", map_value, "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+
+  int got = is_group ? cfg->groupmap_count : cfg->usermap_count;
+  EXPECT_TRUE(got >= 1);
+  const IdentityMap* map = is_group ? cfg->groupmap : cfg->usermap;
+  for (int r = 0; r < got; r++) {
+    EXPECT_EQ_INT(map[r].to, 0);
+    EXPECT_NOT_NULL(map[r].to_name);
+    if (map[r].to_name)
+      EXPECT_EQ_STR(map[r].to_name, "nobody");
+  }
+  config_delete(cfg);
+}
+
+static void test_parse_args_usermap_from_name_glob_name_to() {
+  test_parse_args_identity_map_from_name_glob_name_to(false);
+}
+
+static void test_parse_args_groupmap_from_name_glob_name_to() {
+  test_parse_args_identity_map_from_name_glob_name_to(true);
+}
+
+/* #294: an expansion that would push the map past MAX_IDENTITY_MAP must fail
+ * with a clear error rather than silently truncating.  Prefill the map to the
+ * cap and then add a wildcard guaranteed to match at least the current user. */
+static void test_parse_args_identity_map_from_name_glob_over_cap() {
+  const struct passwd* self = getpwuid(geteuid());
+  if (!self || self->pw_name[0] == '\0')
+    return;
+  char glob[8];
+  snprintf(glob, sizeof(glob), "%c*", self->pw_name[0]);
+
+  size_t need = (size_t)MAX_IDENTITY_MAP * 6 + strlen(glob) + 4 + 1;
+  char* value = malloc(need);
+  if (!value)
+    return;
+  size_t off = 0;
+  for (int i = 0; i < MAX_IDENTITY_MAP; i++)
+    off += (size_t)snprintf(value + off, need - off, "@0:@0,");
+  snprintf(value + off, need - off, "%s:@0", glob);
+
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--usermap", value, "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+  free(value);
+}
+
 /* #294: rsync refuses to mix --chown with --usermap/--groupmap on the same
  * side (either order).  --chown=USER conflicts with a prior --usermap;
  * --chown=:GROUP conflicts with a prior --groupmap; the opposite side is fine. */
@@ -3577,7 +3955,8 @@ static void test_parse_args_rejects_malformed_identity() {
       {"--usermap", "definitely_not_a_real_user_zzz:@1"},
       {"--usermap", "0-"},
       {"--usermap", "5-2:@1"},
-      {"--usermap", "roo*:@1"},
+      {"--usermap", "zzz_definitely_no_such_user_glob_zzz*:@1"},
+      {"--groupmap", "zzz_definitely_no_such_group_glob_zzz*:@1"},
       {"--groupmap", "@1"},
       {"--groupmap", "no_such_group_qqq:x"},
       {"--chown", "a:b:c"},
@@ -4249,7 +4628,7 @@ static void test_parse_args_preserve_long_form() {
 }
 
 /* --no-perms/--no-times/--no-owner/--no-group (long and short) clear only
- * their own attribute bit; they never set metadata_explicitly_disabled. */
+ * their own attribute bit; they never set cli.metadata_explicitly_disabled. */
 static void test_parse_args_preserve_negations() {
   struct {
     const char* arg;
@@ -4277,7 +4656,7 @@ static void test_parse_args_preserve_negations() {
       bool expected = all[j] != cases[i].offset;
       EXPECT_TRUE(*(bool*)((char*)cfg + all[j]) == expected);
     }
-    EXPECT_FALSE(cfg->metadata_explicitly_disabled);
+    EXPECT_FALSE(cfg->cli.metadata_explicitly_disabled);
     /* -a's devices/specials keep the metadata frame on. */
     EXPECT_TRUE(cfg->use_metadata);
     config_delete(cfg);
@@ -4320,7 +4699,7 @@ static void test_parse_args_no_preserve_disables_bundle() {
   EXPECT_FALSE(cfg->preserve_times);
   EXPECT_FALSE(cfg->preserve_owner);
   EXPECT_FALSE(cfg->preserve_group);
-  EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+  EXPECT_TRUE(cfg->cli.metadata_explicitly_disabled);
   EXPECT_TRUE(cfg->use_incremental);
   EXPECT_FALSE(cfg->use_metadata);
   config_delete(cfg);
@@ -4373,7 +4752,7 @@ static void test_parse_args_incremental_implies_preserve() {
   EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
   EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_FALSE(cfg->preserve_times);
-  EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+  EXPECT_TRUE(cfg->cli.metadata_explicitly_disabled);
   EXPECT_FALSE(cfg->use_metadata);
   config_delete(cfg);
 }
@@ -4661,10 +5040,12 @@ static void test_parse_args_include_exclude_order() {
   config_delete(cfg3);
 }
 
-/* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive) must never
- * swallow the next argv: `fastsync -s SRC DST` keeps both positionals. */
+/* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive, and the
+ * --inc-recursive/--no-inc-recursive scan-mode pair) must never swallow the
+ * next argv: `fastsync -s SRC DST` keeps both positionals. */
 static void test_parse_args_noop_does_not_consume_argv() {
-  static const char* const noops[] = {"-s", "--secluded-args", "-r", "--recursive"};
+  static const char* const noops[] = {"-s",          "--secluded-args", "-r",
+                                      "--recursive", "--inc-recursive", "--no-inc-recursive"};
   for (size_t i = 0; i < sizeof(noops) / sizeof(noops[0]); i++) {
     Config* cfg = config_create();
     int positional_args[2];
@@ -4743,6 +5124,11 @@ void test_client_cli() {
   test_parse_args_groupmap();
   test_parse_args_usermap_name_resolution();
   test_parse_args_usermap_rsync_forms();
+  test_parse_args_usermap_from_name_glob();
+  test_parse_args_groupmap_from_name_glob();
+  test_parse_args_usermap_from_name_glob_name_to();
+  test_parse_args_groupmap_from_name_glob_name_to();
+  test_parse_args_identity_map_from_name_glob_over_cap();
   test_parse_args_identity_map_chown_conflict();
   test_parse_args_chown();
   test_parse_args_copy_as();
@@ -4768,6 +5154,7 @@ void test_client_cli() {
   test_validate_config_credentials_require_tls_or_loopback();
   test_validate_config_delta_sendfile_constraints();
   test_validate_config_unified_invariants();
+  test_validate_config_filter_rule_limit();
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();
@@ -4783,6 +5170,7 @@ void test_client_cli() {
   test_parse_args_valid_port();
   test_parse_args_size_only();
   test_parse_args_ignore_existing();
+  test_parse_args_partial_dir_implies_partial();
   test_parse_args_executability();
   test_parse_args_chmod();
   test_parse_args_numeric_chmod();
@@ -4818,7 +5206,8 @@ void test_client_cli() {
   test_parse_args_delete_default_timing_and_commit();
   test_parse_args_delete_timing_conflict_rejected();
   test_parse_args_delete_timing_without_delete_rejected();
-  test_parse_args_rejects_unimplemented_options();
+  test_parse_args_rejects_unknown_options();
+  test_parse_args_accepts_implemented_metadata_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();
   test_parse_args_hard_links();

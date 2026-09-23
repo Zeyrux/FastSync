@@ -37,6 +37,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
   context->early_delete = false;
+  context->prescan_chunks = NULL;
   context->delete_plans = NULL;
   context->delete_suppressed = false;
   context->scan_stopped_early = false;
@@ -50,6 +51,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   protocol_session_set_max_alloc(&context->allocation_session, config->max_alloc);
   context->dir_entries = NULL;
   context->dir_entries_mutex_init = false;
+  atomic_init(&context->dir_count, 0);
   context->delete_limit = false;
   int init = 0;
   if (config->use_metadata) {
@@ -85,11 +87,13 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   return context;
 
 fail:
-  log_perror("Error initializing synchronization objects");
+  log_message(LOG_LEVEL_ERROR, "%s", "Error initializing synchronization objects");
   if (context->dir_entries_mutex_init)
     mtx_destroy(&context->dir_entries_mutex);
   if (context->dir_entries)
     array_list_delete(context->dir_entries);
+  if (init >= 7)
+    mtx_destroy(&context->mutex_progress);
   if (init >= 6)
     cnd_destroy(&context->condition_not_empty_loader);
   if (init >= 5)
@@ -191,6 +195,8 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
+  if (context->prescan_chunks)
+    array_list_delete(context->prescan_chunks);
   if (context->delete_plans)
     delete_plan_sender_destroy(context->delete_plans);
   if (context->excluded_paths)

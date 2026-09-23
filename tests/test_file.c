@@ -9,7 +9,9 @@
 #include "charset.h"
 #include "utils.h"
 #include "protocol.h"
+#include "xattr.h"
 #include "test_utils.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -17,7 +19,11 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <unistd.h>
 
 static void test_file_create() {
@@ -339,12 +345,17 @@ static void test_file_save_to_disk_temp_dir_confined() {
   const char* root = "test_temp_confine_tmp";
   const char* dest_file = "test_temp_confine_tmp/file.txt";
   char outside[PATH_MAX];
+  char inside_abs[PATH_MAX];
   snprintf(outside, sizeof(outside), "/tmp/fastsync_temp_outside_%d", (int)getpid());
   unlink(dest_file);
   rmdir("test_temp_confine_tmp/scratch");
+  rmdir("test_temp_confine_tmp/abs_scratch");
   rmdir(root);
   mkdir(root, 0755);
   mkdir("test_temp_confine_tmp/scratch", 0755);
+  mkdir("test_temp_confine_tmp/abs_scratch", 0755);
+  if (!realpath("test_temp_confine_tmp/abs_scratch", inside_abs))
+    EXPECT_FAIL("realpath(abs_scratch) failed; inside_abs would be uninitialized");
   mkdir(outside, 0755);
 
   File* f = file_create("file.txt");
@@ -364,6 +375,13 @@ static void test_file_save_to_disk_temp_dir_confined() {
   config->temp_dir = str_dup("../escape");
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
   EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  /* An absolute temp dir that canonicalizes INSIDE the receive root is
+     accepted and used (the parity win); destination is still written. */
+  free(config->temp_dir);
+  config->temp_dir = str_dup(inside_abs);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(access(dest_file, F_OK), 0);
+  unlink(dest_file);
   free(config->temp_dir);
   config->temp_dir = str_dup("scratch");
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
@@ -373,8 +391,101 @@ static void test_file_save_to_disk_temp_dir_confined() {
   config_delete(config);
   unlink(dest_file);
   rmdir("test_temp_confine_tmp/scratch");
+  rmdir("test_temp_confine_tmp/abs_scratch");
   rmdir(root);
   rmdir(outside);
+}
+
+/* A client-planted symlink under the receive root must never redirect the
+ * --temp-dir scratch directory outside the authorized root: the REAL path of
+ * the opened dir is checked.  An in-root symlink (the EXDEV cross-filesystem
+ * case) must still be accepted. */
+static void test_file_open_temp_dir_symlink_confinement() {
+  const char* root = "test_tempdir_link_root";
+  const char* outside = "test_tempdir_link_outside";
+  char root_abs[PATH_MAX];
+  char outside_abs[PATH_MAX];
+  unlink("test_tempdir_link_root/escape");
+  unlink("test_tempdir_link_root/inside_link");
+  rmdir("test_tempdir_link_root/scratch");
+  rmdir(root);
+  rmdir(outside);
+
+  int mkdir_root_ret = mkdir(root, 0755);
+  int mkdir_outside_ret = mkdir(outside, 0755);
+  bool root_resolved = realpath(root, root_abs) != NULL;
+  bool outside_resolved = realpath(outside, outside_abs) != NULL;
+  int root_fd = root_resolved ? open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+
+  bool root_set = false;
+  bool scratch_ok = false;
+  int scratch_fd = -1;
+  bool escape_staged = false;
+  int escape_fd = 0;
+  bool inside_staged = false;
+  int inside_fd = -1;
+  char* scratch = NULL;
+  char* escape = NULL;
+  char* inside_link = NULL;
+
+  /* Only touch the global authorized root and the scratch fixtures once the
+     setup succeeded; the teardown below always runs regardless. */
+  if (root_fd >= 0 && outside_resolved) {
+    root_set = utils_set_authorized_root(root_fd, root_abs);
+
+    /* An existing in-root scratch dir opens normally. */
+    scratch = path_cat(root_abs, "scratch");
+    if (scratch && mkdir(scratch, 0755) == 0) {
+      scratch_ok = true;
+      scratch_fd = file_open_temp_dir(scratch);
+      if (scratch_fd >= 0)
+        close(scratch_fd);
+    }
+
+    /* A symlink whose target is outside the root is refused. */
+    escape = path_cat(root_abs, "escape");
+    if (escape && symlink(outside_abs, escape) == 0) {
+      escape_staged = true;
+      escape_fd = file_open_temp_dir(escape);
+    }
+
+    /* A symlink that stays inside the root is accepted (EXDEV fallback). */
+    inside_link = path_cat(root_abs, "inside_link");
+    if (inside_link && scratch && symlink(scratch, inside_link) == 0) {
+      inside_staged = true;
+      inside_fd = file_open_temp_dir(inside_link);
+      if (inside_fd >= 0)
+        close(inside_fd);
+    }
+  }
+
+  /* Release the global authorized root and all fixtures BEFORE asserting:
+     EXPECT_* returns early on failure, so a failed assertion must not be able
+     to leave the process state poisoned or leak root_fd. */
+  utils_set_authorized_root(-1, NULL);
+  if (root_fd >= 0)
+    close(root_fd);
+  free(inside_link);
+  free(escape);
+  free(scratch);
+  unlink("test_tempdir_link_root/escape");
+  unlink("test_tempdir_link_root/inside_link");
+  rmdir("test_tempdir_link_root/scratch");
+  rmdir(root);
+  rmdir(outside);
+
+  EXPECT_EQ_INT(mkdir_root_ret, 0);
+  EXPECT_EQ_INT(mkdir_outside_ret, 0);
+  EXPECT_TRUE(root_resolved);
+  EXPECT_TRUE(outside_resolved);
+  EXPECT_TRUE(root_fd >= 0);
+  EXPECT_TRUE(root_set);
+  EXPECT_TRUE(scratch_ok);
+  EXPECT_TRUE(scratch_fd >= 0);
+  EXPECT_TRUE(escape_staged);
+  EXPECT_EQ_INT(escape_fd, -1);
+  EXPECT_TRUE(inside_staged);
+  EXPECT_TRUE(inside_fd >= 0);
 }
 
 /* Issue #251: file_save_to_disk_full must distinguish receiver-side skips
@@ -1040,8 +1151,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
 
   /* No -p/-E: the pre-existing 0640 survives the atomic overwrite. */
   bool ok = file_to_disk_secure_attrs(path, "data", 4, false, false, false, &m,
-                                      (FileAttrPolicy){false, false, false, false}, false, false,
-                                      false, NULL, false, false, NULL);
+                                      (FileAttrPolicy){false, false, false, false, true}, false,
+                                      false, false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -1049,8 +1160,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
 
   /* -p: the source mode wins. */
   ok = file_to_disk_secure_attrs(path, "data2", 5, false, false, false, &m,
-                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){true, true, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
@@ -1060,8 +1171,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
      source 0755 gives 0750, not 0751 and not the scratch 0711. */
   EXPECT_EQ_INT(chmod(path, 0640), 0);
   ok = file_to_disk_secure_attrs(path, "data3", 6, false, false, false, &m,
-                                 (FileAttrPolicy){false, false, false, true}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, true, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0750);
@@ -1073,8 +1184,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
   const char* fresh = "test_attr_split_fresh.txt";
   unlink(fresh);
   ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, &m,
-                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(fresh, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), (int)(m.mode & 0777 & ~(mode_t)file_process_umask()));
@@ -1083,8 +1194,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
   /* Without any metadata the historical fixed 0644 default still applies. */
   unlink(fresh);
   ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, NULL,
-                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(fresh, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
@@ -1104,8 +1215,8 @@ static void test_new_file_mode_honors_source_and_umask() {
   m.gid = getegid();
 
   bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
-                                      (FileAttrPolicy){false, false, false, false}, false, false,
-                                      false, NULL, false, false, NULL);
+                                      (FileAttrPolicy){false, false, false, false, true}, false,
+                                      false, false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -1220,6 +1331,110 @@ static void test_special_socket_recreated() {
   file_destroy(f);
   config_delete(cfg);
   unlink(sock);
+  rmdir(root);
+}
+
+/* --fake-super device round-trip (rsync parity): a char/block device must be
+ * materialized as a REGULAR empty file whose user.rsync.%stat records the real
+ * rdev -- never as an mknod'ed node -- even on a privileged receiver.  This is
+ * the non-privileged unit counterpart to the setpriv integration test (which
+ * the PR gate excludes). */
+static void test_fake_super_device_writes_regular_file_with_rdev() {
+  const char* root = "test_fake_super_dev_tmp";
+  const char* node = "test_fake_super_dev_tmp/cdev";
+  unlink(node);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->fake_super = true;
+  cfg->preserve_devices = true;
+  cfg->preserve_perms = true;
+  cfg->use_metadata = true;
+  cfg->use_xattrs = true;
+
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFCHR | 0644;
+
+  File* f = file_create("cdev");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->rdev_major = 1;
+  f->rdev_minor = 3;
+  f->metadata = &meta;
+
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+
+  struct stat st;
+  EXPECT_EQ_INT(lstat(node, &st), 0);
+  EXPECT_TRUE(S_ISREG(st.st_mode)); /* never a real device node */
+  EXPECT_EQ_INT((int)st.st_size, 0);
+
+  char value[128] = {0};
+  ssize_t got = getxattr(node, FAKESUPER_XATTR, value, sizeof(value) - 1);
+  EXPECT_TRUE(got > 0);
+  EXPECT_EQ_STR(value, "20644 1,3 0:0"); /* the REAL rdev, not 0,0 */
+
+  f->metadata = NULL;
+  file_destroy(f);
+  config_delete(cfg);
+  unlink(node);
+  rmdir(root);
+}
+
+/* A char/block device that mknodat() refuses (EPERM/EACCES on an unprivileged
+ * receiver) must be a PER-ENTRY failure -- FILE_SAVE_FAILED, which the receiver
+ * counts and continues past -- never the fatal FILE_SAVE_ERROR that aborts the
+ * stream.  The unit suite normally runs as root, so drop the effective uid to
+ * make the kernel refusal deterministic. */
+static void test_device_mknod_failure_is_per_entry() {
+  const char* root = "test_device_eperm_tmp";
+  const char* node = "test_device_eperm_tmp/cdev";
+  unlink(node);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0777), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->preserve_devices = true;
+  cfg->use_metadata = true;
+
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFCHR | 0644;
+
+  File* f = file_create("cdev");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->rdev_major = 1;
+  f->rdev_minor = 3;
+  f->metadata = &meta;
+
+  uid_t saved = geteuid();
+  bool dropped = false;
+  if (saved == 0 && seteuid(65534) == 0)
+    dropped = true;
+  FileSaveResult result = file_save_to_disk_full(root, f, cfg);
+  if (dropped) {
+    EXPECT_EQ_INT(seteuid(saved), 0);
+#ifdef __linux__
+    /* A setuid transition clears the process dumpable flag, which makes
+     * LeakSanitizer's ptrace-based thread suspension fail at exit.  Restore it
+     * so the ASan/UBSan CI jobs can still run the leak check. */
+    (void)prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+#endif
+  }
+
+  EXPECT_EQ_INT(result, FILE_SAVE_FAILED);
+  /* Nothing was created: no device node and no regular-file fallback. */
+  struct stat st;
+  EXPECT_EQ_INT(lstat(node, &st), -1);
+
+  f->metadata = NULL;
+  file_destroy(f);
+  config_delete(cfg);
   rmdir(root);
 }
 
@@ -1663,8 +1878,8 @@ static void test_file_write_to_disk_partial_retention() {
   m.atime_valid = false;
   m.crtime_valid = false;
   bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
-                                      (FileAttrPolicy){true, true, false, false}, false, false,
-                                      false, NULL, false, true, NULL);
+                                      (FileAttrPolicy){true, true, false, false, true}, false,
+                                      false, false, NULL, false, true, NULL);
   EXPECT_FALSE(ok); /* the write itself succeeded, but metadata restore failed */
   /* Retained: the already-written temp now sits at the destination path. */
   int fd = open(path, O_RDONLY);
@@ -1683,8 +1898,8 @@ static void test_file_write_to_disk_partial_retention() {
 
   /* Same failure with keep_partial=false: temp is unlinked, nothing retained. */
   ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
-                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){true, true, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_FALSE(ok);
   EXPECT_TRUE(access(path, F_OK) == -1);
 }
@@ -2163,26 +2378,26 @@ static void test_basis_delete_relative_root_slash() {
   EXPECT_NOT_NULL(cfg);
   cfg->receive_root_directory = str_dup("/");
 
-  char* rel = file_receive_basis_delete_relative(cfg, "/a");
+  char* rel = delete_basis_relative(cfg, "/a");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "a");
   free(rel);
-  rel = file_receive_basis_delete_relative(cfg, "/a/b");
+  rel = delete_basis_relative(cfg, "/a/b");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "a/b");
   free(rel);
   /* The root itself is not a child. */
-  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/"));
+  EXPECT_NULL(delete_basis_relative(cfg, "/"));
   /* A relative entry is already root-relative. */
-  rel = file_receive_basis_delete_relative(cfg, "x/y");
+  rel = delete_basis_relative(cfg, "x/y");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "x/y");
   free(rel);
   /* An absolute path outside a non-"/" root is unreachable. */
   free(cfg->receive_root_directory);
   cfg->receive_root_directory = str_dup("/root");
-  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/other/a"));
-  rel = file_receive_basis_delete_relative(cfg, "/root/a");
+  EXPECT_NULL(delete_basis_relative(cfg, "/other/a"));
+  rel = delete_basis_relative(cfg, "/root/a");
   EXPECT_NOT_NULL(rel);
   EXPECT_EQ_STR(rel, "a");
   free(rel);
@@ -2264,6 +2479,7 @@ void test_file() {
   test_file_save_to_disk_ignore_existing_entry_types();
   test_file_save_to_disk_partial_install();
   test_file_save_to_disk_temp_dir_confined();
+  test_file_open_temp_dir_symlink_confinement();
   test_file_save_to_disk_reports_skips();
   test_file_write_to_disk_sparse_preserves_holes();
   test_file_write_to_disk_partial_retention();
@@ -2303,6 +2519,8 @@ void test_file() {
   test_new_file_mode_honors_source_and_umask();
   test_special_fifo_mode_honors_source_and_umask();
   test_special_socket_recreated();
+  test_fake_super_device_writes_regular_file_with_rdev();
+  test_device_mknod_failure_is_per_entry();
   test_inplace_overwrite_truncates_shorter_payload();
   test_inplace_refuses_fifo_destination();
   test_inplace_refuses_device_destination();

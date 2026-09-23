@@ -183,10 +183,11 @@ class TestDeviceSpecial:
             )
 
     @pytest.mark.setpriv
-    def test_devices_nonroot_receiver_skips_safely(self):
-        """A receiver without CAP_MKNOD must skip a device entry with a warning
-        and never abort.  A root runner drops the receiver (server) to nobody
-        via setpriv; on a non-root runner (or without setpriv) the test skips."""
+    def test_devices_nonroot_receiver_errors_like_rsync(self):
+        """A receiver without CAP_MKNOD must report the failed device mknod as a
+        transfer error (rsync parity, partial failure) instead of silently
+        succeeding.  A root runner drops the receiver (server) to nobody via
+        setpriv; on a non-root runner (or without setpriv) the test skips."""
         if os.geteuid() != 0 or shutil.which("setpriv") is None:
             pytest.skip("requires root + setpriv to run the receiver unprivileged")
         self._setup()
@@ -202,16 +203,16 @@ class TestDeviceSpecial:
                                    flags=["--devices"], port=port)
         finally:
             out, err = _stop_captured_server(server)
-        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:300]}"
-        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
-        with open(os.path.join(received, "plain.txt")) as f:
-            assert f.read() == "regular content\n"
-        assert not os.path.lexists(os.path.join(received, "chardev")), (
-            "a receiver without CAP_MKNOD must skip the device node, not create it"
+        assert result.returncode != 0, (
+            f"a failed device mknod must be a transfer error like rsync (got exit 0): "
+            f"{(out + err)[:300]}"
         )
-        assert ("cannot create device node" in (out + err)
-                or "device-node creation is not permitted" in (out + err)), (
-            f"receiver did not log the documented device skip: out={out!r} err={err!r}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        assert not os.path.lexists(os.path.join(received, "chardev")), (
+            "a receiver without CAP_MKNOD must not create the device node"
+        )
+        assert "cannot create device" in (out + err), (
+            f"receiver did not log the device creation error: out={out!r} err={err!r}"
         )
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
@@ -2275,6 +2276,36 @@ class TestPartialDir:
         partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
         assert not os.path.exists(partial)
 
+    def test_partial_dir_alone_implies_partial(self, shared_server):
+        """--partial-dir=DIR with no --partial implies --partial, like rsync.
+
+        rsync 3.4.1 retains the staged partial when --partial-dir is given by
+        itself; before the implication was added FastSync discarded it.  The
+        transfer is made to fail deterministically by placing a non-empty
+        directory at the destination path, so the final partial-dir ->
+        destination rename fails and whatever was staged under the partial dir
+        stays on disk."""
+        source = os.path.join(TEST_DATA_DIR, "partial_dir_implied_src")
+        dest = os.path.join(TEST_DATA_DIR, "partial_dir_implied_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.bin")
+        with open(source_file, "wb") as f:
+            f.write(b"partial payload")
+
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(os.path.join(received, "f.bin"))
+        with open(os.path.join(received, "f.bin", "keep"), "wb") as f:
+            f.write(b"keep")
+
+        result, _ = run_client(source, dest, flags=["--partial-dir=.partial"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "expected the blocked install to fail"
+
+        partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
+        assert os.path.exists(partial), \
+            "--partial-dir alone must imply --partial and retain the partial file"
+
 
 class TestLargeFile:
     def test_transfer_100mb_file(self, shared_server):
@@ -2606,35 +2637,30 @@ class TestTimeoutAndAllocLimits:
         mismatches, missing = verify_transfer(source, received)
         assert not missing and not mismatches
 
-    def test_temp_dir_cross_filesystem_fallback(self, shared_server):
-        """A confined relative --temp-dir that resolves (via a symlink under the
-        destination root) to another filesystem must fall back to a non-atomic
-        copy instead of aborting (rsync parity).  Skipped when no second
-        filesystem is available."""
-        shm = "/dev/shm"
-        if not os.path.isdir(shm):
-            pytest.skip("/dev/shm not available")
-        if os.stat(shm).st_dev == os.stat(TEST_DATA_DIR).st_dev:
-            pytest.skip("/dev/shm is on the same filesystem as the test data")
-        scratch = os.path.join(shm, f"fastsync_tmp_{os.getpid()}")
-        shutil.rmtree(scratch, ignore_errors=True)
-        os.makedirs(scratch)
+    def test_temp_dir_symlink_escape_rejected(self, shared_server):
+        """A symlink planted inside the destination root pointing outside it
+        must not redirect receiver scratch files: --temp-dir=<that link> is
+        refused and nothing is written at the link target.  An in-root symlink
+        (e.g. to a mount point that stays inside the authorized root) is still
+        accepted, preserving the engine's EXDEV cross-filesystem fallback."""
+        source, dest = self._seed("tempdir_escape_src")
+        outside = "/tmp/fastsync_tempdir_escape_%d" % os.getpid()
+        shutil.rmtree(outside, ignore_errors=True)
+        os.makedirs(outside)
+        link = os.path.join(dest, "escape_scratch")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(outside, link)
         try:
-            source, dest = self._seed("tempdir_xdev_src")
-            # The receiver resolves a relative temp dir under the destination
-            # root; a symlink there points the scratch at the second filesystem.
-            link = os.path.join(dest, "xdev_scratch")
-            os.symlink(scratch, link)
-            result, _ = run_client(source, dest, flags=["--temp-dir", "xdev_scratch"],
+            result, _ = run_client(source, dest, flags=["--temp-dir", "escape_scratch"],
                                    port=shared_server.port)
-            assert result.returncode == 0, f"cross-fs temp-dir failed: {result.stderr[:300]}"
+            assert result.returncode != 0, "an escaping --temp-dir symlink must be refused"
             received = get_dest_received_dir(dest, source)
-            mismatches, missing = verify_transfer(source, received)
-            assert not missing, f"Missing: {missing}"
-            assert not mismatches, f"Mismatch: {mismatches}"
-            assert os.listdir(scratch) == [], "temp files left behind in the cross-fs scratch"
+            assert not os.path.exists(os.path.join(received, "f.txt")), \
+                "the receiver must not fall back to writing the file"
+            assert os.listdir(outside) == [], "receiver wrote outside the authorized root"
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            shutil.rmtree(outside, ignore_errors=True)
 
 
 class TestRemoteOptionTransport:
@@ -2761,7 +2787,12 @@ class TestItemizeChanges:
                                flags=["--preserve", "-i", "--incremental"],
                                port=shared_server.port)
         assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
-        itemized = [line for line in result.stdout.splitlines() if line and line[0] in ">.<c"]
+        # -i also emits the transfer-root and directory lines; only FILE entries
+        # matter here, so drop any line whose name has a trailing '/'.
+        itemized = [
+            line for line in result.stdout.splitlines()
+            if line and line[0] in ">.<c" and not line.rsplit(" ", 1)[-1].endswith("/")
+        ]
         assert itemized == [], f"unchanged files were itemized: {itemized[:5]}"
 
     def test_multithreaded_emits_same_itemize_lines(self, shared_server):
@@ -5782,6 +5813,35 @@ class TestStandaloneSuperDefault:
             "standalone server accepted --copy-as without --allow-super"
         )
 
+    @pytest.mark.skipif(
+        os.geteuid() != 0,
+        reason="root triggers the SUPER_MODE_OFF default and can create setuid sources",
+    )
+    def test_special_bits_masked_without_allow_super(self):
+        """A root standalone server without --allow-super forces SUPER_MODE_OFF,
+        so client-supplied setuid/setgid/sticky bits must be stripped even under
+        -p (they are super-user activities just like device-node creation)."""
+        source = os.path.join(TEST_DATA_DIR, "super_default_mode_src")
+        dest = os.path.join(TEST_DATA_DIR, "super_default_mode_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "priv.sh")
+        with open(src_file, "wb") as f:
+            f.write(b"#!/bin/sh\necho hi\n")
+        os.chmod(src_file, 0o4755)
+        server = ServerManager()
+        server.start()  # deliberately no --allow-super -> SUPER_MODE_OFF as root
+        try:
+            result, _ = run_client(source, dest, flags=["-p"], port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode == 0, f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mode = stat.S_IMODE(os.stat(os.path.join(received, "priv.sh")).st_mode)
+        assert (mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)) == 0, \
+            f"--no-super receiver kept a privileged bit: {oct(mode)}"
+        assert (mode & 0o777) == 0o755, f"ordinary permission bits lost: {oct(mode)}"
+
     @pytest.mark.skipif(os.geteuid() != 0, reason="root can create the source device node")
     def test_devices_skipped_without_allow_super(self):
         """Root standalone server without --allow-super must skip device-node
@@ -6540,7 +6600,7 @@ class TestExtendedAttributes:
             os.getxattr(os.path.join(received, "data.txt"), "user.foo")
 
     def test_reserved_fake_super_key_not_forwarded(self, shared_server):
-        """A source file that already carries the reserved user.fastsync.stat
+        """A source file that already carries the reserved user.rsync.%stat
         record must NOT have it planted on the receiver during a plain -X run
         (it is receiver-only, so it cannot be spoofed for a later privileged
         restore)."""
@@ -6550,7 +6610,7 @@ class TestExtendedAttributes:
             fh.write(b"reserved\n")
         if not _xattr_supported(f):
             pytest.skip("filesystem does not support user xattrs")
-        os.setxattr(f, "user.fastsync.stat", b"0:0:644:0:0")
+        os.setxattr(f, "user.rsync.%stat", b"100644 0,0 0:0")
         # A normal user.* attr still travels alongside.
         os.setxattr(f, "user.keep", b"yes")
 
@@ -6560,7 +6620,7 @@ class TestExtendedAttributes:
         received = get_dest_received_dir(dest, source)
         assert os.getxattr(os.path.join(received, "data.txt"), "user.keep") == b"yes"
         with pytest.raises(OSError):
-            os.getxattr(os.path.join(received, "data.txt"), "user.fastsync.stat")
+            os.getxattr(os.path.join(received, "data.txt"), "user.rsync.%stat")
 
     @pytest.mark.ci
     def test_xattrs_multithreaded(self, shared_server):
@@ -6576,6 +6636,68 @@ class TestExtendedAttributes:
             f"-X -m sync failed: {(result.stderr or result.stdout)[:300]}"
         received = get_dest_received_dir(dest, source)
         assert os.getxattr(os.path.join(received, "data.txt"), "user.k") == b"v"
+
+    @pytest.mark.ci
+    def test_symlink_own_xattrs_never_referent(self, shared_server):
+        """Protocol 2.29.0: a symlink's STATUS_SYMLINK frame carries a trailing
+        xattr block captured with llistxattr/lgetxattr (no follow) and applied
+        with lsetxattr on the link itself.  Linux's VFS refuses to associate
+        xattrs with a symlink at all, so the portable guarantee asserted here is
+        the no-follow one: a referent that carries user.* must NOT have those
+        attributes appear on the destination symlink entry (the old
+        path-following capture would have copied the referent's attrs onto the
+        link).  On a platform/filesystem that does support symlink xattrs the
+        full round-trip of the link's own attribute is asserted too."""
+        source, dest = self._source_and_dest("symlink_xattr")
+        target = os.path.join(source, "target.txt")
+        with open(target, "wb") as fh:
+            fh.write(b"referent payload\n")
+        if not _xattr_supported(target):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(target, "user.referent-only", b"referent-value")
+
+        link = os.path.join(source, "link")
+        os.symlink("target.txt", link)
+        link_xattr_supported = False
+        try:
+            os.setxattr(link, "user.link-own", b"link-value", follow_symlinks=False)
+            link_xattr_supported = os.getxattr(
+                link, "user.link-own", follow_symlinks=False
+            ) == b"link-value"
+        except (OSError, AttributeError, NotImplementedError):
+            link_xattr_supported = False
+
+        result, _ = run_client(source, dest, flags=["-aX"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-aX symlink sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        dst_link = os.path.join(received, "link")
+        assert os.path.islink(dst_link), "destination link entry is not a symlink"
+        assert os.readlink(dst_link) == "target.txt"
+
+        # The no-follow guarantee.  Checking only the link's own xattr list is
+        # vacuous on Linux (lsetxattr on a symlink always fails EPERM), so also
+        # prove the apply never followed the link: the destination REFERENT must
+        # keep its own user.* value untouched.
+        dst_target = os.path.join(received, "target.txt")
+        assert os.getxattr(dst_target, "user.referent-only") == b"referent-value", (
+            "the destination symlink apply followed the link and rewrote the "
+            "referent's xattr"
+        )
+        link_names = os.listxattr(dst_link, follow_symlinks=False)
+        assert "user.referent-only" not in link_names, (
+            "the destination symlink captured its REFERENT's xattr "
+            "(path-following capture bug)"
+        )
+        if sys.platform.startswith("linux"):
+            assert link_names == [], (
+                "Linux associates no xattrs with a symlink; the link entry must "
+                "carry none"
+            )
+        if link_xattr_supported:
+            assert os.getxattr(
+                dst_link, "user.link-own", follow_symlinks=False
+            ) == b"link-value", "the symlink's own xattr did not round-trip"
 
     @pytest.mark.ci
     def test_acls_via_posix_acl_xattr(self, shared_server):
@@ -6649,10 +6771,17 @@ class TestExtendedAttributes:
         assert result.returncode == 0, \
             f"--fake-super sync failed: {(result.stderr or result.stdout)[:300]}"
         received = get_dest_received_dir(dest, source)
-        record = os.getxattr(os.path.join(received, "data.txt"), "user.fastsync.stat").decode()
-        fields = record.split(":")
-        assert len(fields) == 5
-        assert fields[0] == str(uid), f"reserved uid field {fields[0]} != source uid {uid}"
+        record = os.getxattr(os.path.join(received, "data.txt"), "user.rsync.%stat").decode()
+        # rsync 3.4.1 grammar: "<octal st_mode> <rdev_major>,<rdev_minor> <uid>:<gid>".
+        fields = record.split()
+        assert len(fields) == 3, f"unexpected rsync fake-super record {record!r}"
+        mode_field, rdev_field, owner_field = fields
+        assert rdev_field == "0,0", f"regular file rdev must be 0,0, got {rdev_field!r}"
+        assert int(mode_field, 8) & 0o170000 == stat.S_IFREG, (
+            f"recorded mode {mode_field!r} must carry S_IFREG"
+        )
+        assert owner_field.split(":")[0] == str(uid), \
+            f"recorded uid {owner_field!r} != source uid {uid}"
 
     @pytest.mark.ci
     def test_fake_super_records_resolved_chown_without_real_chown(self, shared_server):
@@ -6671,11 +6800,70 @@ class TestExtendedAttributes:
         assert result.returncode == 0, \
             f"--fake-super --chown sync failed: {(result.stderr or result.stdout)[:300]}"
         dst = os.path.join(get_dest_received_dir(dest, source), "data.txt")
-        record = os.getxattr(dst, "user.fastsync.stat").decode().split(":")
-        assert record[0] == "33333", f"recorded owner {record[0]} != resolved 33333"
-        assert record[1] == "44444", f"recorded group {record[1]} != resolved 44444"
+        record = os.getxattr(dst, "user.rsync.%stat").decode().split()
+        owner = record[2].split(":")
+        assert owner == ["33333", "44444"], (
+            f"recorded owner {record[2]!r} != resolved 33333:44444"
+        )
         st = os.stat(dst)
         assert st.st_uid != 33333, "--fake-super must not real-chown the recorded owner"
+
+    @pytest.mark.ci
+    def test_fake_super_rsync_interop(self, shared_server):
+        """A fake-super tree written by FastSync is readable by rsync 3.4.1:
+        rsync reads the `user.rsync.%stat` record (mode/rdev/uid:gid) and, when
+        it re-emits a fake-super tree, reproduces the same record.  This pins
+        the on-disk key and value grammar against the real tool."""
+        rsync = shutil.which("rsync")
+        if rsync is None:
+            pytest.skip("rsync not installed")
+        source, dest = self._source_and_dest("fakesuper_interop")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"interop\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support user xattrs")
+        # rsync's fake-super receiver only writes a %stat% record when it has
+        # something to fake; a root-owned file with a matching root stat is
+        # a no-op.  When privileged, record a non-root owner so the round-trip
+        # actually exercises the parser (non-root CI already has a non-zero uid).
+        if os.geteuid() == 0:
+            try:
+                os.chown(f, 12345, 12346)
+            except OSError:
+                pass
+        # A setuid bit exercises the full st_mode encoding; set it AFTER any
+        # chown (chown clears setuid/setgid), and note that neither tool installs
+        # it on the real destination file.
+        os.chmod(f, 0o4711)
+
+        result, _ = run_client(source, dest, flags=["--fake-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--fake-super sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        rec = os.getxattr(os.path.join(received, "data.txt"), "user.rsync.%stat").decode()
+        rec_fields = rec.split()
+        assert len(rec_fields) == 3 and rec_fields[1] == "0,0", (
+            f"FastSync did not write rsync's stat grammar: {rec!r}"
+        )
+        assert int(rec_fields[0], 8) & 0o7777 == 0o4711, (
+            f"FastSync did not record the source mode in rsync's grammar: {rec!r}"
+        )
+
+        out = os.path.join(TEST_DATA_DIR, "fakesuper_interop_rsync")
+        clean_dir(out)
+        rs = subprocess.run([rsync, "-aX", "--fake-super",
+                             received + "/", out + "/"],
+                            capture_output=True, text=True, timeout=120)
+        assert rs.returncode == 0, (
+            f"rsync could not read FastSync's fake-super tree: {rs.stderr[:300]}"
+        )
+        out_rec = os.getxattr(os.path.join(out, "data.txt"), "user.rsync.%stat").decode()
+        assert out_rec == rec, (
+            "rsync re-emitted a different fake-super record; FastSync's grammar "
+            f"is not interoperable: ours={rec!r} rsync={out_rec!r}"
+        )
 
     @pytest.mark.ci
     def test_directory_xattrs_preserved(self, shared_server):
@@ -6695,6 +6883,31 @@ class TestExtendedAttributes:
         received = get_dest_received_dir(dest, source)
         assert os.getxattr(received, "user.rootdir") == b"r"
         assert os.getxattr(os.path.join(received, "sub"), "user.subdir") == b"s"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_directory_xattr_applied(self, shared_server, mt):
+        """#286.3: -d/-X must apply a transferred directory's user.* xattr at the
+        destination through the --dirs STATUS_MKDIR path (both the
+        single-threaded and -m/--threads receiver paths)."""
+        source, dest = self._source_and_dest("dirsxattr")
+        sub = os.path.join(source, "sub")
+        os.makedirs(sub)
+        if not _xattr_supported(sub):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(sub, "user.dirsdir", b"dirs-value")
+        lst = os.path.join(TEST_DATA_DIR, "dirs_xattr_list.txt")
+        with open(lst, "wb") as fh:
+            fh.write(b"sub\n")
+
+        flags = ["--files-from", lst, "--dirs", "-R", "-X"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--dirs -X sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = os.path.join(dest, "sub")
+        assert os.path.isdir(received), "--dirs directory entry was not created"
+        assert os.getxattr(received, "user.dirsdir") == b"dirs-value", \
+            "the --dirs directory's user.* xattr was not applied at the destination"
 
     @pytest.mark.ci
     def test_directory_default_acl_preserved(self, shared_server):
@@ -7171,9 +7384,10 @@ class TestCopyAs:
         )
         received = get_dest_received_dir(dest, source)
         dst = os.path.join(received, "mixed.txt")
-        record = os.getxattr(dst, "user.fastsync.stat").decode().split(":")
-        assert (record[0], record[1]) == ("65534", "65534"), (
-            f"fake-super must record the resolved copy-as ownership: {record[:2]}"
+        record = os.getxattr(dst, "user.rsync.%stat").decode().split()
+        owner = record[2].split(":")
+        assert owner == ["65534", "65534"], (
+            f"fake-super must record the resolved copy-as ownership: {owner}"
         )
         st = os.lstat(dst)
         assert (st.st_uid, st.st_gid) != (12345, 12346), (

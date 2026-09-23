@@ -3,11 +3,13 @@
 #include "test_utils.h"
 #include "transport_tcp.h"
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 /* -4/-6 map to a getaddrinfo ai_family hint: -4 -> AF_INET, -6 -> AF_INET6,
  * and neither -> AF_UNSPEC.  Both flags together are rejected earlier (in
@@ -246,6 +248,227 @@ static void test_tcp_nodelay_default_and_override() {
   server_delete(&s);
 }
 
+/* Count the process's open descriptors via /proc/self/fd.  The opendir
+ * descriptor is itself counted and closed before returning, so repeated calls
+ * are consistent and a before/after delta reflects only the code under test. */
+static int count_open_fds(void) {
+  DIR* dir = opendir("/proc/self/fd");
+  if (!dir)
+    return -1;
+  int count = 0;
+  const struct dirent* ent;
+  while ((ent = readdir(dir)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+      continue;
+    count++;
+  }
+  closedir(dir);
+  return count;
+}
+
+/* True when two sockaddrs name the same endpoint (family, address, and port).
+ * Comparing only the IP would let a connection to a different port on the same
+ * host pass, so the port is part of the identity. */
+static bool sockaddr_same_endpoint(const struct sockaddr_storage* a,
+                                   const struct sockaddr_storage* b) {
+  if (a->ss_family != b->ss_family)
+    return false;
+  if (a->ss_family == AF_INET) {
+    const struct sockaddr_in* ia = (const struct sockaddr_in*)a;
+    const struct sockaddr_in* ib = (const struct sockaddr_in*)b;
+    return ia->sin_port == ib->sin_port && ia->sin_addr.s_addr == ib->sin_addr.s_addr;
+  }
+  if (a->ss_family == AF_INET6) {
+    const struct sockaddr_in6* ia = (const struct sockaddr_in6*)a;
+    const struct sockaddr_in6* ib = (const struct sockaddr_in6*)b;
+    return ia->sin6_port == ib->sin6_port &&
+           memcmp(&ia->sin6_addr, &ib->sin6_addr, sizeof(ia->sin6_addr)) == 0;
+  }
+  return false;
+}
+
+/* Bind + listen on the SECOND address getaddrinfo returns for "localhost", so
+ * the first candidate is connection-refused and the shared connect loop must
+ * fall back to a later one.  On success the actual bound endpoint is written to
+ * out_bound/out_bound_len (the caller asserts the winning connect landed on it).
+ * Returns the listener fd and its port, or -1 when this host does not resolve
+ * localhost to at least two addresses (the test then skips rather than claiming
+ * coverage it does not have). */
+static int bind_second_localhost_address(int* out_port, struct sockaddr_storage* out_bound,
+                                         socklen_t* out_bound_len) {
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = NULL;
+  if (getaddrinfo("localhost", "0", &hints, &res) != 0 || !res)
+    return -1;
+  const struct addrinfo* chosen = res->ai_next;
+  if (!chosen) {
+    freeaddrinfo(res);
+    return -1;
+  }
+  int fd = socket(chosen->ai_family, chosen->ai_socktype, chosen->ai_protocol);
+  if (fd < 0) {
+    freeaddrinfo(res);
+    return -1;
+  }
+  int opt = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  if (bind(fd, chosen->ai_addr, chosen->ai_addrlen) != 0 || listen(fd, 1) != 0) {
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
+  }
+  struct sockaddr_storage bound;
+  socklen_t bound_len = sizeof(bound);
+  if (getsockname(fd, (struct sockaddr*)&bound, &bound_len) != 0) {
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
+  }
+  if (out_bound)
+    *out_bound = bound;
+  if (out_bound_len)
+    *out_bound_len = bound_len;
+  if (bound.ss_family == AF_INET6)
+    *out_port = ntohs(((struct sockaddr_in6*)&bound)->sin6_port);
+  else
+    *out_port = ntohs(((struct sockaddr_in*)&bound)->sin_port);
+  freeaddrinfo(res);
+  return fd;
+}
+
+/* #219 AC3: when the first getaddrinfo candidate is refused, the connect loop
+ * must fall back to the next address and end with exactly ONE open descriptor
+ * (proving the failed attempt's fd was closed before the retry). */
+static void test_tcp_connect_falls_back_to_next_address() {
+  int port = 0;
+  struct sockaddr_storage bound;
+  int listener = bind_second_localhost_address(&port, &bound, NULL);
+  if (listener < 0)
+    return; /* localhost is single-address on this host: cannot exercise fallback */
+
+  /* The /proc/self/fd delta is unreliable under valgrind (its own lazy fd
+   * activity perturbs the baseline), so only the functional assertions run
+   * there; the fd-count checks are skipped. */
+  bool check_fds = !is_running_under_valgrind();
+  int before = check_fds ? count_open_fds() : -1;
+
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_TRUE(client_connect(c, "localhost", port));
+  EXPECT_TRUE(c->file_descriptor >= 0);
+  /* The winning candidate must be the endpoint we bound (the second
+   * getaddrinfo entry).  Without this, a re-resolution that dropped the second
+   * address would make the test pass without ever exercising fallback. */
+  EXPECT_TRUE(sockaddr_same_endpoint(&c->address, &bound));
+  if (check_fds && before >= 0)
+    EXPECT_EQ_INT(count_open_fds(), before + 1);
+  client_disconnect(c);
+  if (check_fds && before >= 0)
+    EXPECT_EQ_INT(count_open_fds(), before);
+  client_delete(c);
+  close(listener);
+}
+
+/* #219 AC3: a connect that fails on every candidate leaves at most one
+ * descriptor (the last failed attempt) and none after client_disconnect. */
+static void test_tcp_connect_failed_attempts_do_not_leak_fds() {
+  if (is_running_under_valgrind())
+    return; /* /proc/self/fd delta is perturbed by valgrind's own lazy fds */
+
+  /* Keep an ephemeral loopback port bound (but NOT listening) for the whole
+   * assertion: the port stays occupied by our own socket, so the kernel
+   * deterministically refuses a connect() to it.  This closes the bind/close/
+   * connect TOCTOU window in which a parallel test could claim the port. */
+  int probe = socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(probe >= 0);
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  EXPECT_EQ_INT(bind(probe, (struct sockaddr*)&addr, sizeof(addr)), 0);
+  socklen_t addr_len = sizeof(addr);
+  EXPECT_EQ_INT(getsockname(probe, (struct sockaddr*)&addr, &addr_len), 0);
+  int port = ntohs(addr.sin_port);
+
+  int before = count_open_fds();
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  /* The literal loopback address has a single getaddrinfo candidate -- the one
+   * our bound socket owns -- so the connect is deterministically refused. */
+  EXPECT_FALSE(client_connect(c, "127.0.0.1", port));
+  if (before >= 0)
+    EXPECT_TRUE(count_open_fds() <= before + 1);
+  client_disconnect(c);
+  if (before >= 0)
+    EXPECT_EQ_INT(count_open_fds(), before);
+  client_delete(c);
+  close(probe);
+}
+
+/* #219 AC3: the shared tcp_connect_socket_ex() (used by both the plain and TLS
+ * entry points) must install the --contimeout as SO_RCVTIMEO/SO_SNDTIMEO before
+ * connecting.  Calling it directly lets us observe the pre-connect state (the
+ * plain wrapper later overrides the receive timeout with the IO --timeout). */
+static void test_tcp_connect_socket_ex_applies_contimeout() {
+  Server* s = server_create(0);
+  EXPECT_NOT_NULL(s);
+  EXPECT_EQ_INT(listen(s->file_descriptor, 1), 0);
+  struct sockaddr_in bound;
+  socklen_t bound_len = sizeof(bound);
+  EXPECT_EQ_INT(getsockname(s->file_descriptor, (struct sockaddr*)&bound, &bound_len), 0);
+  int port = ntohs(bound.sin_port);
+
+  tcp_set_timeouts(30, 7);
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  TcpConnectOptions opts;
+  memset(&opts, 0, sizeof(opts));
+  EXPECT_TRUE(tcp_connect_socket_ex(c, "127.0.0.1", port, &opts));
+  struct timeval tv;
+  socklen_t tv_len = sizeof(tv);
+  EXPECT_EQ_INT(getsockopt(c->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &tv, &tv_len), 0);
+  EXPECT_EQ_INT((int)tv.tv_sec, 7);
+  tv_len = sizeof(tv);
+  EXPECT_EQ_INT(getsockopt(c->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &tv, &tv_len), 0);
+  EXPECT_EQ_INT((int)tv.tv_sec, 7);
+  client_disconnect(c);
+  client_delete(c);
+  tcp_set_timeouts(30, 10);
+  server_delete(&s);
+}
+
+/* The plain wrapper applies the post-connect IO --timeout, which supersedes the
+ * contimeout installed during connect. */
+static void test_tcp_connect_post_timeout_applied() {
+  Server* s = server_create(0);
+  EXPECT_NOT_NULL(s);
+  EXPECT_EQ_INT(listen(s->file_descriptor, 1), 0);
+  struct sockaddr_in bound;
+  socklen_t bound_len = sizeof(bound);
+  EXPECT_EQ_INT(getsockname(s->file_descriptor, (struct sockaddr*)&bound, &bound_len), 0);
+  int port = ntohs(bound.sin_port);
+
+  tcp_set_timeouts(5, 7);
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_TRUE(client_connect(c, "127.0.0.1", port));
+  struct timeval tv;
+  socklen_t tv_len = sizeof(tv);
+  EXPECT_EQ_INT(getsockopt(c->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &tv, &tv_len), 0);
+  EXPECT_EQ_INT((int)tv.tv_sec, 5);
+  tv_len = sizeof(tv);
+  EXPECT_EQ_INT(getsockopt(c->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &tv, &tv_len), 0);
+  EXPECT_EQ_INT((int)tv.tv_sec, 5);
+  client_disconnect(c);
+  client_delete(c);
+  tcp_set_timeouts(30, 10);
+  server_delete(&s);
+}
+
 void test_transport_tcp() {
   test_server_create_ephemeral();
   test_server_delete_null();
@@ -263,4 +486,8 @@ void test_transport_tcp() {
   test_server_create_bind_address();
   test_server_create_bind_ipv6();
   test_tcp_nodelay_default_and_override();
+  test_tcp_connect_falls_back_to_next_address();
+  test_tcp_connect_failed_attempts_do_not_leak_fds();
+  test_tcp_connect_socket_ex_applies_contimeout();
+  test_tcp_connect_post_timeout_applied();
 }

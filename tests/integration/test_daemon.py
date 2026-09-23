@@ -63,6 +63,10 @@ DETACH_MODULE = os.path.join(MODULE_ROOT, "detach")
 DETACH_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.conf")
 DETACH_PORT = None
 
+# A dedicated config for the umask test: the daemon must be launched in the real
+# (double-fork) detach path, whose daemonize() applies umask(022).
+UMASK_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_umask.conf")
+
 # Passwords are never sent as plaintext and never logged; these literals are
 # only hashed into the server credential file / client password file.
 ALICE_PASS = "alice-s3cret"
@@ -137,6 +141,7 @@ class DaemonManager:
     def __init__(self):
         self._proc = None
         self._port = None
+        self.log_path = None
 
     def start(self, config_path, port_override=None, extra_args=None, log_path=None):
         self.stop()
@@ -150,7 +155,11 @@ class DaemonManager:
         if extra_args:
             cmd += extra_args
         if log_path is None:
-            log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+            # A unique log per manager: several managers run in one xdist
+            # worker, and a shared log lets one daemon's truncate/write offset
+            # corrupt the other's appended lines (a flaky log assertion).
+            log_path = os.path.join(TEST_DATA_DIR, f"fastsyncd_{id(self):x}.log")
+        self.log_path = log_path
         log = open(log_path, "w")
         self._proc = subprocess.Popen(
             cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -220,6 +229,7 @@ def daemon_env():
             "\n"
             "[files]\n"
             "path = %s\n"
+            "read only = no\n"
             "\n"
             "[readonly]\n"
             "path = %s\n"
@@ -227,18 +237,22 @@ def daemon_env():
             "\n"
             "[locked]\n"
             "path = %s\n"
+            "read only = no\n"
             "auth users = alice\n"
             "\n"
             "[team]\n"
             "path = %s\n"
+            "read only = no\n"
             "auth users = alice,bob\n"
             "\n"
             "[owner]\n"
             "path = %s\n"
+            "read only = no\n"
             "client owner = yes\n"
             "\n"
             "[denied]\n"
             "path = %s\n"
+            "read only = no\n"
             "hosts deny = 127.0.0.1\n"
             % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE,
                DENIED_MODULE))
@@ -257,7 +271,8 @@ def daemon_env():
     global DETACH_PORT
     DETACH_PORT = _find_free_port()
     with open(DETACH_CONF, "w") as f:
-        f.write("port = %d\n\n[detach]\npath = %s\n" % (DETACH_PORT, DETACH_MODULE))
+        f.write("port = %d\n\n[detach]\npath = %s\nread only = no\n"
+                % (DETACH_PORT, DETACH_MODULE))
 
     yield
     _kill_by_cmdline_marker(DETACH_CONF)
@@ -331,6 +346,97 @@ class TestDaemonModuleSelection:
         mismatches, missing = verify_transfer(SOURCE_DIR, received)
         assert not missing, f"missing: {missing[:5]}"
         assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def test_daemon_new_dirs_not_world_writable(self):
+        """The daemon must not force umask 0: implied parent directories created
+        without -p are the source default (0755 under the daemon's 022 umask),
+        never world-writable 0777.
+
+        This drives the real double-fork detach path, where the umask(022) fix
+        lives (daemonize()); the --no-detach path never calls it.  The launcher
+        is run with umask 0, so without the fix the daemon would inherit 0 and
+        create a 0777 directory; with the fix the assertion below fails only if
+        the fix regresses."""
+        port = _find_free_port()
+        with open(UMASK_CONF, "w") as f:
+            f.write("port = %d\n\n[files]\npath = %s\nread only = no\n"
+                    % (port, FILES_MODULE))
+        sub = os.path.join(FILES_MODULE, "umask_check")
+        shutil.rmtree(sub, ignore_errors=True)
+        os.makedirs(sub, exist_ok=True)
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_umask.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", UMASK_CONF, "--allow-unauthenticated"]
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                preexec_fn=lambda: os.umask(0))
+        try:
+            _wait_for_port(port, timeout=15)
+            result = _push("127.0.0.1::files/umask_check", port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(sub, SOURCE_DIR)
+            nested = os.path.join(received, "nested")
+            assert os.path.isdir(nested), f"nested dir missing under {received}"
+            mode = stat.S_IMODE(os.stat(nested).st_mode)
+            assert (mode & 0o022) == 0, f"implied directory is group/other writable: {oct(mode)}"
+        finally:
+            _kill_by_cmdline_marker(UMASK_CONF)
+            log.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+class TestRsyncConfigCompat:
+    """A real rsyncd.conf can be pointed at FastSync: the common rsync GLOBAL
+    and MODULE keys are accepted, the ones with a FastSync equivalent (port,
+    path, read only, max connections) take effect, and the inert ones (pid
+    file, log file, comment, use chroot, uid, gid, exclude, timeout, ...) are
+    documented no-ops.  --dparam accepts the same expanded key set."""
+
+    @pytest.mark.ci
+    def test_rsync_style_config_round_trip(self):
+        module = os.path.join(MODULE_ROOT, "rsync_style")
+        shutil.rmtree(module, ignore_errors=True)
+        os.makedirs(module, exist_ok=True)
+        port = _find_free_port()
+        conf = os.path.join(TEST_DATA_DIR, "fastsyncd_rsync_style.conf")
+        with open(conf, "w") as f:
+            f.write(
+                "# an rsync 3.4.1-style rsyncd.conf\n"
+                "pid file = /tmp/fastsyncd_rsync_style.pid\n"
+                "log file = /tmp/fastsyncd_rsync_style.log\n"
+                "socket options = TCP_NODELAY\n"
+                "use chroot = no\n"
+                "uid = nobody\n"
+                "gid = nogroup\n"
+                "timeout = 600\n"
+                "max verbosity = 2\n"
+                "transfer logging = yes\n"
+                "port = %d\n"
+                "\n"
+                "[rsync_style]\n"
+                "path = %s\n"
+                "comment = rsync-style module\n"
+                "use chroot = no\n"
+                "exclude = *.tmp\n"
+                "read only = no\n"
+                "max connections = 4\n"
+                % (port, module))
+        d = DaemonManager()
+        # --dparam borrows rsync's compact spelling; `pidfile` is inert but must
+        # not be rejected, proving dparam reuses the expanded global key set.
+        d.start(conf, extra_args=["--dparam", "pidfile=/tmp/rsync_style.pid"],
+                log_path=os.path.join(TEST_DATA_DIR, "fastsyncd_rsync_style.log"))
+        try:
+            result = _push("127.0.0.1::rsync_style", d.port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(module, SOURCE_DIR)
+            mismatches, missing = verify_transfer(SOURCE_DIR, received)
+            assert not missing, f"missing: {missing[:5]}"
+            assert not mismatches, f"mismatch: {mismatches[:5]}"
+        finally:
+            d.stop()
 
 
 class TestDaemonRejection:
@@ -435,7 +541,7 @@ class TestDaemonRejection:
         before any data lands.  `accept` lists the log phrases that count as the
         refusal (a non-root daemon refuses --copy-as earlier, at the privilege
         check, so the caller accepts that phrase too)."""
-        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        log_path = daemon.log_path
         before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
         before_files = self._tree_files()
         result, _ = run_client(SOURCE_DIR, f"127.0.0.1::{module}", port=daemon.port, flags=flags)
@@ -472,14 +578,13 @@ class TestDaemonRejection:
         the refusal into a silent accept."""
         port = _find_free_port()
         d = DaemonManager()
-        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         try:
             d.start(CONF_FILE, port_override=port,
                     extra_args=["--password-file", CRED_FILE, "--no-super"])
             result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=d.port,
                                    flags=["--super", "--preserve"])
             assert result.returncode != 0, "the --no-super daemon must refuse --super"
-            with open(log_path, "rb") as f:
+            with open(d.log_path, "rb") as f:
                 tail = f.read().decode("utf-8", "replace")
             assert "client-chosen ownership" in tail, (
                 f"daemon did not log the --super refusal: {tail[-400:]!r}"
@@ -968,7 +1073,7 @@ class TestDaemonAuthentication:
 
     def test_auth_log_does_not_leak_password(self, daemon):
         """The daemon log must never contain the password or the store verifier."""
-        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        log_path = daemon.log_path
         before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
         _push_with_creds("127.0.0.1::locked", daemon.port, "alice", WRONG_PASS)
         _push_with_creds("127.0.0.1::locked", daemon.port, "alice", ALICE_PASS)
@@ -995,7 +1100,7 @@ class TestDaemonAuthentication:
             _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
             _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
             time.sleep(0.3)
-            log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+            log_path = d.log_path
             with open(log_path, "rb") as f:
                 log = f.read().decode("utf-8", "replace")
         finally:
@@ -1030,7 +1135,8 @@ class TestDaemonMotd:
         motd_line = "motd file = %s\n" % motd_path if motd_path else ""
         os.makedirs(self.MOTD_MODULE, exist_ok=True)
         with open(self.MOTD_CONF, "w") as f:
-            f.write("port = %d\n%s\n[files]\npath = %s\n" % (port, motd_line, self.MOTD_MODULE))
+            f.write("port = %d\n%s\n[files]\npath = %s\nread only = no\n"
+                    % (port, motd_line, self.MOTD_MODULE))
         d = DaemonManager()
         d.start(self.MOTD_CONF, port_override=port)
         return d, port
@@ -1214,12 +1320,12 @@ class TestDaemonTLSAuth:
         _write_client_password_file(client_creds, "alice", ALICE_PASS)
         d = DaemonManager()
         port = _find_free_port()
-        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         try:
             d.start(CONF_FILE, port_override=port, extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
                 "--ca", certs["ca"], "--client-cn", "fastsync-client",
                 "--password-file", CRED_FILE])
+            log_path = d.log_path
             before_files = _tree_file_count(AUTH_MODULE)
             log_before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
             tls_flags = ["--tls",
@@ -1267,6 +1373,7 @@ class TestDaemonConnectionLimits:
                     "\n"
                     "[locked]\n"
                     "path = %s\n"
+                    "read only = no\n"
                     "auth users = alice\n"
                     % (port, AUTH_MODULE))
         d = DaemonManager()
@@ -1304,6 +1411,7 @@ class TestDaemonConnectionLimits:
                     "\n"
                     "[files]\n"
                     "path = %s\n"
+                    "read only = no\n"
                     "max connections = 2\n"
                     % (port, FILES_MODULE))
         d = DaemonManager()

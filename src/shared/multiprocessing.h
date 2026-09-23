@@ -78,6 +78,13 @@ typedef struct {
      path-only pre-scan on the calling thread and the pipeline scanner must not
      append to it.  Set once before the worker threads start. */
   bool early_delete;
+  /* --delete-before: the path-only pre-scan that built the early keep-set,
+     retained as the pipeline's file list (owning Chunk*; consumed and NULLed by
+     the scanner thread) so the data pass replays rsync's single file list
+     instead of re-reading the source.  NULL in every other mode, where the
+     scanner thread scans normally.  Set once before the worker threads start
+     and freed with the context. */
+  ArrayList* prescan_chunks;
   /* Non-NULL for --delete-during/--delete-delay: the per-directory plan set
      prebuilt by the path-only pre-scan on the calling thread.  The sender
      thread transmits the root plan before any data and the remaining plans
@@ -119,6 +126,10 @@ typedef struct {
   ArrayList* dir_entries;
   mtx_t dir_entries_mutex;
   bool dir_entries_mutex_init;
+  /* --stats directory accounting for a `-r` scan (no directory metadata):
+     shared by the parallel scanner workers, read by the sender thread once the
+     scanner is done.  See ScannerOptions.dir_count. */
+  atomic_ullong dir_count;
   /* Set by the sender thread when the receiver reported a --max-delete-capped
      deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
      exit 25 like rsync.  Read by the caller after the sender thread is joined. */

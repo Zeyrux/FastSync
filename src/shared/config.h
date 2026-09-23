@@ -83,7 +83,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.28.0).
+ * Config wire-field table (single source of truth for protocol 2.29.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -342,22 +342,60 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   CONFIG_WIRE_CODEC_FIELDS(X)                                                                      \
   CONFIG_WIRE_PROTECT_FIELDS(X)
 
+/* Client-only, CLI-parse bookkeeping (never serialized).  These members exist
+ * only so the client command-line parser can record HOW an option was
+ * specified (explicitly set, explicitly negated, or a parser-requested exit
+ * code); no other module and no wire peer ever needs them.  Grouping them in
+ * one nested member keeps the public Config free of client-CLI-only state. */
+typedef struct {
+  /* Set when the user explicitly turned an attribute off with --no-perms /
+   * --no-times (long or short form).  --incremental/--delta historically
+   * auto-enabled mode and mtime preservation; these flags let
+   * cli_finalize_config restore that behavior while still honoring the
+   * explicit per-attribute negation.  A later -p/-t re-enables the attribute
+   * directly, so the flag only prevents the incremental/delta implication,
+   * never a POSITIVE request. */
+  bool preserve_perms_explicit_off;
+  bool preserve_times_explicit_off;
+  /* Set by --no-preserve, the explicit opt-out of the whole preservation
+   * bundle, so the --incremental/--delta auto-preserve implication stays off. */
+  bool metadata_explicitly_disabled;
+  /* True when --server-port/--port was explicitly given.  --dry-run uses it to
+   * decide whether a real server handshake was requested, so a plain local
+   * destination (no explicit port) keeps the existing client-side dry-run
+   * behavior instead of dialing the default 127.0.0.1:8080. */
+  bool server_port_set;
+  /* True when --server-host was explicitly given, and distinct from the
+   * "127.0.0.1" default: --dry-run uses it to route an explicit remote target
+   * to the server so it reports receiver state exactly like a real run,
+   * instead of silently running the client-side manifest. */
+  bool server_host_set;
+  /* Codec-negotiation CLI state.  The effective pre-transfer checksum is
+   * Config->checksum_algo (serialized); checksum_transfer_algo is the rsync
+   * "transfer" half of a two-name --checksum-choice form (validated and used
+   * only to mirror rsync's whole-file forcing, since FastSync's per-block
+   * strong hash is fixed).  cli_exit_code carries a parser-requested process
+   * exit status (rsync uses 4 for an unsupported checksum/compress algorithm)
+   * so main() can mirror it. */
+  int checksum_transfer_algo;
+  int cli_exit_code;
+  /* "The user explicitly chose" bits.  They let the per-codec default level /
+   * checksum list be applied only when the corresponding rsync option was
+   * omitted (an explicit --compress-level / --checksum-choice always wins). */
+  bool compression_level_set;
+  bool checksum_choice_set;
+  /* True when --stop-at was given. */
+  bool stop_at_set;
+} ConfigCliParse;
+
 typedef struct Config {
   /* -j/--threads=N: number of parallel scanner worker threads for the -m
    * pipeline.  0 (the default, also set by bare -j/--threads) means "use the
    * scanner's built-in default" (4).  CLIENT-ONLY: it is a local scheduling
    * concern and is NEVER serialized into the wire config frame. */
   int scanner_threads;
-  bool metadata_explicitly_disabled;
-  /* CLIENT-ONLY (never serialized; not in CONFIG_WIRE_FIELDS).  Set when the
-   * user explicitly turned an attribute off with --no-perms / --no-times (long
-   * or short form).  --incremental/--delta historically auto-enabled mode and
-   * mtime preservation; these flags let cli_finalize_config restore that
-   * behavior while still honoring the explicit per-attribute negation.  A
-   * later -p/-t re-enables the attribute directly, so the flag only prevents
-   * the incremental/delta implication, never a POSITIVE request. */
-  bool preserve_perms_explicit_off;
-  bool preserve_times_explicit_off;
+  /* Client-only CLI-parse bookkeeping (never serialized).  See ConfigCliParse. */
+  ConfigCliParse cli;
   bool show_progress;
   int compression_threads;
   int ssh_port;
@@ -378,18 +416,6 @@ typedef struct Config {
   bool use_tls;
   char* server_host;
   int server_port;
-  /* True when --server-port/--port was explicitly given.  CLIENT-ONLY (never
-   * serialized): --dry-run uses it to decide whether a real server handshake
-   * was requested, so a plain local destination (no explicit port) keeps the
-   * existing client-side dry-run behavior instead of dialing the default
-   * 127.0.0.1:8080. */
-  bool server_port_set;
-  /* True when --server-host was explicitly given.  CLIENT-ONLY (never
-   * serialized), and distinct from the "127.0.0.1" default: --dry-run uses it
-   * to route an explicit remote target to the server so it reports receiver
-   * state exactly like a real run, instead of silently running the client-side
-   * manifest. */
-  bool server_host_set;
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
@@ -435,22 +461,6 @@ typedef struct Config {
    * enters the keep-set.  Implied by --delete-missing-args. */
   bool ignore_missing_args;
 
-  /* Codec-negotiation CLI state (all client-only, never serialized).  The
-   * effective pre-transfer checksum is Config->checksum_algo (serialized);
-   * checksum_transfer_algo is the rsync "transfer" half of a two-name
-   * --checksum-choice form (validated and used only to mirror rsync's
-   * whole-file forcing, since FastSync's per-block strong hash is fixed).
-   * cli_exit_code carries a parser-requested process exit status (rsync uses 4
-   * for an unsupported checksum/compress algorithm) so main() can mirror it. */
-  int checksum_transfer_algo;
-  int cli_exit_code;
-  /* Client-only "the user explicitly chose" bits.  They let the per-codec
-   * default level / checksum list be applied only when the corresponding
-   * rsync option was omitted (an explicit --compress-level / --checksum-choice
-   * always wins).  Never serialized. */
-  bool compression_level_set;
-  bool checksum_choice_set;
-
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).
   ArrayList* filters;   /* --filter=RULE rule strings, in order */
@@ -463,7 +473,9 @@ typedef struct Config {
    * /.rsync-filter' (the .rsync-filter files themselves are transferred); a
    * repeated -F adds --filter='- .rsync-filter' so they are excluded too. */
   int per_dir_filter_count;
-  bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
+  int one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries.
+                          Repeated -x (rsync's -xx) drops the mount-point
+                          directory entirely instead of recreating it empty. */
   /* --no-implied-dirs: client-only.  With -R, do not transfer the source
    * metadata of the parent directories implied by a listed path; an unlisted
    * implied parent is still created (with default attributes) so the listed
@@ -484,7 +496,6 @@ typedef struct Config {
   /* --outbuf mode (OutbufMode): stdout/stderr buffering.  Client-only launch
    * concern: NEVER crosses the wire. */
   int outbuf;
-  bool old_args;
   /* --remote-option=OPT (Phase 5, long form only): one or more extra command-line
    * options to append to the REMOTE server invocation over SSH.  CLIENT-ONLY:
    * they are composed into the remote command line by ssh_build_remote_command()
@@ -554,7 +565,6 @@ typedef struct Config {
    * process and are NEVER serialized into the config frame. */
   int stop_after_mins; /* --stop-after=MINS minutes; 0 when unset */
   time_t stop_at;      /* --stop-at=... absolute wall-clock deadline */
-  bool stop_at_set;    /* true when --stop-at was given */
 
   /* Client-only residual-batch paths.  A residual batch is a self-contained
    * single-file record of the whole source tree (full file images using the
@@ -725,11 +735,13 @@ typedef struct Config {
    * --copy-as) imply it. */
   /* fake_super */
   /* --fake-super: receiver-only.  When set, each written file additionally gets
-   * a reserved user.fastsync.stat xattr recording the RESOLVED uid/gid (the
+   * rsync's reserved user.rsync.%stat xattr recording the RESOLVED uid/gid (the
    * source's own when no ownership request is active, else the --chown/--usermap
-   * result) plus mode/mtime so a later privileged restore could re-apply them.
-   * It NEVER real-chowns: the point is to record the source ownership on an
-   * unprivileged receiver.  Crosses the wire. */
+   * result) plus the full mode and rdev, in rsync 3.4.1's grammar, so the tree is
+   * interoperable and a later privileged restore could re-apply them.  mtime is
+   * carried by the file's own timestamp, exactly as rsync does it.  It NEVER
+   * real-chowns: the point is to record the source ownership on an unprivileged
+   * receiver.  Crosses the wire. */
   /* module */
   /* Daemon module selection (Wave A, protocol 2.15.0).  Client-composed from a
    * host::module/path destination; NULL or "" means "no module" (the ordinary
@@ -1059,7 +1071,20 @@ typedef struct Config {
  * filter rules so the receiver can protect DESTINATION-ONLY entries from
  * --delete with `protect`/`risk` rules (rsync parity).  The block appends after
  * compression_algo; see CONFIG_WIRE_PROTECT_FIELDS. */
-#define PROTOCOL_VERSION "2.28.0"
+/* (10) Symlink xattrs/ACLs (protocol 2.29.0): the config-frame LAYOUT is
+ * unchanged (the derived use_xattrs bit already crosses the wire), but the
+ * STATUS_SYMLINK frame BODY grows a trailing bounded xattr block when -X/-A is
+ * negotiated -- exactly the block STATUS_MKDIR, STATUS_DIR_TIMES and regular
+ * files already carry.  The sender captures the symlink's OWN xattrs with
+ * llistxattr/lgetxattr (so it can never attach the REFERENT's attributes to the
+ * link) and the receiver re-applies them to the link itself with lsetxattr on a
+ * confined /proc/self/fd/<parent>/<leaf> path (there is no *at xattr syscall and
+ * fsetxattr cannot target a symlink).  A 2.28 peer that does not consume the new
+ * trailing block would desynchronize after every symlink, so the protocol
+ * version must bump; the strict same-version handshake (config_receive rejects a
+ * mismatched version before parsing anything else) keeps a 2.29 client and a
+ * 2.28 server from ever reaching that state. */
+#define PROTOCOL_VERSION "2.29.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

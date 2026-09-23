@@ -1,18 +1,30 @@
-# FastSync — Session Handoff (2026-09-19)
+# FastSync — Session Handoff (2026-09-21)
 
 ## Current status
-- **rsync-parity tracks 1-6 landed on `dev`** via **PR #303** (`10159dc`,
-  "feat(parity): rsync parity tracks 1-6 (protocol 2.28.0)"). Dev push CI run
-  **581** fully green: lint, build-and-test, parity-full, ASan, UBSan,
-  fuzz-build, coverage, valgrind.
+- **Release `v2.28.0`** is tagged and merged to `main`: tag `v2.28.0` points at
+  `ee6523a`, and the PR #304 merge commit `b4d54504` is on `main`.
+- **`dev` is at `0fbb9de`** — the merge of parity cycle 2.29 (PR #305). The old
+  `558782d` (incremental-check flake fix) is an ancestor.
 - **`PROTOCOL_VERSION` = `"2.28.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.28.0)`. The cycle batched all wire
-  changes (stats counters, filter-rule block, `--verify-basis`) under the one
-  bump.
-- **`main` = `ef76c90`** (tag `v2.26.0`); the 2.27.0/2.28.0 work is on `dev`
-  and not yet released. A `dev -> main` v2.28.0 release PR is the next step.
-- Parity matrix: **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (was 111/13/33 at cycle start).
-- Working tree clean; feature branch deleted; no scratch trees or worktrees.
+  `project(FastFileTransfer VERSION 2.28.0)`.
+- **Parity cycle 2.29 is merged to `dev`** (PR #305), no wire change. It closed
+  the scanner-order, delete-timing, relative-basis and fuzzy-eligibility
+  residuals and improved the `--info`/`--stats`/`--debug` partials. Parity
+  matrix: **120 ✅ / 10 ⚠️ / 27 ❌ = 157**. Remaining ⚠️ rows: `--info`,
+  `--debug`, `--msgs2stderr`, `--stats`, `--progress`, `--delete-before`, the
+  three basis-dir options, and `-y`/`--fuzzy`.
+- **Audit cycle complete on branch `fix/audit-cycle`** (branched from `dev` @
+  `0fbb9de`), integration PR to `dev` pending. No wire change
+  (`PROTOCOL_VERSION` stays 2.28.0). It lands the receiver/client security and
+  correctness fixes — `--temp-dir` symlink-escape confinement, special-bit
+  masking under a super-off policy, daemon `umask(022)`, the `-z` decompression
+  ceiling raised to the 256 MiB whole-file bound, `--bwlimit` pacing the
+  plaintext `--sendfile` path, `--partial-dir` implying `--partial`, rejection
+  of unsupported filter modifiers (`x`/`e`/`n`/`w`), client-side
+  `MAX_FILTER_RULES` enforcement, unknown wire `Status` rejection, and the
+  accompanying refactors/docs. The parity matrix is unchanged at
+  **120 ✅ / 10 ⚠️ / 27 ❌ = 157**; this docs pass (worktree `fix/audit-docs2`)
+  corrects the `RSYNC_COMPAT.md` summary tally to match the rows.
 
 
 ## What landed this session
@@ -98,7 +110,8 @@
     uptodate` plus the leading `./` root name line for `--info=name` (only the
     root-line trigger condition and receiver-side `skip` wording remain). Matrix
     now **111 ✅ / 14 ⚠️ / 32 ❌ = 157**; differential + unit tests added in
-    `test_features.py`, `test_option_parity.py`, `test_delete_plan.c`,
+    `test_features.py`, `test_option_parity.py`, the unit test
+    `tests/test_delete_plan.c`,
     `test_delete_delay_budget_parity.py`, `test_delete_timing_parity.py`.
 12. **No-wire parity track 2b** on `feat/parity-2.28` (no protocol change):
     `--progress`/`-P`/`--info=progress` (when not `--quiet`) now run an opt-in
@@ -195,17 +208,43 @@
     **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (the `--delete`/`--delete-during` rows stay
     ⚠️ for the abort boundary; `--delete-after` stays ✅).
 
+17. **Audit cycle** on `fix/audit-cycle` (from `dev` @ `0fbb9de`;
+    `PROTOCOL_VERSION` stays `2.28.0`): a security/correctness pass over the
+    parity-2.29 baseline. It raises the decompression ceiling to the 256 MiB
+    protocol whole-file bound (`-z` on 100–256 MiB files now works), paces the
+    plaintext-TCP `--sendfile` path with `--bwlimit`, confines the `--temp-dir`
+    scratch dir by the fd's real path (symlink escape refused), masks
+    client-controlled setuid/setgid/sticky bits when super activities are not
+    permitted, sets the daemon umask to `022`, makes `--partial-dir` imply
+    `--partial`, rejects the unsupported filter modifiers (`x`/`e`/`n`/`w`),
+    enforces `MAX_FILTER_RULES` client-side, rejects unknown wire `Status`
+    values, and hardens credentials/signal handling (with the accompanying
+    refactors and docs). No row changes classification, so the matrix stays
+    **120 ✅ / 10 ⚠️ / 27 ❌ = 157**. This docs pass is on `fix/audit-docs2`.
+
 ## Next steps
-1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
-2. **Deferred security items** (documented, not implemented):
-   - Pre-auth config/daemon-auth handshake has no aggregate wall-clock deadline
-     (per-message timeout only) — slowloris holds connection slots.
-   - Per-source registry fails open when the shared table is full (per-module/global
-     caps and host ACLs still apply); consider fail-closed or larger/evicting table.
-   - SCRAM-like daemon auth has no TLS channel binding (and is not RFC 5802).
-   - `cleanup()` signal handler calls non-async-signal-safe teardown; daemon `umask(0)`.
-   - Wire protocol assumes homogeneous word size/endianness (lengths are native
-     `size_t`) — document or move to fixed-width framing.
+1. **Open and merge the audit-cycle PR** (`fix/audit-cycle`, including this
+   `fix/audit-docs2` docs pass) into `dev` once reviewed. `dev` is the default
+   branch; all PRs target `dev`, never `main` directly.
+2. **Remaining deferred items:**
+   - **Large structural refactors:** delete-engine consolidation
+     (`delete_extras_fd`/`manifest_delete_extras`/the delete-plan path),
+     god-function splits, and translation-unit splits.
+   - **`--progress`/`--info` receiver→sender event channel:** the root `./`
+     line, ancestor-directory suppression, receiver-side `skip`/`backup` echo,
+     and symlink/empty-dir quick-check feedback.
+   - **`--delete-before` phase-0 keep-set** (rsync fixes the file list before
+     the data pass; FastSync keeps its pre-scan snapshot race).
+   - **>256 MiB single-file streaming** (B4, the general whole-file limit).
+   - **Wire native-size framing:** lengths are native `size_t` and the protocol
+     assumes homogeneous word size/endianness — document or move to fixed-width
+     framing.
+   - **SCRAM-like daemon auth channel binding:** no TLS channel binding today
+     (and it is not RFC 5802).
+   - Still-open security nits: the pre-auth config/daemon-auth handshake has no
+     aggregate wall-clock deadline (per-message timeout only — slowloris holds
+     connection slots); the per-source registry fails open when the shared table
+     is full (per-module/global caps and host ACLs still apply).
 3. **Out of scope / intentional:** pull (remote source) mode is **not** planned —
    FastSync is push-only; see `RSYNC_COMPAT.md#direction`.
 

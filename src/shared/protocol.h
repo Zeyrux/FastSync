@@ -28,6 +28,10 @@
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
+/* Files larger than this are not kept fully in memory while loading: the
+ * loader skips them so the sender streams from the path, and file_checksum
+ * hashes them from disk in bounded buffers instead of forcing a full load. */
+#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 #define MAX_MANIFEST_ENTRIES (1024 * 1024)
 /* Aggregate bytes retained by one received deletion manifest. */
 #define MAX_MANIFEST_BYTES (16ULL * 1024 * 1024)
@@ -46,16 +50,48 @@
 
 typedef struct ssl_st SSL;
 
+typedef struct ProtocolSession ProtocolSession;
+
+/*
+ * Transport vtable: the per-session set of I/O primitives the three protocol
+ * loops (send, receive, status-read) dispatch through.  The ops are selected
+ * once, when the session is initialized or its SSL is installed, so the loops
+ * never branch on the transport at runtime.  A plaintext session uses the
+ * read()/write() ops; a TLS session uses the SSL_read()/SSL_write() ops.
+ *
+ * `send`/`recv` attempt exactly one transfer and return:
+ *   > 0                    bytes transferred,
+ *   PROTOCOL_IO_RETRY      no progress; poll on *wait_events and retry,
+ *   PROTOCOL_IO_CLOSED     peer closed the stream,
+ *   PROTOCOL_IO_ERROR      fatal transport error.
+ * `has_pending` reports bytes already buffered by the transport (a TLS record
+ * residue); the receive loops skip the poll() gate when it is true.
+ */
+typedef struct ProtocolIoOps {
+  ssize_t (*send)(ProtocolSession* session, const void* data, size_t size, short* wait_events);
+  ssize_t (*recv)(ProtocolSession* session, void* data, size_t size, short* wait_events);
+  bool (*has_pending)(const ProtocolSession* session);
+} ProtocolIoOps;
+
+/* Negative sentinels returned by ProtocolIoOps.send/recv (see above). */
+enum {
+  PROTOCOL_IO_RETRY = -1,
+  PROTOCOL_IO_CLOSED = -2,
+  PROTOCOL_IO_ERROR = -3,
+};
+
 /*
  * Explicit owner of protocol I/O.  A session does not own the descriptors or
  * SSL object; it only describes the transport used by a transfer.  This makes
  * it safe to pass the transport to a worker without relying on inherited
  * thread-local state.
  */
-typedef struct ProtocolSession {
+struct ProtocolSession {
   int read_fd;
   int write_fd;
   SSL* ssl;
+  /* Transport dispatch selected by protocol_session_init()/set_ssl(). */
+  const ProtocolIoOps* ops;
   unsigned long long bwlimit;
   long long bw_tokens;
   long long bw_last_refill_sec;
@@ -71,7 +107,7 @@ typedef struct ProtocolSession {
    * SO_RCVTIMEO/SO_SNDTIMEO.  The server does not propagate a client 0 here: it
    * installs protocol_server_io_timeout_sec() so its sessions keep a floor. */
   int io_timeout_sec;
-} ProtocolSession;
+};
 
 typedef int Status;
 enum NET_STATUS {
@@ -212,6 +248,17 @@ void io_set_bwlimit(unsigned long long bytes_per_sec);
 unsigned long long io_get_bwlimit(void);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
+/* SSL object of the transport in effect on this thread: the currently bound
+ * session's SSL when a TLS session is bound, otherwise the legacy thread-local
+ * io_ssl.  NULL for a plaintext transport.  Unlike io_get_ssl(), this resolves
+ * worker threads that bound a TLS session via protocol_session_set_ssl()/
+ * protocol_session_bind() but never called io_set_ssl() themselves (C11
+ * _Thread_local state is not inherited by a new thread).  A bound session only
+ * wins when its selected dispatch is TLS; a bound plaintext session (ssl ==
+ * NULL) falls back to io_ssl so it can never mask a live encrypted transport.
+ * Callers that must choose a TLS-only code path (e.g. file_send.c's sendfile
+ * fallback) must use this instead of io_get_ssl(). */
+SSL* protocol_current_ssl(void);
 
 /* Process-wide wire byte counters.  protocol_send_n_data/protocol_receive_n_data
  * update them; the zero-copy sendfile path reports through
@@ -220,6 +267,15 @@ SSL* io_get_ssl(void);
 unsigned long long protocol_bytes_written(void);
 unsigned long long protocol_bytes_read(void);
 void protocol_note_bytes_written(unsigned long long bytes);
+/* Apply --bwlimit pacing to bytes written outside protocol_send_n_data (the
+ * plaintext zero-copy sendfile fast path).  `file_descriptor` is the wire fd
+ * the bytes were written to, so the legacy session is resolved exactly as the
+ * preceding send_n_data call resolved it (the bound TLS session still wins when
+ * set); resolving with the same fd avoids re-initializing the legacy session
+ * and granting a second first-call burst.  Runs the same token-bucket throttle,
+ * so the sendfile transport is paced identically to the buffered/TLS paths.  A
+ * no-op when the effective session has no bandwidth limit. */
+void protocol_throttle_bytes(int file_descriptor, size_t bytes);
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
 /* Transitional bridge for helpers whose signatures still carry only an fd. */
@@ -263,6 +319,9 @@ bool protocol_send_int(ProtocolSession* session, int data);
 bool protocol_receive_int(ProtocolSession* session, int* data);
 bool protocol_send_status(ProtocolSession* session, Status status);
 bool protocol_receive_status(ProtocolSession* session, Status* status);
+/* As protocol_receive_status, but with an explicit per-message deadline
+ * (seconds) instead of the session's configured io_timeout_sec. */
+bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int timeout_sec);
 bool send_n_data(int file_descriptor, const void* data, size_t data_size);
 bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 

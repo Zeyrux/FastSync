@@ -29,6 +29,12 @@ typedef struct FileAttrPolicy {
   bool times;         /* config->preserve_times: apply the source mtime */
   bool atimes;        /* config->preserve_atimes (-U): apply the source atime */
   bool executability; /* config->use_executability (-E): exec-bits-only mode */
+  /* privilege_super_mode_permitted(): when false (SUPER_MODE_OFF / --no-super,
+     or a daemon that did not grant `client owner = yes`), the setuid/setgid/
+     sticky bits are stripped from every applied mode (source mode and any
+     --chmod result) even under --perms.  When true, rsync's exact semantics are
+     preserved: -p copies the special bits and the kernel decides. */
+  bool super_permitted;
 } FileAttrPolicy;
 
 /* Build the per-attribute policy from a connection's Config.  A NULL config

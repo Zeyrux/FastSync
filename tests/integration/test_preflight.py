@@ -1,23 +1,57 @@
 """CLI validation and preflight checks."""
+import socket
 import subprocess
 import sys
 import os
 import shutil
+import time
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import BUILD_DIR, CLIENT_CMD, SERVER_CMD, TEST_DATA_DIR, run_client, verify_transfer
+from common import (
+    BUILD_DIR,
+    CLIENT_CMD,
+    CLIENT_TIMEOUT,
+    SERVER_CMD,
+    TEST_DATA_DIR,
+    get_dest_received_dir,
+    run_client,
+    verify_transfer,
+)
+
+DEFAULT_PORT = 8080
+
+
+def _port_is_listening(host, port, timeout=0.3):
+    """True if something accepts a TCP connection on host:port right now."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_listener(host, port, timeout=5.0):
+    """Poll host:port until a listener accepts, or the deadline passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _port_is_listening(host, port):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 class TestHelp:
     def test_client_help(self):
-        r = subprocess.run(CLIENT_CMD + ["--help"], capture_output=True, text=True)
+        r = subprocess.run(CLIENT_CMD + ["--help"], capture_output=True,
+                           text=True, timeout=CLIENT_TIMEOUT)
         assert r.returncode == 0
         assert "Usage:" in r.stdout
         assert "SSH transport" in r.stdout
 
     def test_server_help(self):
-        r = subprocess.run(SERVER_CMD + ["--help"], capture_output=True, text=True)
+        r = subprocess.run(SERVER_CMD + ["--help"], capture_output=True,
+                           text=True, timeout=CLIENT_TIMEOUT)
         assert r.returncode == 0
         assert "Usage:" in r.stdout
 
@@ -67,19 +101,24 @@ class TestServerPort:
 
     def test_default_port(self):
         """Server should start on default port 8080."""
+        if _port_is_listening("127.0.0.1", DEFAULT_PORT):
+            pytest.skip(f"port {DEFAULT_PORT} already in use by another process")
+
         proc = subprocess.Popen(
             SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None,
         )
         try:
-            import socket, time
-            time.sleep(0.5)
-            with socket.create_connection(("127.0.0.1", 8080), timeout=2):
-                pass  # Port is listening
-        except (ConnectionRefusedError, OSError):
-            pytest.fail("Server not listening on default port 8080")
+            if not _wait_for_listener("127.0.0.1", DEFAULT_PORT, timeout=5.0):
+                if proc.poll() is not None and _port_is_listening("127.0.0.1", DEFAULT_PORT):
+                    pytest.skip(f"port {DEFAULT_PORT} was taken by another process")
+                pytest.fail(f"Server not listening on default port {DEFAULT_PORT}")
         finally:
             proc.terminate()
-            proc.wait(timeout=5)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
 
 def _seed_protocol_source(source):
@@ -94,18 +133,18 @@ def _seed_protocol_source(source):
 class TestProtocol:
     @pytest.mark.ci
     def test_protocol_current_version_accepted(self, shared_server):
-        """--protocol=2.28.0 (the current PROTOCOL_VERSION) is accepted and the
+        """--protocol=2.29.0 (the current PROTOCOL_VERSION) is accepted and the
         transfer completes normally."""
         source = os.path.join(TEST_DATA_DIR, "proto_ok_src")
         dest = os.path.join(TEST_DATA_DIR, "proto_ok_dst")
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
         _seed_protocol_source(source)
-        result, _ = run_client(source, dest, flags=["--protocol=2.28.0"],
+        result, _ = run_client(source, dest, flags=["--protocol=2.29.0"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"--protocol current run failed: {(result.stderr or result.stdout)[:400]}"
-        received = os.path.join(dest, os.path.abspath(source).lstrip(os.sep))
+        received = get_dest_received_dir(dest, source)
         mismatches, missing = verify_transfer(source, received)
         assert not mismatches and not missing, \
             f"transfer mismatch: missing={missing} mismatches={mismatches}"
@@ -118,7 +157,7 @@ class TestProtocol:
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
         _seed_protocol_source(source)
-        for bad in ("2.27.0", "2.26.0", "2.25.0", "2.24.0", "2.23.0", "2.22.0", "2.21.0", "2.20.0",
+        for bad in ("2.28.0", "2.27.0", "2.26.0", "2.25.0", "2.24.0", "2.23.0", "2.22.0", "2.21.0", "2.20.0",
                     "2.19.0", "2.18.0", "2.17.0", "2.15.0", "2.16.0", "216", "31"):
             result, _ = run_client(source, dest, flags=[f"--protocol={bad}"],
                                    port=shared_server.port)

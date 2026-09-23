@@ -141,6 +141,10 @@ static void itemize_code(const Config* config, const ChangeEvent* event, char co
     update = 'h';
   else if (created)
     update = (event->is_directory || event->is_symlink || event->is_special) ? 'c' : '>';
+  else if (event->is_directory)
+    /* rsync: an existing directory that only has attribute changes carries no
+       transfer, so the update column is `.` rather than `>`. */
+    update = '.';
   else
     update = '>';
   code[0] = update;
@@ -168,12 +172,15 @@ static void itemize_code(const Config* config, const ChangeEvent* event, char co
   code[11] = '\0';
 }
 
-/* rsync %n: the transfer-relative name, with a trailing slash for directories. */
+/* rsync %n: the transfer-relative name, with a trailing slash for directories.
+ * The transfer root is `.` (so `%n` renders `./`), matching rsync's root entry. */
 static bool append_name(StrBuf* buf, const ChangeEvent* event) {
-  if (!strbuf_append(buf, event->name != NULL ? event->name : ""))
+  const char* name = event->name != NULL ? event->name : "";
+  if (event->is_directory && name[0] == '\0')
+    return strbuf_append(buf, "./");
+  if (!strbuf_append(buf, name))
     return false;
-  if (event->is_directory && (event->name == NULL || event->name[0] == '\0' ||
-                              event->name[strlen(event->name) - 1] != '/'))
+  if (event->is_directory && name[strlen(name) - 1] != '/')
     return strbuf_append_char(buf, '/');
   return true;
 }
@@ -245,7 +252,7 @@ static char* change_render_name_uptodate(const ChangeEvent* event) {
  * resolves to xxh128, so an explicit selection and the default both render the
  * selected algorithm's digest. */
 static ChecksumAlgo out_format_checksum_algo(const Config* config) {
-  return (ChecksumAlgo)config->checksum_transfer_algo;
+  return (ChecksumAlgo)config->cli.checksum_transfer_algo;
 }
 
 /* Render a digest as rsync's sum_as_hex: xxh128 prints the HIGH 64-bit half

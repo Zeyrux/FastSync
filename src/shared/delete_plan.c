@@ -2,6 +2,7 @@
 
 #include "charset.h"
 #include "delay_updates.h"
+#include "delete.h"
 #include "file.h"
 #include "log.h"
 #include "utils.h"
@@ -432,6 +433,17 @@ int delete_plan_send_remaining(int fd, DeletePlanSender* sender, const ArrayList
   return 0;
 }
 
+int delete_plan_send_all(int fd, DeletePlanSender* sender, const ArrayList* dirs) {
+  if (!sender)
+    return -1;
+  /* Root first: this also transmits the one-shot per-run config block on its
+     own carrier frame (see send_config_only), so it reaches the receiver even
+     when the scope permits no directory plan at all. */
+  if (delete_plan_send_root(fd, sender) != 0)
+    return -1;
+  return delete_plan_send_remaining(fd, sender, dirs);
+}
+
 /* ------------------------------------------------------------------ */
 /* Receiver: delete session                                           */
 /* ------------------------------------------------------------------ */
@@ -469,6 +481,24 @@ struct DeletePlanSession {
 static void notify_deleted(DeletePlanSession* session, const char* rel) {
   if (session && session->observer && rel)
     session->observer(session->observer_context, rel);
+}
+
+/* A removed directory is reported with rsync's trailing slash (`deleting dir/`)
+   while files keep their bare path. */
+static void notify_deleted_dir(DeletePlanSession* session, const char* rel) {
+  if (!session || !session->observer || !rel)
+    return;
+  size_t len = strlen(rel);
+  char* with_slash = malloc(len + 2);
+  if (!with_slash) {
+    session->observer(session->observer_context, rel);
+    return;
+  }
+  memcpy(with_slash, rel, len);
+  with_slash[len] = '/';
+  with_slash[len + 1] = '\0';
+  session->observer(session->observer_context, with_slash);
+  free(with_slash);
 }
 
 DeletePlanSession* delete_plan_session_create(const Config* config) {
@@ -572,9 +602,8 @@ static int open_plan_dir(const Config* config, const char* dir) {
   return fd;
 }
 
-typedef struct PlanSkips {
-  DeleteSkipEntry* entries;
-  int count;
+typedef struct {
+  DeleteSkipSet set;
   /* Receiver-side delete-protection rules received on the config frame (NULL
      when the sender sent none).  Evaluated per extra so a protect/risk rule is
      honored under --delete-during/--delete-delay exactly like the whole-tree
@@ -584,39 +613,12 @@ typedef struct PlanSkips {
 
 static bool build_plan_skips(const Config* config, const DeletePlanSession* session,
                              PlanSkips* out) {
-  out->entries = NULL;
-  out->count = 0;
   out->protect_rules = config->protect_rules;
-  int count = (config->delay_updates ? 1 : 0) + config->basis_count +
-              session->protected_prefixes->size + session->size_skipped->size;
-  if (count == 0)
-    return true;
-  out->entries = calloc((size_t)count, sizeof(DeleteSkipEntry));
-  if (!out->entries)
-    return false;
-  int idx = 0;
-  if (config->delay_updates) {
-    out->entries[idx].prefix = DELAY_UPDATES_STAGING_DIR;
-    out->entries[idx].top_level_only = true;
-    idx++;
-  }
-  for (int i = 0; i < config->basis_count; i++) {
-    out->entries[idx].prefix = config->basis_dirs[i].path;
-    out->entries[idx].top_level_only = false;
-    idx++;
-  }
-  for (int i = 0; i < session->protected_prefixes->size; i++) {
-    out->entries[idx].prefix = (const char*)session->protected_prefixes->items[i];
-    out->entries[idx].top_level_only = false;
-    idx++;
-  }
-  for (int i = 0; i < session->size_skipped->size; i++) {
-    out->entries[idx].prefix = (const char*)session->size_skipped->items[i];
-    out->entries[idx].top_level_only = false;
-    idx++;
-  }
-  out->count = idx;
-  return true;
+  /* The per-directory plan walk keeps each basis path verbatim (it does not
+     convert an absolute under-root path to its root-relative form, unlike the
+     whole-tree commit walk). */
+  return delete_skips_build(config, session->protected_prefixes, session->size_skipped, false,
+                            &out->set);
 }
 
 static bool budget_available(const DeletePlanSession* session) {
@@ -696,7 +698,7 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
     session->deleted++;
     session->planned++;
     log_deleted(child_rel);
-    notify_deleted(session, child_rel);
+    notify_deleted_dir(session, child_rel);
     *removed = true;
     return true;
   }
@@ -733,81 +735,108 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
                              const ArrayList* keep_files, bool at_root, bool force_now,
                              const PlanSkips* skips, DeletePlanSession* session, bool* survives) {
   *survives = false;
-  int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (scanfd < 0)
+  DeleteDirEntry* entries = NULL;
+  size_t count = 0;
+  bool collect_ok = true;
+  if (!delete_dir_entries_collect(dirfd, &entries, &count, &collect_ok))
     return false;
-  DIR* dir = fdopendir(scanfd);
-  if (!dir) {
-    close(scanfd);
+  bool operation_ok = collect_ok;
+  bool local_survives = false;
+  bool* shielded = calloc(count ? count : 1, sizeof(bool));
+  bool* is_extra = calloc(count ? count : 1, sizeof(bool));
+  bool* force = calloc(count ? count : 1, sizeof(bool));
+  if (!shielded || !is_extra || !force) {
+    free(shielded);
+    free(is_extra);
+    free(force);
+    delete_dir_entries_free(entries, count);
     return false;
   }
-  bool operation_ok = true;
-  bool local_survives = false;
-  const struct dirent* entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
+
+  /* rsync's order: extraneous subdirectories in descending name order, then
+     extraneous files in descending name order (kept entries survive and are not
+     touched here — a kept subdirectory gets its own per-directory plan). */
+  if (count > 1)
+    qsort(entries, count, sizeof(*entries), delete_dir_entry_cmp_desc);
+  size_t dir_count = 0;
+  while (dir_count < count && entries[dir_count].is_dir)
+    dir_count++;
+
+  for (size_t i = 0; i < count; i++) {
     char* child_rel =
-        (strcmp(dir_rel, ".") == 0) ? str_dup(entry->d_name) : path_cat(dir_rel, entry->d_name);
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entries[i].name) : path_cat(dir_rel, entries[i].name);
     if (!child_rel) {
       operation_ok = false;
       continue;
     }
-    if (path_under_skip_prefix(child_rel, at_root, skips->entries, skips->count)) {
+    if (path_under_skip_prefix(child_rel, at_root, skips->set.entries, skips->set.count)) {
+      shielded[i] = true;
       local_survives = true;
       free(child_rel);
       continue;
     }
-    struct stat st;
-    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno != ENOENT)
-        operation_ok = false;
-      free(child_rel);
-      continue;
-    }
-    bool is_dir = S_ISDIR(st.st_mode);
-    bool in_keep_dirs = is_dir && list_contains_str(keep_dirs, entry->d_name);
-    bool in_keep_files = !is_dir && list_contains_str(keep_files, entry->d_name);
+    bool is_dir = entries[i].is_dir;
+    bool in_keep_dirs = is_dir && list_contains_str(keep_dirs, entries[i].name);
+    bool in_keep_files = !is_dir && list_contains_str(keep_files, entries[i].name);
     bool rule_protected =
         skips->protect_rules &&
-        filter_rules_apply_side(skips->protect_rules, child_rel, entry->d_name, is_dir,
+        filter_rules_apply_side(skips->protect_rules, child_rel, entries[i].name, is_dir,
                                 FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT;
-    if (in_keep_dirs) {
+    if (in_keep_dirs || in_keep_files || rule_protected) {
+      shielded[i] = true;
       local_survives = true;
-    } else if (keep_dirs && !is_dir && list_contains_str(keep_dirs, entry->d_name)) {
-      /* Destination file blocks a source directory: clear it now, whatever the
-         delete timing, so the directory can be created. */
-      if (!process_extra_file(dirfd, entry->d_name, child_rel, true, session))
-        operation_ok = false;
-    } else if (in_keep_files) {
-      local_survives = true;
-    } else if (keep_files && is_dir && list_contains_str(keep_files, entry->d_name)) {
-      /* Destination directory blocks a source file: remove it now. */
-      bool removed = false;
-      if (!process_extra_dir(dirfd, entry->d_name, child_rel, true, skips, session, &removed))
-        operation_ok = false;
-      else if (!removed)
-        local_survives = true;
     } else if (is_dir) {
-      if (rule_protected) {
-        local_survives = true;
-      } else {
-        bool removed = false;
-        if (!process_extra_dir(dirfd, entry->d_name, child_rel, force_now, skips, session,
-                               &removed))
-          operation_ok = false;
-        else if (!removed)
-          local_survives = true;
-      }
-    } else if (rule_protected) {
-      local_survives = true;
+      /* A destination directory blocks a source file of the same name: remove
+         it now, whatever the delete timing, so the file can be created. */
+      is_extra[i] = true;
+      force[i] = keep_files && list_contains_str(keep_files, entries[i].name);
     } else {
-      if (!process_extra_file(dirfd, entry->d_name, child_rel, force_now, session))
-        operation_ok = false;
+      /* A destination file blocks a source directory of the same name: clear it
+         now so the directory can be created. */
+      is_extra[i] = true;
+      force[i] = keep_dirs && list_contains_str(keep_dirs, entries[i].name);
     }
     free(child_rel);
   }
-  closedir(dir);
+
+  /* Pass 1: extraneous subdirectories, descending. */
+  for (size_t i = 0; i < dir_count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel =
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entries[i].name) : path_cat(dir_rel, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    bool removed = false;
+    if (!process_extra_dir(dirfd, entries[i].name, child_rel, force[i] || force_now, skips, session,
+                           &removed))
+      operation_ok = false;
+    else if (!removed)
+      local_survives = true;
+    free(child_rel);
+  }
+
+  /* Pass 2: extraneous files, descending. */
+  for (size_t i = dir_count; i < count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel =
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entries[i].name) : path_cat(dir_rel, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    if (!process_extra_file(dirfd, entries[i].name, child_rel, force[i] || force_now, session))
+      operation_ok = false;
+    free(child_rel);
+  }
+
+  free(shielded);
+  free(is_extra);
+  free(force);
+  delete_dir_entries_free(entries, count);
   *survives = local_survives;
   return operation_ok;
 }
@@ -827,7 +856,7 @@ static bool apply_plan_dir(DeletePlanSession* session, const Config* config, con
   bool survives = false;
   bool ok = process_children(dirfd, dir, dirs, files, strcmp(dir, ".") == 0, false, &skips, session,
                              &survives);
-  free(skips.entries);
+  delete_skips_free(&skips.set);
   close(dirfd);
   if (!ok)
     log_message(LOG_LEVEL_ERROR, "deletion failed while removing extraneous files");
@@ -932,10 +961,11 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
     return false;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full, &leaf, false);
+  int open_errno = errno;
   free(full);
   if (parent_fd < 0) {
     free(leaf);
-    return errno == ENOENT || errno == ENOTDIR;
+    return open_errno == ENOENT || open_errno == ENOTDIR;
   }
   struct stat st;
   if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -967,7 +997,7 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
     }
     bool survives = false;
     bool ok = process_children(dirfd, rel, NULL, NULL, false, true, &skips, session, &survives);
-    free(skips.entries);
+    delete_skips_free(&skips.set);
     close(dirfd);
     if (!ok) {
       close(parent_fd);
@@ -981,7 +1011,7 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
         session->deleted++;
         session->planned++;
         log_deleted(rel);
-        notify_deleted(session, rel);
+        notify_deleted_dir(session, rel);
       } else if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST) {
         close(parent_fd);
         free(leaf);

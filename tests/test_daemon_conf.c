@@ -1,6 +1,7 @@
 #include "test_daemon_conf.h"
 #include "credentials.h"
 #include "daemon_conf.h"
+#include "log.h"
 #include "test_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,9 @@ static void test_daemon_conf_create_defaults() {
   EXPECT_EQ_INT(conf->global.port, DAEMON_CONF_DEFAULT_PORT);
   EXPECT_NULL(conf->global.motd_file);
   EXPECT_NULL(conf->global.address);
+  /* rsync modules are read-only unless they opt in, so the default must be
+   * true. */
+  EXPECT_TRUE(conf->global.read_only_default);
   EXPECT_EQ_INT(conf->global.max_connections, DAEMON_CONF_DEFAULT_MAX_CONNECTIONS);
   EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS);
   EXPECT_EQ_INT(conf->global.max_connections_per_host,
@@ -626,6 +630,348 @@ static void test_daemon_conf_module_count_capped() {
   EXPECT_TRUE(strstr(err, "too many modules") != NULL);
 }
 
+/* rsync rsyncd.conf compatibility: the common GLOBAL keys FastSync does not
+ * implement (pid file, log file, use chroot, uid/gid, timeout, ...) are
+ * accepted as documented inert keys, while the keys with a FastSync equivalent
+ * keep working and the compact rsync --dparam spellings (`pidfile`, `logfile`,
+ * `motdfile`) are recognized.  A global `read only` is rsync's module default
+ * and must not be silently dropped. */
+static void test_daemon_conf_rsync_global_keys() {
+  char* path;
+  char err[256];
+  EXPECT_EQ_INT(write_conf("pid file = /run/fastsyncd.pid\n"
+                           "log file = /var/log/fastsyncd.log\n"
+                           "socket options = TCP_NODELAY\n"
+                           "listen backlog = 10\n"
+                           "syslog facility = daemon\n"
+                           "syslog tag = fastsyncd\n"
+                           "use chroot = no\n"
+                           "uid = nobody\n"
+                           "gid = nogroup\n"
+                           "timeout = 600\n"
+                           "max verbosity = 3\n"
+                           "lock file = /var/run/fastsyncd.lock\n"
+                           "transfer logging = yes\n"
+                           "strict modes = yes\n"
+                           "reverse lookup = no\n"
+                           "dont compress = *.gz\n"
+                           "read only = yes\n"
+                           "port = 8734\n"
+                           "address = 127.0.0.1\n"
+                           "pidfile = /run/other.pid\n"
+                           "logfile = /var/log/other.log\n"
+                           "motdfile = /etc/fastsync/motd.alt\n"
+                           "\n"
+                           "[pub]\n"
+                           "path = /srv/pub\n"
+                           "\n"
+                           "[explicit]\n"
+                           "path = /srv/explicit\n"
+                           "read only = no\n",
+                           &path),
+                0);
+  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  /* Mapped globals took effect; the compact aliases too. */
+  EXPECT_EQ_INT(conf->global.port, 8734);
+  EXPECT_EQ_STR(conf->global.address, "127.0.0.1");
+  EXPECT_EQ_STR(conf->global.motd_file, "/etc/fastsync/motd.alt");
+  /* The global `read only = yes` is the default for modules defined after it. */
+  EXPECT_TRUE(conf->global.read_only_default);
+  EXPECT_EQ_INT(conf->module_count, 2);
+  EXPECT_TRUE(conf->modules[0].read_only);
+  /* An explicit per-module value wins over the global default. */
+  EXPECT_FALSE(conf->modules[1].read_only);
+  daemon_conf_free(conf);
+}
+
+/* rsync module keys with no FastSync equivalent load inert; the keys with a
+ * FastSync meaning still map onto their native fields. */
+static void test_daemon_conf_rsync_module_keys() {
+  char* path;
+  char err[256];
+  EXPECT_EQ_INT(write_conf("[data]\n"
+                           "path = /srv/data\n"
+                           "comment = Public data\n"
+                           "use chroot = yes\n"
+                           "uid = nobody\n"
+                           "gid = nogroup\n"
+                           "exclude = *.tmp\n"
+                           "include = keep.tmp\n"
+                           "exclude from = /etc/rsync.exclude\n"
+                           "max verbosity = 2\n"
+                           "lock file = /var/run/rsyncd.lock\n"
+                           "transfer logging = yes\n"
+                           "timeout = 300\n"
+                           "secrets file = /etc/rsyncd.secrets\n"
+                           "auth digest = sha256\n"
+                           "numeric ids = yes\n"
+                           "write only = no\n"
+                           "list = yes\n"
+                           "dont compress = *.gz\n"
+                           "refuse options = delete\n"
+                           "read only = yes\n"
+                           "max connections = 5\n"
+                           "hosts allow = 10.0.0.0/8\n"
+                           "auth users = alice\n",
+                           &path),
+                0);
+  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_EQ_STR(conf->modules[0].path, "/srv/data");
+  EXPECT_TRUE(conf->modules[0].read_only);
+  EXPECT_EQ_INT(conf->modules[0].max_connections, 5);
+  EXPECT_EQ_INT(conf->modules[0].hosts_allow_count, 1);
+  EXPECT_EQ_STR(conf->modules[0].hosts_allow[0], "10.0.0.0/8");
+  EXPECT_EQ_INT(conf->modules[0].auth_user_count, 1);
+  EXPECT_EQ_STR(conf->modules[0].auth_users[0], "alice");
+  daemon_conf_free(conf);
+}
+
+/* A genuinely unknown key is still rejected in both contexts, so accepting the
+ * rsync subset did not turn typos into silent no-ops. */
+static void test_daemon_conf_rsync_unknown_keys_rejected() {
+  char* path;
+  char err[256];
+  EXPECT_EQ_INT(write_conf("bogus rsync key = 1\n", &path), 0);
+  const DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "unknown global key") != NULL);
+
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nnot a real key = 1\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "unknown key 'not a real key'") != NULL);
+}
+
+/* A recognized rsync key with an invalid value is still a clear parse error. */
+static void test_daemon_conf_rsync_read_only_invalid() {
+  char* path;
+  char err[256];
+  EXPECT_EQ_INT(write_conf("read only = maybe\n[m]\npath = /x\n", &path), 0);
+  const DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "read only") != NULL);
+
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nread only = maybe\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "read only") != NULL);
+}
+
+/* --dparam reuses the same global dispatch: it accepts the compact rsync
+ * spellings and the inert rsync global keys, and `read only` sets the default
+ * for modules that did not set their own value. */
+static void test_daemon_conf_dparam_rsync_keys() {
+  DaemonConf* conf = daemon_conf_create();
+  EXPECT_NOT_NULL(conf);
+  char err[256];
+
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "pidfile=/run/x.pid", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "pid file=/run/y.pid", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "logfile=/tmp/x.log", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "log file=/tmp/y.log", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "motdfile=/tmp/alt.motd", err, sizeof(err)), 0);
+  EXPECT_EQ_STR(conf->global.motd_file, "/tmp/alt.motd");
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "timeout=600", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "use chroot=no", err, sizeof(err)), 0);
+
+  /* A module already parsed without an explicit `read only` takes the
+   * --dparam default; an explicit module value is preserved. */
+  {
+    char* path;
+    EXPECT_EQ_INT(write_conf("[plain]\npath = /p\n[explicit]\npath = /e\nread only = no\n", &path),
+                  0);
+    DaemonConf* loaded = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NOT_NULL(loaded);
+    EXPECT_EQ_INT(daemon_conf_apply_dparam(loaded, "read only=yes", err, sizeof(err)), 0);
+    EXPECT_TRUE(loaded->global.read_only_default);
+    EXPECT_TRUE(loaded->modules[0].read_only);
+    EXPECT_FALSE(loaded->modules[1].read_only);
+    daemon_conf_free(loaded);
+  }
+
+  /* Invalid values and genuinely unknown keys are still rejected. */
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "read only=maybe", err, sizeof(err)), -1);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "definitely not rsync=1", err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "unknown global key") != NULL);
+
+  daemon_conf_free(conf);
+}
+
+/* rsync modules default to READ-ONLY; `read only = no` / `write only = yes`
+ * opt a module into writability, and an explicit module value wins over a
+ * global default. */
+static void test_daemon_conf_read_only_default_and_opt_in() {
+  char* path;
+  char err[256];
+  DaemonConf* conf;
+
+  /* A module that never mentions read only/write only is READ-ONLY, matching
+   * rsync (a migrated rsyncd.conf must not be served writable). */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_TRUE(conf->modules[0].read_only);
+  EXPECT_FALSE(conf->modules[0].read_only_explicit);
+  daemon_conf_free(conf);
+
+  /* `read only = no` opts in to writable. */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nread only = no\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_FALSE(conf->modules[0].read_only);
+  EXPECT_TRUE(conf->modules[0].read_only_explicit);
+  daemon_conf_free(conf);
+
+  /* `write only = yes` opts in to writable (FastSync is push-only). */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nwrite only = yes\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_FALSE(conf->modules[0].read_only);
+  EXPECT_TRUE(conf->modules[0].read_only_explicit);
+  daemon_conf_free(conf);
+
+  /* `write only = no` is rsync's default and does not undo read-only. */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nwrite only = no\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_TRUE(conf->modules[0].read_only);
+  EXPECT_FALSE(conf->modules[0].read_only_explicit);
+  daemon_conf_free(conf);
+
+  /* A global `read only = no` is the default for later modules; an explicit
+   * module `read only`/`write only = yes` still wins. */
+  EXPECT_EQ_INT(write_conf("read only = no\n[a]\npath = /a\n"
+                           "[b]\npath = /b\nread only = yes\n"
+                           "[c]\npath = /c\nwrite only = yes\n",
+                           &path),
+                0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_FALSE(conf->global.read_only_default);
+  EXPECT_FALSE(conf->modules[0].read_only);
+  EXPECT_TRUE(conf->modules[1].read_only);
+  EXPECT_FALSE(conf->modules[2].read_only);
+  daemon_conf_free(conf);
+
+  /* A global `read only = yes` keeps modules without an explicit value
+   * read-only. */
+  EXPECT_EQ_INT(write_conf("read only = yes\n[a]\npath = /a\n"
+                           "[b]\npath = /b\nread only = no\n"
+                           "[c]\npath = /c\nwrite only = yes\n",
+                           &path),
+                0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_TRUE(conf->global.read_only_default);
+  EXPECT_TRUE(conf->modules[0].read_only);
+  EXPECT_FALSE(conf->modules[1].read_only);
+  EXPECT_FALSE(conf->modules[2].read_only);
+  daemon_conf_free(conf);
+
+  /* An invalid `write only` value is a clear parse error. */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nwrite only = maybe\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "write only") != NULL);
+}
+
+/* Security-relevant rsync keys are accepted for migration but have no FastSync
+ * effect, so loading must warn loudly (naming the key and module) rather than
+ * letting an operator believe the restriction is enforced. */
+static void test_daemon_conf_unenforced_security_keys_warned() {
+  char* path;
+  char err[256];
+  EXPECT_EQ_INT(write_conf("use chroot = yes\n"
+                           "uid = nobody\n"
+                           "[m]\n"
+                           "path = /x\n"
+                           "read only = no\n"
+                           "secrets file = /etc/rsyncd.secrets\n"
+                           "refuse options = delete\n"
+                           "exclude = *.tmp\n"
+                           "max size = 1M\n"
+                           "pre-xfer exec = /bin/true\n"
+                           "incoming chmod = F644\n"
+                           "name converter = sh\n",
+                           &path),
+                0);
+
+  set_log_level(LOG_LEVEL_WARNING);
+  FILE* log_capture = tmpfile();
+  EXPECT_NOT_NULL(log_capture);
+  log_set_file(log_capture);
+  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  fflush(log_capture);
+  rewind(log_capture);
+  log_set_file(NULL);
+  free(path);
+
+  /* Inert security keys must never fail the load. */
+  EXPECT_NOT_NULL(conf);
+  EXPECT_FALSE(conf->modules[0].read_only);
+
+  bool saw_secrets = false;
+  bool saw_refuse = false;
+  bool saw_filter = false;
+  bool saw_size = false;
+  bool saw_hook = false;
+  bool saw_chmod = false;
+  bool saw_converter = false;
+  bool saw_global_chroot = false;
+  bool saw_global_uid = false;
+  char line[512];
+  while (fgets(line, sizeof(line), log_capture) != NULL) {
+    if (strstr(line, "NOT enforced") == NULL)
+      continue;
+    if (strstr(line, "module 'm'") && strstr(line, "secrets file"))
+      saw_secrets = true;
+    if (strstr(line, "module 'm'") && strstr(line, "refuse options"))
+      saw_refuse = true;
+    if (strstr(line, "module 'm'") && strstr(line, "exclude"))
+      saw_filter = true;
+    if (strstr(line, "module 'm'") && strstr(line, "max size"))
+      saw_size = true;
+    if (strstr(line, "module 'm'") && strstr(line, "pre-xfer exec"))
+      saw_hook = true;
+    if (strstr(line, "module 'm'") && strstr(line, "incoming chmod"))
+      saw_chmod = true;
+    if (strstr(line, "module 'm'") && strstr(line, "name converter"))
+      saw_converter = true;
+    if (strstr(line, "global key 'use chroot'"))
+      saw_global_chroot = true;
+    if (strstr(line, "global key 'uid'"))
+      saw_global_uid = true;
+  }
+  fclose(log_capture);
+
+  EXPECT_TRUE(saw_secrets);
+  EXPECT_TRUE(saw_refuse);
+  EXPECT_TRUE(saw_filter);
+  EXPECT_TRUE(saw_size);
+  EXPECT_TRUE(saw_hook);
+  EXPECT_TRUE(saw_chmod);
+  EXPECT_TRUE(saw_converter);
+  EXPECT_TRUE(saw_global_chroot);
+  EXPECT_TRUE(saw_global_uid);
+  daemon_conf_free(conf);
+}
+
 void test_daemon_conf() {
   test_daemon_conf_create_defaults();
   test_daemon_conf_full_parse();
@@ -645,4 +991,11 @@ void test_daemon_conf() {
   test_daemon_conf_module_count_capped();
   test_daemon_hosts_allowed();
   test_daemon_module_name_valid();
+  test_daemon_conf_rsync_global_keys();
+  test_daemon_conf_rsync_module_keys();
+  test_daemon_conf_rsync_unknown_keys_rejected();
+  test_daemon_conf_rsync_read_only_invalid();
+  test_daemon_conf_dparam_rsync_keys();
+  test_daemon_conf_read_only_default_and_opt_in();
+  test_daemon_conf_unenforced_security_keys_warned();
 }

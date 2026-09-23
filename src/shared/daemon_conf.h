@@ -17,7 +17,20 @@
  * DAEMON_CONF_MAX_LINE all fail the whole load with a clear, line-numbered
  * error instead of being silently ignored.  This keeps a typo from silently
  * changing what a module serves.
- */
+ *
+ * rsync compatibility: to reduce the divergence from rsync 3.4.1's rsyncd.conf
+ * grammar, the parser also ACCEPTS the common rsync GLOBAL and MODULE keys.
+ * Keys with a FastSync equivalent are mapped onto it (the native spellings are
+ * unchanged; `read only` defaults to yes like rsync, and `write only = yes`
+ * opts a module into writability).  Keys with no FastSync equivalent are
+ * accepted and documented as inert (they load successfully but have no effect)
+ * rather than failing the whole config; the accepted inert set is listed in
+ * kRsyncInertGlobalKeys / kRsyncInertModuleKeys in daemon_conf.c and in
+ * RSYNC_COMPAT.md.  Every inert key whose intent is access control is loudly
+ * warned about at load time (kRsyncUnenforced*SecurityKeys) so an operator
+ * migrating a hardened rsyncd.conf is never misled into believing the
+ * restriction is enforced.  A key outside both the FastSync-native grammar and
+ * the recognized rsync subset is still rejected as unknown. */
 
 /* A daemon module's configured root is used exactly like the standalone
  * server's --destination-root: the daemon confines every connection that
@@ -42,15 +55,21 @@
  * store refuses (fail closed) rather than falling open; see server.c.  Auth is
  * never bypassed by ignoring the list. */
 typedef struct DaemonModule {
-  char* name;        /* module name, as the client requests it */
-  char* path;        /* module root (daemon-side authorized root) */
-  bool read_only;    /* `read only = yes/no`; default no */
-  bool client_owner; /* `client owner = yes/no`; default no.  Per-module opt-in
-                        that lets this module's clients choose ownership
-                        (--numeric-ids/--chown/--usermap/--groupmap/--fake-super/
-                        --copy-as) and request explicit --super super-user
-                        activities.  Without it the daemon refuses all of them. */
-  char** auth_users; /* `auth users = a,b`; Wave B credential list */
+  char* name;              /* module name, as the client requests it */
+  char* path;              /* module root (daemon-side authorized root) */
+  bool read_only;          /* `read only = yes/no`; defaults to the global `read only`
+                              default (rsync allows it in the global section), which is
+                              itself default YES (rsync modules are read-only unless
+                              `read only = no` / `write only = yes` opts in) */
+  bool read_only_explicit; /* set when this module set its own `read only` or
+                              `write only = yes`, so a later global default (from a
+                              `--dparam read only=`) does not override it */
+  bool client_owner;       /* `client owner = yes/no`; default no.  Per-module opt-in
+                              that lets this module's clients choose ownership
+                              (--numeric-ids/--chown/--usermap/--groupmap/--fake-super/
+                              --copy-as) and request explicit --super super-user
+                              activities.  Without it the daemon refuses all of them. */
+  char** auth_users;       /* `auth users = a,b`; Wave B credential list */
   int auth_user_count;
   /* `max connections = N` (optional per-module cap).  0 means unlimited.  The
    * per-connection child records the selected module in the shared registry
@@ -69,6 +88,10 @@ typedef struct DaemonConfGlobals {
   int port;                      /* `port`, default DAEMON_CONF_DEFAULT_PORT (873) */
   char* motd_file;               /* `motd file`, may be NULL */
   char* address;                 /* `address` (optional bind address), may be NULL */
+  bool read_only_default;        /* global `read only` default for modules defined
+                                    after it (rsync allows the module key in the
+                                    global section); default YES to match rsync's
+                                    read-only modules */
   int max_connections;           /* `max connections`, default
                                     DAEMON_CONF_DEFAULT_MAX_CONNECTIONS (100) */
   int auth_failure_delay_ms;     /* `auth failure delay`, milliseconds; default
@@ -152,10 +175,13 @@ const DaemonModule* daemon_conf_find_module(const DaemonConf* conf, const char* 
 bool daemon_module_name_valid(const char* name);
 
 /* Parse one --dparam=KEY=VALUE (or "--dparam KEY=VALUE") override string and
- * apply it to the global keys only.  Keys are case-insensitive and limited to
- * the global keys defined by the grammar (port, motd file, address,
+ * apply it to the global keys only.  Keys are case-insensitive and cover the
+ * global keys defined by the grammar (port, motd file, address, read only,
  * max connections, max connections per host, auth failure delay,
- * auth lockout threshold, auth lockout duration, hosts allow, hosts deny).
+ * auth lockout threshold, auth lockout duration, hosts allow, hosts deny) plus
+ * the recognized inert rsync global keys and the compact rsync spellings
+ * (`motdfile`, `pidfile`, `logfile`).  Applying `read only` sets the global
+ * default and re-applies it to every module that did not set its own value.
  * Returns 0 on success, -1 on error (err filled). */
 int daemon_conf_apply_dparam(DaemonConf* conf, const char* assignment, char* err, size_t err_size);
 

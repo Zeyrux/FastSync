@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(FastFileTransfer VERSION 2.28.0)
+project(FastFileTransfer VERSION 2.29.0)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 11)
@@ -26,9 +26,9 @@ elseif(NOT SANITIZER STREQUAL "none")
 endif()
 
 # --- Strict warnings option ---
-option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Werror)" OFF)
+option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Wformat-signedness, Werror)" OFF)
 if(STRICT_WARNINGS)
-	add_compile_options(-Wextra -Wpedantic -Werror)
+	add_compile_options(-Wextra -Wpedantic -Wformat-signedness -Werror)
 endif()
 
 # --- Coverage option ---
@@ -99,17 +99,21 @@ set(SHARED_SRCS
 	src/shared/daemon_limits.c
 	src/shared/data.c
 	src/shared/delay_updates.c
+	src/shared/delete.c
+	src/shared/delete_commit.c
 	src/shared/delete_plan.c
 	src/shared/delta.c
 	src/shared/file.c
 	src/shared/file_list.c
 	src/shared/file_receive.c
+	src/shared/file_save.c
 	src/shared/file_send.c
 	src/shared/file_store.c
 	src/shared/filter.c
 	src/shared/format.c
 	src/shared/hardlink.c
 	src/shared/identity.c
+	src/shared/incremental_check.c
 	src/shared/log.c
 	src/shared/metadata.c
 	src/shared/motd.c
@@ -136,9 +140,14 @@ set(SERVER_MAIN_SRCS src/server/server.c)
 # Client implementation (no main): everything except the CLI entry point.
 set(CLIENT_CORE_SRCS
 	src/client/change_list.c
+	src/client/client_manifest.c
+	src/client/client_report.c
+	src/client/client_scan.c
 	src/client/client_send.c
 	src/client/client_validation.c
 	src/client/scanner.c
+	src/client/scanner_filter.c
+	src/client/scanner_parallel.c
 	src/client/usage.c
 )
 set(CLIENT_MAIN_SRCS src/client/client_cli.c)
@@ -226,6 +235,7 @@ set(TEST_SRCS
 	tests/test_file.c
 	tests/test_file_list.c
 	tests/test_file_sendfile.c
+	tests/test_filter.c
 	tests/test_format.c
 	tests/test_fuzz_smoke.c
 	tests/test_glob.c

@@ -103,8 +103,12 @@ bool file_remove_tree_secure(const char* path);
    the authorized root.  Used for the --delay-updates staging directory. */
 int file_open_private_dir(const char* dir_path);
 
-/* Open an existing --temp-dir scratch directory as-is (absolute or relative;
-   no creation, no root confinement), matching rsync's --temp-dir handling. */
+/* Open an existing --temp-dir scratch directory (relative or absolute; no
+   creation).  When an authorized receive root is configured the directory's
+   REAL path (symlinks resolved) must lie within it, so a client-planted
+   symlink cannot redirect receiver scratch files outside the sandbox; an
+   in-root symlink to another filesystem is still allowed for rsync's EXDEV
+   fallback. */
 int file_open_temp_dir(const char* dir_path);
 
 /* The file_to_disk_secure* variants write a temporary copy in the destination
@@ -178,13 +182,12 @@ bool file_copy_basis_stream_attrs(const char* path, const char* basis_path,
  * confined secure walk had to create that lie strictly below `count_floor` (a
  * receive-root-relative prefix, or NULL for all).  Used to reproduce rsync's
  * `Number of created files` directory count on a fresh destination. */
-bool file_to_disk_secure_attrs_counted(const char* path, const void* data,
-                                       unsigned long long data_size, bool inplace, bool sparse,
-                                       bool preallocate, const FileMetadata* metadata,
-                                       FileAttrPolicy policy, bool update, bool no_replace,
-                                       bool use_fsync, const FileXattrList* xattrs, bool fake_super,
-                                       bool keep_partial, const char* temp_dir,
-                                       unsigned* dirs_created, const char* count_floor);
+bool file_to_disk_secure_attrs_counted(
+    const char* path, const void* data, unsigned long long data_size, bool inplace, bool sparse,
+    bool preallocate, const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+    bool no_replace, bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+    bool keep_partial, const char* temp_dir, unsigned* dirs_created, const char* count_floor,
+    uint32_t fake_super_rdev_major, uint32_t fake_super_rdev_minor);
 bool file_to_disk_secure_link_attrs_counted(const char* path, const char* basis_path,
                                             const void* data, unsigned long long data_size,
                                             bool preallocate, const FileMetadata* metadata,

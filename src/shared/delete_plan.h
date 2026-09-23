@@ -3,6 +3,7 @@
 
 #include "array_list.h"
 #include "config.h"
+#include "delete.h"
 #include "file_receive.h"
 #include "protocol.h"
 #include "utils.h"
@@ -61,9 +62,19 @@ int delete_plan_send_root(int fd, DeletePlanSender* sender);
  * for `path` itself; already-sent plans are skipped. */
 int delete_plan_send_for_path(int fd, DeletePlanSender* sender, const char* path, bool is_dir);
 /* Send the plan for every directory in `dirs` that has not been transmitted
- * yet.  Called after the data stream so an empty source directory's plan still
- * clears its destination extras even though no file frame triggered it. */
+ * yet. */
 int delete_plan_send_remaining(int fd, DeletePlanSender* sender, const ArrayList* dirs);
+/* Transmit the COMPLETE per-directory plan set in one pass, before any data
+ * frame: the root plan (with the one-shot per-run config block on its carrier
+ * frame) followed by every directory in `dirs`.  Because the whole plan set is
+ * known from the path-only pre-scan, sending it all up front means a
+ * mid-transfer abort has already applied every planned removal, matching
+ * rsync's generator (which runs ahead of its throttled sender).  A completed
+ * run is unaffected.  `dirs` is the set of directories whose direct children
+ * were enumerated (the scanner's plan_dirs sink), so a merely listed but
+ * untraversed directory never gets a plan and its mirror is left intact.
+ * Returns -1 on I/O error. */
+int delete_plan_send_all(int fd, DeletePlanSender* sender, const ArrayList* dirs);
 
 /* ---- Receiver: delete session ---- */
 

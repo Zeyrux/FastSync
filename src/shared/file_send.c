@@ -124,8 +124,12 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
   }
 
   /* sendfile cannot encrypt TLS records.  Keep the framing identical but
-     route encrypted transfers through the deadline-aware IO layer. */
-  if (io_get_ssl() != NULL) {
+     route encrypted transfers through the deadline-aware IO layer.  Resolve
+     the transport from the bound session, not the thread-local io_ssl: a
+     worker thread running a TLS transfer has its SSL only on the session it
+     bound, so io_get_ssl() would be NULL there and the raw sendfile() path
+     would be taken on an encrypted socket. */
+  if (protocol_current_ssl() != NULL) {
     unsigned char buffer[64 * 1024];
     unsigned long long remaining = file_size;
     bool ok = true;
@@ -166,6 +170,8 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
     }
     struct pollfd pfd = {.fd = file_descriptor, .events = POLLOUT};
     int polled = poll(&pfd, 1, timeout);
+    if (polled < 0 && errno == EINTR)
+      continue;
     if (polled <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
       close(fd);
       return false;
@@ -183,6 +189,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
       return false;
     }
     protocol_note_bytes_written((unsigned long long)sent);
+    protocol_throttle_bytes(file_descriptor, (size_t)sent);
   }
 
   close(fd);

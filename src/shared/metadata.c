@@ -211,13 +211,22 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
 
 bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrPolicy policy,
                               mode_t* out_mode) {
+  const mode_t special_bits = (mode_t)(S_ISUID | S_ISGID | S_ISVTX);
   const mode_t execute_bits = S_IXUSR | S_IXGRP | S_IXOTH;
   if (policy.perms) {
     /* rsync --perms copies the source's permission and special bits exactly,
      * including group/other write and setuid/setgid/sticky.  The kernel may
      * still clear setgid when the receiver is not in the file's group; the
-     * caller logs a failed chmod rather than silently masking the bits here. */
-    *out_mode = source_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
+     * caller logs a failed chmod rather than silently masking the bits here.
+     * Setuid/setgid/sticky are super-user activities: when the connection did
+     * not permit them (SUPER_MODE_OFF / --no-super) they are stripped, so a
+     * client can never install a privileged bit on a receiver that forbade
+     * super-user activities.  This also covers bits introduced by --chmod,
+     * whose result is fed in as source_mode. */
+    mode_t bits = source_mode & (mode_t)(special_bits | 0777);
+    if (!policy.super_permitted)
+      bits &= ~special_bits;
+    *out_mode = bits;
     return true;
   }
   if (policy.executability) {
@@ -227,8 +236,11 @@ bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrP
      * execute); otherwise clear every execute bit.  This runs on the
      * destination-derived base (pre-existing dest mode, or source&~umask for a
      * new file), and leaves the special bits untouched.  --perms wins when both
-     * are set (handled above). */
-    mode_t base = current_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
+     * are set (handled above).  The destination's own special bits survive
+     * unless super-user activities are forbidden. */
+    mode_t base = current_mode & (mode_t)(special_bits | 0777);
+    if (!policy.super_permitted)
+      base &= ~special_bits;
     if (source_mode & 0111)
       *out_mode = base | ((base & 0444) >> 2);
     else
@@ -240,12 +252,13 @@ bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrP
 }
 
 FileAttrPolicy file_attr_policy_from_config(const Config* config) {
-  FileAttrPolicy policy = {false, false, false, false};
+  FileAttrPolicy policy = {0};
   if (config) {
     policy.perms = config->preserve_perms;
     policy.times = config->preserve_times;
     policy.atimes = config->preserve_atimes;
     policy.executability = config->use_executability;
+    policy.super_permitted = privilege_super_mode_permitted(config->super_mode);
   }
   return policy;
 }
@@ -314,6 +327,8 @@ bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadat
      transfer never fails over it. */
   if (policy.perms) {
     mode_t link_mode = metadata->mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
+    if (!policy.super_permitted)
+      link_mode &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
     if (fchmodat(parent_fd, leaf, link_mode, AT_SYMLINK_NOFOLLOW) != 0 && errno != EOPNOTSUPP &&
         errno != ENOTSUP && errno != ENOSYS) {
       log_message(LOG_LEVEL_DEBUG, "Could not set symlink mode on %s: %s", path, strerror(errno));

@@ -25,13 +25,6 @@
 #include "utils.h"
 #include "protocol.h"
 #include "xattr.h"
-#include <fcntl.h>
-#include <unistd.h>
-
-/* Files larger than this are not loaded whole for transfer (the sender streams
- * them); a whole-file digest is computed from the path instead.  Kept in sync
- * with the sender's streaming threshold. */
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
@@ -1136,17 +1129,51 @@ int file_open_private_dir(const char* dir_path) {
   return fd;
 }
 
-/* Open a --temp-dir scratch directory exactly as rsync does: the directory must
- * already exist and is used as given (an absolute path is used verbatim, a
- * relative one was already resolved against the destination root by the
- * caller).  Unlike file_open_private_dir this neither creates it nor confines
- * it below the receive root, because rsync accepts any temp dir -- including
- * one outside the destination tree or on another filesystem.  Returns an
- * O_DIRECTORY|O_CLOEXEC fd, or -1 on error. */
+/* Open a --temp-dir scratch directory.  The directory must already exist (rsync
+ * never creates it); a relative path was already resolved against the
+ * destination root by the caller.  Unlike file_open_private_dir this neither
+ * creates it nor requires it to be a direct child of the receive root, because
+ * rsync permits a scratch dir that (via a symlink) lands on another filesystem
+ * -- but it MUST resolve inside the authorized receive root.  The directory is
+ * opened following symlinks and then judged by the REAL path of the opened fd
+ * (through /proc/self/fd), so a client-planted symlink under the receive root
+ * can never redirect receiver scratch files outside the sandbox while an
+ * in-root link to another filesystem (the EXDEV fallback case) still works.
+ * Returns an O_DIRECTORY|O_CLOEXEC fd, or -1 on error (errno set; an escaping
+ * target is reported as EACCES with a logged reason). */
 int file_open_temp_dir(const char* dir_path) {
   if (!dir_path)
     return -1;
-  return open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  const char* root = utils_get_authorized_root_path();
+  if (!root) {
+    /* No authorized root (e.g. a local batch apply): nothing to confine
+       against, so preserve the historical open-as-given behavior. */
+    return fd;
+  }
+  char fd_path[64];
+  int fd_path_length = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+  char resolved[PATH_MAX];
+  if (fd_path_length < 0 || (size_t)fd_path_length >= sizeof(fd_path) ||
+      !realpath(fd_path, resolved)) {
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+  if (!path_is_within_root(root, resolved)) {
+    char* escaped = output_escape(dir_path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR,
+                "--temp-dir '%s' resolves outside the authorized receive root; refusing",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    close(fd);
+    errno = EACCES;
+    return -1;
+  }
+  return fd;
 }
 
 /* After the content and mode/times are restored on the just-written file, apply
@@ -1155,21 +1182,24 @@ int file_open_temp_dir(const char* dir_path) {
  * destination file) and best-effort: a per-attribute or privilege failure is
  * logged and skipped, never fatal. */
 static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXattrList* xattrs,
-                             bool fake_super, FileAttrPolicy policy) {
+                             bool fake_super, FileAttrPolicy policy, uint32_t fake_super_rdev_major,
+                             uint32_t fake_super_rdev_minor) {
   xattr_apply_fd(fd, xattrs);
   if (fake_super && metadata) {
     /* Record the ownership that WOULD have been applied: when an explicit
        ownership request (--chown/--usermap/--groupmap/--copy-as or -o/-g) is
        active, the resolved mapping; otherwise the source's own id.  The real
        chown is suppressed (identity_apply_ownership early-returns under
-       --fake-super) so recording never defeats the flag.  Mode/mtime are still
-       replayed (policy-gated) so unprivileged --fake-super keeps working. */
+       --fake-super) so recording never defeats the flag.  The recorded stat is
+       rsync's format; the permission bits are replayed (policy-gated) so
+       unprivileged --fake-super keeps working while mtime comes from the
+       normal metadata path above. */
     uint32_t store_uid;
     uint32_t store_gid;
     identity_resolve_storage_ids((int32_t)metadata->uid, (int32_t)metadata->gid, &store_uid,
                                  &store_gid);
-    fake_super_store_fd(fd, store_uid, store_gid, (uint32_t)metadata->mode, metadata->mtime_sec,
-                        metadata->mtime_nsec);
+    fake_super_store_fd(fd, store_uid, store_gid, (uint32_t)metadata->mode, fake_super_rdev_major,
+                        fake_super_rdev_minor);
     fake_super_restore_fd(fd, policy);
   }
 }
@@ -1179,7 +1209,8 @@ file_to_disk_secure_impl(const char* path, const void* data, unsigned long long 
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
                          FileAttrPolicy policy, bool update, bool no_replace, bool use_fsync,
                          const char* temp_dir, const FileXattrList* xattrs, bool fake_super,
-                         bool keep_partial, unsigned* dirs_created, const char* count_floor) {
+                         bool keep_partial, unsigned* dirs_created, const char* count_floor,
+                         uint32_t fake_super_rdev_major, uint32_t fake_super_rdev_minor) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent_counted(path, &leaf, true, dirs_created, count_floor);
   if (dirfd < 0)
@@ -1286,7 +1317,8 @@ file_to_disk_secure_impl(const char* path, const void* data, unsigned long long 
             }
           }
           if (ok)
-            restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
+            restore_extra_fd(fd, metadata, xattrs, fake_super, policy, fake_super_rdev_major,
+                             fake_super_rdev_minor);
           if (ok && use_fsync)
             ok = fsync(fd) == 0;
         }
@@ -1404,7 +1436,8 @@ file_to_disk_secure_impl(const char* path, const void* data, unsigned long long 
           }
         }
         if (ok)
-          restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
+          restore_extra_fd(fd, metadata, xattrs, fake_super, policy, fake_super_rdev_major,
+                           fake_super_rdev_minor);
         if (ok && use_fsync)
           ok = fsync(fd) == 0;
       }
@@ -1472,7 +1505,8 @@ file_to_disk_secure_impl(const char* path, const void* data, unsigned long long 
                 "non-atomic copy into the destination directory");
     return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                     policy, update, no_replace, use_fsync, NULL, xattrs, fake_super,
-                                    keep_partial, dirs_created, count_floor);
+                                    keep_partial, dirs_created, count_floor, fake_super_rdev_major,
+                                    fake_super_rdev_minor);
   }
   return ok;
 }
@@ -1482,7 +1516,7 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
                          FileAttrPolicy policy, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   policy, false, false, false, temp_dir, NULL, false, false, NULL,
-                                  NULL);
+                                  NULL, 0, 0);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
@@ -1491,7 +1525,7 @@ bool file_to_disk_secure_update(const char* path, const void* data, unsigned lon
                                 const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   policy, true, false, false, temp_dir, NULL, false, false, NULL,
-                                  NULL);
+                                  NULL, 0, 0);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
@@ -1500,7 +1534,7 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     FileAttrPolicy policy, bool use_fsync, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   policy, false, false, use_fsync, temp_dir, NULL, false, false,
-                                  NULL, NULL);
+                                  NULL, NULL, 0, 0);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
@@ -1509,7 +1543,7 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
                                   policy, false, true, false, temp_dir, NULL, false, false, NULL,
-                                  NULL);
+                                  NULL, 0, 0);
 }
 
 /* Receiver write-path variant that also applies the per-file xattrs (-X/-A)
@@ -1524,19 +1558,19 @@ bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long
                                bool fake_super, bool keep_partial, const char* temp_dir) {
   return file_to_disk_secure_attrs_counted(path, data, data_size, inplace, sparse, preallocate,
                                            metadata, policy, update, no_replace, use_fsync, xattrs,
-                                           fake_super, keep_partial, temp_dir, NULL, NULL);
+                                           fake_super, keep_partial, temp_dir, NULL, NULL, 0, 0);
 }
 
-bool file_to_disk_secure_attrs_counted(const char* path, const void* data,
-                                       unsigned long long data_size, bool inplace, bool sparse,
-                                       bool preallocate, const FileMetadata* metadata,
-                                       FileAttrPolicy policy, bool update, bool no_replace,
-                                       bool use_fsync, const FileXattrList* xattrs, bool fake_super,
-                                       bool keep_partial, const char* temp_dir,
-                                       unsigned* dirs_created, const char* count_floor) {
+bool file_to_disk_secure_attrs_counted(
+    const char* path, const void* data, unsigned long long data_size, bool inplace, bool sparse,
+    bool preallocate, const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+    bool no_replace, bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+    bool keep_partial, const char* temp_dir, unsigned* dirs_created, const char* count_floor,
+    uint32_t fake_super_rdev_major, uint32_t fake_super_rdev_minor) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   policy, update, no_replace, use_fsync, temp_dir, xattrs,
-                                  fake_super, keep_partial, dirs_created, count_floor);
+                                  fake_super, keep_partial, dirs_created, count_floor,
+                                  fake_super_rdev_major, fake_super_rdev_minor);
 }
 
 /* Atomic --link-dest install.  The destination is replaced (via a temporary
@@ -1666,7 +1700,7 @@ static bool file_copy_basis_stream_impl(const char* path, const char* basis_path
         wrote = false;
       }
       if (wrote)
-        restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
+        restore_extra_fd(fd, metadata, xattrs, fake_super, policy, 0, 0);
       if (wrote && use_fsync)
         wrote = fsync(fd) == 0;
       if (close(fd) != 0)
@@ -1815,7 +1849,7 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
       return true;
     return file_to_disk_secure_attrs_counted(
         path, data, data_size, false, false, preallocate, metadata, policy, false, false, use_fsync,
-        xattrs, fake_super, false, temp_dir, dirs_created, count_floor);
+        xattrs, fake_super, false, temp_dir, dirs_created, count_floor, 0, 0);
   }
 
   if (scratch_dirfd >= 0)
@@ -1859,6 +1893,6 @@ bool file_write_to_disk(const char* path, const void* data, unsigned long long d
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  FileAttrPolicy policy = {false, false, false, false};
+  FileAttrPolicy policy = {0};
   return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, policy, NULL);
 }

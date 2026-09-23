@@ -353,10 +353,10 @@ class TestOwnershipRoot:
         st = os.stat(dst)
         assert st.st_uid != 12345, \
             f"--fake-super -o must NOT real-chown the source owner, got uid={st.st_uid}"
-        record = os.getxattr(dst, "user.fastsync.stat").decode()
-        fields = record.split(":")
-        assert fields[0] == "12345", \
-            f"--fake-super must record the resolved owner, got {fields[0]}"
+        record = os.getxattr(dst, "user.rsync.%stat").decode()
+        owner = record.split()[2].split(":")
+        assert owner[0] == "12345", \
+            f"--fake-super must record the resolved owner, got {owner[0]}"
 
     def test_o_applies_directory_owner(self, shared_server):
         """#286.2: -o must apply the source owner to DIRECTORIES too (the

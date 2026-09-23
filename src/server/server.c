@@ -226,11 +226,6 @@ static void release_authorization(void) {
     close(root_fd);
 }
 
-static bool path_is_within(const char* root, const char* path) {
-  size_t n = strlen(root);
-  return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
-}
-
 /* --mkpath contract: when the client's destination root directory does not
    exist yet on the server side, --mkpath tells the server to create it (and
    any missing leading components) below the authorized root at connection
@@ -710,69 +705,85 @@ static const char* server_module_gate(const Config* config, void* context) {
   return module_gate_install_root(config, module);
 }
 
-void handler(int file_descriptor) {
-  SSL* ssl = io_get_ssl();
+/* Per-connection state threaded through the handler phase helpers below.  The
+ * fields are a faithful split of the former handler() locals: the protocol
+ * session, the config-frame gate context, the accepted config, the optional
+ * multithreaded pipeline context and the teardown bookkeeping all live here so
+ * the single `done` epilogue in handler() can release them exactly as before. */
+typedef struct ServerSession {
+  int fd;
+  SSL* ssl;
   ProtocolSession session;
-  protocol_session_init(&session, file_descriptor, file_descriptor);
-  protocol_session_set_ssl(&session, ssl);
-  protocol_session_bind(&session);
   ModuleGateContext gate_ctx;
-  gate_ctx.ssl = ssl;
-  gate_ctx.fd = file_descriptor;
-  gate_ctx.super_mode_override = -1;
-  gate_ctx.has_peer_ip = false;
-  gate_ctx.peer_ip[0] = '\0';
-  gate_ctx.is_local = false;
-  /* All teardown state starts empty so the single `done` epilogue is safe to
-   * reach from any error path (including before the config frame arrives). */
-  Config* config = NULL;
-  PipelineContextReceiver* context = NULL;
-  char* joined_destination = NULL;
-  bool charset_ready = false;
-  config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
-  if (config == NULL) {
+  Config* config;
+  PipelineContextReceiver* context;
+  char* joined_destination;
+  bool charset_ready;
+} ServerSession;
+
+/* Phase 1 -- config receipt + validation.  Receives the client config frame
+ * through the module gate, applies the super-mode override the gate recorded
+ * exactly once, and installs the per-connection protocol/compression state.
+ * Returns false when the config frame was refused (the gate has already
+ * answered the client); the caller jumps to the shared `done` epilogue. */
+static bool server_accept_config(ServerSession* state) {
+  state->config = config_receive_with_validate(state->fd, server_module_gate, &state->gate_ctx);
+  if (state->config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
-    goto done;
+    return false;
   }
   /* Apply the super-mode veto the gate decided on (operator --no-super, or a
    * daemon module without the `client owner = yes` opt-in) exactly once, so
    * every downstream gate (identity_apply_ownership via privilege_super_permitted,
    * device-node creation) sees SUPER_MODE_OFF.  The gate never mutated the
    * received config. */
-  if (gate_ctx.super_mode_override != -1)
-    config->super_mode = (SuperMode)gate_ctx.super_mode_override;
+  if (state->gate_ctx.super_mode_override != -1)
+    state->config->super_mode = (SuperMode)state->gate_ctx.super_mode_override;
   /* Install the codec this connection negotiated before the receiver/writer
    * threads start (the server forks per connection, so the process-global
    * codec is private to this session). */
-  compression_set_algo((CompressionAlgo)config->compression_algo);
+  compression_set_algo((CompressionAlgo)state->config->compression_algo);
   /* If the client requested ownership but the effective super mode forbids it
    * (operator --no-super, a privileged standalone receiver's secure default, or
    * a daemon module without `client owner = yes`), say so ONCE per connection so
    * a successful -a/-o/-g transfer is not mistaken for preserved ownership. */
-  if (config->super_mode == SUPER_MODE_OFF && identity_ownership_requested(config))
+  if (state->config->super_mode == SUPER_MODE_OFF && identity_ownership_requested(state->config))
     log_message(LOG_LEVEL_WARNING,
                 "requested ownership will NOT be applied: super-user activities are disabled "
                 "for this connection (operator veto, or module without `client owner = yes`)");
-  protocol_set_8_bit_output(config->eight_bit_output);
+  protocol_set_8_bit_output(state->config->eight_bit_output);
   /* Server-side per-message protocol deadline for every frame from here on.
    * `timeout` is not serialized, so this is the server's own config (the server
    * has no --timeout CLI and defaults it to 0).  A client's --timeout tightens
    * only that client's own protocol I/O; the server floors its own deadline at
    * SERVER_IO_TIMEOUT_SEC so a silent peer can never hold a session slot
    * forever (the socket layer gets the same floor at startup). */
-  protocol_session_set_io_timeout(&session, protocol_server_io_timeout_sec(config->timeout));
+  protocol_session_set_io_timeout(&state->session,
+                                  protocol_server_io_timeout_sec(state->config->timeout));
+  return true;
+}
+
+/* Phase 2 -- security gates.  The ORDER here is load-bearing and must not be
+ * merged or reordered: transport/authentication (plaintext refusal, TLS
+ * client-CN verification), then daemon-root confinement (absolute-destination
+ * rejection, traversal + within-authorized-root), then delete/force
+ * authorization -- exactly the sequence the former handler() used.  Returns
+ * false after logging the matching rejection; the caller jumps to the shared
+ * `done` epilogue. */
+static bool server_apply_security_gates(ServerSession* state) {
+  Config* config = state->config;
   const char* authorized_root = utils_get_authorized_root_path();
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
-    goto done;
+    return false;
   }
-  if (!allow_unauthenticated && ssl == NULL) {
+  if (!allow_unauthenticated && state->ssl == NULL) {
     log_message(LOG_LEVEL_ERROR, "Rejected unauthenticated plaintext connection");
-    goto done;
+    return false;
   }
-  if (ssl && required_client_cn && !tls_client_identity_allowed(ssl)) {
+  if (state->ssl && required_client_cn && !tls_client_identity_allowed(state->ssl)) {
     log_message(LOG_LEVEL_ERROR, "Rejected TLS client with unauthorized identity");
-    goto done;
+    return false;
   }
   /* Daemon mode: the module's root is the authorized root (installed by
      server_module_gate), and the client's destination is a MODULE-RELATIVE
@@ -782,27 +793,27 @@ void handler(int file_descriptor) {
   if (g_daemon_conf && config->receive_root_directory && config->receive_root_directory[0] == '/') {
     log_message(LOG_LEVEL_ERROR, "Rejected absolute daemon destination (must be relative to the "
                                  "selected module root)");
-    goto done;
+    return false;
   }
   char* destination = config->receive_root_directory;
   if (destination && destination[0] != '/')
-    joined_destination = path_cat(authorized_root, destination);
-  if (joined_destination)
-    destination = joined_destination;
+    state->joined_destination = path_cat(authorized_root, destination);
+  if (state->joined_destination)
+    destination = state->joined_destination;
   if (!destination || has_path_traversal(destination) ||
-      !path_is_within(authorized_root, destination)) {
+      !path_is_within_root(authorized_root, destination)) {
     log_message(LOG_LEVEL_ERROR, "Rejected destination outside authorized root");
-    free(joined_destination);
-    joined_destination = NULL;
-    goto done;
+    free(state->joined_destination);
+    state->joined_destination = NULL;
+    return false;
   }
-  if (joined_destination) {
+  if (state->joined_destination) {
     free(config->receive_root_directory);
-    config->receive_root_directory = joined_destination;
-    joined_destination = NULL;
+    config->receive_root_directory = state->joined_destination;
+    state->joined_destination = NULL;
   }
   if (!config->receive_root_directory) {
-    goto done;
+    return false;
   }
   config->use_delete = config->use_delete && allow_delete;
   /* --force (receiver-side) is deletion authority too: it lets an incoming
@@ -812,6 +823,18 @@ void handler(int file_descriptor) {
    * --delete-missing-args, so a client cannot use --force to bypass the delete
    * policy. */
   config->force_delete = config->force_delete && allow_delete;
+  return true;
+}
+
+/* Phase 3 -- session preparation.  Installs the negotiated conversion, applies
+ * the remaining deletion policy, materializes the destination root (--mkpath),
+ * creates the --delay-updates staging tree, snapshots the identity policy, and
+ * publishes the --keep-dirlinks/--trust-sender globals and the daemon MOTD.
+ * All of it must happen before any receiver/writer thread is spawned.  Returns
+ * false after logging the matching failure; the caller jumps to the shared
+ * `done` epilogue. */
+static bool server_prepare_session(ServerSession* state) {
+  Config* config = state->config;
   /* --iconv (protocol 2.16.0): install the receiver-side wire->local conversion
      now that the client's full CONVERT_SPEC has been received and validated,
      before any received file name is decoded.  The server's own --iconv (if
@@ -822,14 +845,14 @@ void handler(int file_descriptor) {
     if (!charset_wire_init_receiver(config->iconv_spec, server_iconv_spec)) {
       log_message(LOG_LEVEL_ERROR,
                   "--iconv: unsupported charset conversion requested (LOCAL[,REMOTE])");
-      goto done;
+      return false;
     }
-    charset_ready = true;
+    state->charset_ready = true;
   }
   /* --delete-missing-args deletes destination mirrors receiver-side, so it is
-     deletion and stays gated by the same --allow-delete server policy.  When
-     the server policy is off the flag is inert (the missing entries are still
-     skipped via its implied --ignore-missing-args, but nothing is deleted). */
+   * deletion and stays gated by the same --allow-delete server policy.  When
+   * the server policy is off the flag is inert (the missing entries are still
+   * skipped via its implied --ignore-missing-args, but nothing is deleted). */
   config->delete_missing_args = config->delete_missing_args && allow_delete;
   /* --mkpath: create the destination root (and its missing leading components)
    * before anything else; without it the root must pre-exist.  The precondition
@@ -844,7 +867,7 @@ void handler(int file_descriptor) {
     log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
                 escaped_root ? escaped_root : "<allocation failed>");
     free(escaped_root);
-    goto done;
+    return false;
   }
   /* A --delay-updates transfer stages under a private 0700 directory inside
      the receive root.  Create it up front (wiping leftovers of any previously
@@ -854,7 +877,7 @@ void handler(int file_descriptor) {
     config->delay_context = delay_updates_context_create(config->receive_root_directory);
     if (!config->delay_context || !delay_updates_prepare(config->delay_context)) {
       log_message(LOG_LEVEL_ERROR, "Failed to initialize --delay-updates staging area");
-      goto done;
+      return false;
     }
   }
   /* Preserve the negotiated identity policy for the fd-relative ownership
@@ -864,7 +887,7 @@ void handler(int file_descriptor) {
      rather than silently applying the wrong ownership policy. */
   if (!identity_set_active(config)) {
     log_message(LOG_LEVEL_ERROR, "Failed to activate identity policy");
-    goto done;
+    return false;
   }
   /* Persist the negotiated --keep-dirlinks policy once, here at config-accept,
      before any multithreaded receiver/writer threads are spawned, so the
@@ -892,140 +915,201 @@ void handler(int file_descriptor) {
      Wave C note in config.h). */
   if (g_daemon_conf) {
     char* motd = motd_read_file(g_daemon_conf->global.motd_file);
-    if (!motd_send(file_descriptor, motd ? motd : "")) {
+    if (!motd_send(state->fd, motd ? motd : "")) {
       free(motd);
       log_message(LOG_LEVEL_ERROR, "Failed to send daemon MOTD");
-      goto done;
+      return false;
     }
     free(motd);
   }
-  if (config->use_multithreading) {
-    Queue* q = queue_create(100, file_destroy);
-    if (q == NULL)
-      goto done;
-    context = pipeline_context_receiver_create(config, q, file_descriptor, ssl);
-    if (context == NULL) {
-      queue_destroy(q);
-      goto done;
-    }
-    protocol_session_set_max_alloc(&context->session, config->max_alloc);
-    protocol_session_set_io_timeout(&context->session,
-                                    protocol_server_io_timeout_sec(config->timeout));
-    atomic_store(&context->session.total_allocated_bytes,
-                 atomic_load(&session.total_allocated_bytes));
-    pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);
-    thrd_t receiver = {0};
-    thrd_t writer = {0};
-    bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
-    bool writer_created = false;
-    if (receiver_created)
-      writer_created = thrd_create(&writer, write_thread, context) == thrd_success;
-    if (!receiver_created || !writer_created) {
-      log_perror("Error creating Threads");
-      if (receiver_created) {
-        mtx_lock(&context->mutex);
-        atomic_store(&context->cancelled, true);
-        cnd_broadcast(&context->condition_not_full);
-        cnd_broadcast(&context->condition_not_empty);
-        mtx_unlock(&context->mutex);
-        /* Unblock a worker parked in socket I/O without closing the fd (the
-         * child owns the single close).  shutdown() only affects sockets; for
-         * the --stdio pipe the receiver's per-message poll timeout still
-         * bounds the join, so do nothing there rather than close a descriptor
-         * another thread may still be using. */
-        struct stat fd_stat;
-        if (fstat(file_descriptor, &fd_stat) == 0 && S_ISSOCK(fd_stat.st_mode))
-          shutdown(file_descriptor, SHUT_RDWR);
-        thrd_join(receiver, NULL);
-      }
-      if (writer_created)
-        thrd_join(writer, NULL);
-      goto done;
-    }
-    int receiver_result;
-    int writer_result;
-    thrd_join(receiver, &receiver_result);
-    thrd_join(writer, &writer_result);
-    bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
-    if (transfer_ok && !config->dry_run) {
-      /* Commit-style (late) deletion: receive_thread handed the keep-set
-         manifest here instead of deleting while write_thread might still be
-         draining, so by now every file is on disk and the whole transfer is
-         known to have succeeded.  Remove the extras before publishing a
-         --delay-updates run; the walker skips the staging directory.  A
-         server-contacting --dry-run deletes nothing (no manifest is sent). */
-      if (context->deferred_manifest) {
-        size_t deleted = 0;
-        DeletePathObserver observer = config->report_deletes ? receiver_record_deleted_path : NULL;
-        DeleteCommitResult deletion = manifest_delete_all_observed(
-            config, context->deferred_manifest, &deleted, observer, (void*)context->deleted_paths);
-        context->stats.deleted_files += deleted;
-        if (deletion == DELETE_COMMIT_ERROR) {
-          transfer_ok = false;
-        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
-          /* The transfer still succeeds; the terminal frame reports the capped
-             deletion so the sender exits 25 like rsync. */
-          context->delete_limit_reached = true;
-        }
-        delete_manifest_free(context->deferred_manifest);
-        context->deferred_manifest = NULL;
-      }
-      /* --delete-delay: receive_thread snapshotted each plan's extras as it
-         arrived; with the disk writer drained, commit the deferred removals.
-         --delete-during already applied its plans on the receive thread. */
-      if (context->deferred_plans) {
-        /* Defence in depth (the enclosing block already excludes dry-run): a
-           -n run never commits a deletion. */
-        if (config->report_deletes)
-          delete_plan_session_set_delete_observer(
-              context->deferred_plans, receiver_record_deleted_path, (void*)context->deleted_paths);
-        DeleteCommitResult deletion =
-            config->dry_run ? DELETE_COMMIT_OK
-                            : delete_plan_session_commit(context->deferred_plans, config);
-        context->stats.deleted_files += delete_plan_session_deleted(context->deferred_plans);
-        if (deletion == DELETE_COMMIT_ERROR) {
-          transfer_ok = false;
-        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
-          context->delete_limit_reached = true;
-        }
-        delete_plan_session_destroy(context->deferred_plans);
-        context->deferred_plans = NULL;
-      }
-    }
-    if (transfer_ok && !config->dry_run) {
-      /* --delay-updates: receive_thread has finished the whole protocol stream
-         (including manifest/delete handling) and write_thread has drained its
-         queue, so every staged file is complete.  Publish atomically before the
-         success/outcome frame so a --remove-source-files sender only learns of
-         files that were actually installed. */
-      if (config->delay_updates && config->delay_context &&
-          !delay_updates_publish(config->delay_context, config)) {
-        transfer_ok = false;
-      }
-      /* P7 Wave D: all writers have joined and the late deletion (and
-         --delay-updates publication) has committed above, so it is finally safe
-         to stamp directory times; a directory's mtime must not be clobbered by
-         its children or by an extra removal. */
-      if (transfer_ok)
-        dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
-    }
-    if (transfer_ok) {
-      Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
-      /* Emit the optional wire-stats record first (protocol 2.25.0), then the
-         success/outcome frame, exactly like the single-threaded receiver. */
-      if (!receiver_send_stats_frame(file_descriptor, config, &context->stats,
-                                     context->would_delete, context->deleted_paths) ||
-          !receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
-        transfer_ok = false;
-    } else {
-      send_error_detail(file_descriptor, "transfer failed on receiver");
-    }
-    if (!transfer_ok)
-      log_message(LOG_LEVEL_ERROR, "Transfer failed");
-  } else {
-    if (receiver_receive_files(config, file_descriptor) != 0)
-      log_message(LOG_LEVEL_ERROR, "Transfer failed");
+  return true;
+}
+
+/* Phase 4a -- transfer via the multithreaded receiver.  Spawns the receive/write
+ * thread pair, joins them, then commits the late deletion, --delay-updates
+ * publication and directory times before emitting the terminal stats/success
+ * frame.  On any failure the helper just returns; the caller's `done` epilogue
+ * releases the pipeline context (which owns the config and queue) exactly as the
+ * former inline code did. */
+static void server_run_mt_receiver(ServerSession* state) {
+  Config* config = state->config;
+  Queue* q = queue_create(100, file_destroy);
+  if (q == NULL)
+    return;
+  state->context = pipeline_context_receiver_create(config, q, state->fd, state->ssl);
+  if (state->context == NULL) {
+    queue_destroy(q);
+    return;
   }
+  protocol_session_set_max_alloc(&state->context->session, config->max_alloc);
+  protocol_session_set_io_timeout(&state->context->session,
+                                  protocol_server_io_timeout_sec(config->timeout));
+  atomic_store(&state->context->session.total_allocated_bytes,
+               atomic_load(&state->session.total_allocated_bytes));
+  pipeline_context_receiver_set_queue_byte_limit(state->context, RECEIVER_QUEUE_MAX_BYTES);
+  thrd_t receiver = {0};
+  thrd_t writer = {0};
+  bool receiver_created = thrd_create(&receiver, receive_thread, state->context) == thrd_success;
+  bool writer_created = false;
+  if (receiver_created)
+    writer_created = thrd_create(&writer, write_thread, state->context) == thrd_success;
+  if (!receiver_created || !writer_created) {
+    log_perror("Error creating Threads");
+    if (receiver_created) {
+      mtx_lock(&state->context->mutex);
+      atomic_store(&state->context->cancelled, true);
+      cnd_broadcast(&state->context->condition_not_full);
+      cnd_broadcast(&state->context->condition_not_empty);
+      mtx_unlock(&state->context->mutex);
+      /* Unblock a worker parked in socket I/O without closing the fd (the
+       * child owns the single close).  shutdown() only affects sockets; for
+       * the --stdio pipe the receiver's per-message poll timeout still
+       * bounds the join, so do nothing there rather than close a descriptor
+       * another thread may still be using. */
+      struct stat fd_stat;
+      if (fstat(state->fd, &fd_stat) == 0 && S_ISSOCK(fd_stat.st_mode))
+        shutdown(state->fd, SHUT_RDWR);
+      thrd_join(receiver, NULL);
+    }
+    if (writer_created)
+      thrd_join(writer, NULL);
+    return;
+  }
+  int receiver_result;
+  int writer_result;
+  thrd_join(receiver, &receiver_result);
+  thrd_join(writer, &writer_result);
+  bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
+  PipelineContextReceiver* context = state->context;
+  if (transfer_ok && !config->dry_run) {
+    /* Commit-style (late) deletion: receive_thread handed the keep-set
+       manifest here instead of deleting while write_thread might still be
+       draining, so by now every file is on disk and the whole transfer is
+       known to have succeeded.  Remove the extras before publishing a
+       --delay-updates run; the walker skips the staging directory.  A
+       server-contacting --dry-run deletes nothing (no manifest is sent). */
+    if (context->deferred_manifest) {
+      size_t deleted = 0;
+      DeletePathObserver observer = config->report_deletes ? receiver_record_deleted_path : NULL;
+      DeleteCommitResult deletion = manifest_delete_all_observed(
+          config, context->deferred_manifest, &deleted, observer, (void*)context->deleted_paths);
+      context->stats.deleted_files += deleted;
+      if (deletion == DELETE_COMMIT_ERROR) {
+        transfer_ok = false;
+      } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+        /* The transfer still succeeds; the terminal frame reports the capped
+           deletion so the sender exits 25 like rsync. */
+        context->delete_limit_reached = true;
+      }
+      delete_manifest_free(context->deferred_manifest);
+      context->deferred_manifest = NULL;
+    }
+    /* --delete-delay: receive_thread snapshotted each plan's extras as it
+       arrived; with the disk writer drained, commit the deferred removals.
+       --delete-during already applied its plans on the receive thread. */
+    if (context->deferred_plans) {
+      /* Defence in depth (the enclosing block already excludes dry-run): a
+         -n run never commits a deletion. */
+      if (config->report_deletes)
+        delete_plan_session_set_delete_observer(
+            context->deferred_plans, receiver_record_deleted_path, (void*)context->deleted_paths);
+      DeleteCommitResult deletion =
+          config->dry_run ? DELETE_COMMIT_OK
+                          : delete_plan_session_commit(context->deferred_plans, config);
+      context->stats.deleted_files += delete_plan_session_deleted(context->deferred_plans);
+      if (deletion == DELETE_COMMIT_ERROR) {
+        transfer_ok = false;
+      } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+        context->delete_limit_reached = true;
+      }
+      delete_plan_session_destroy(context->deferred_plans);
+      context->deferred_plans = NULL;
+    }
+  }
+  if (transfer_ok && !config->dry_run) {
+    /* --delay-updates: receive_thread has finished the whole protocol stream
+       (including manifest/delete handling) and write_thread has drained its
+       queue, so every staged file is complete.  Publish atomically before the
+       success/outcome frame so a --remove-source-files sender only learns of
+       files that were actually installed. */
+    if (config->delay_updates && config->delay_context &&
+        !delay_updates_publish(config->delay_context, config)) {
+      transfer_ok = false;
+    }
+    /* P7 Wave D: all writers have joined and the late deletion (and
+       --delay-updates publication) has committed above, so it is finally safe
+       to stamp directory times; a directory's mtime must not be clobbered by
+       its children or by an extra removal. */
+    if (transfer_ok)
+      dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
+  }
+  if (transfer_ok) {
+    if (context->failed_entries > 0)
+      log_message(LOG_LEVEL_WARNING,
+                  "%zu entr%s failed to materialize; continuing (partial transfer)",
+                  context->failed_entries, context->failed_entries == 1 ? "y" : "ies");
+    Status final_status = context->delete_limit_reached
+                              ? STATUS_DELETE_LIMIT
+                              : (context->failed_entries > 0 ? STATUS_ERROR : STATUS_OK);
+    /* Emit the optional wire-stats record first (protocol 2.25.0), then the
+       success/outcome frame, exactly like the single-threaded receiver. */
+    if (!receiver_send_stats_frame(state->fd, config, &context->stats, context->would_delete,
+                                   context->deleted_paths) ||
+        !receiver_send_final_success(state->fd, config, &context->outcomes, final_status))
+      transfer_ok = false;
+  } else {
+    send_error_detail(state->fd, "transfer failed on receiver");
+  }
+  if (!transfer_ok)
+    log_message(LOG_LEVEL_ERROR, "Transfer failed");
+}
+
+/* Phase 4b -- transfer via the single-threaded receiver.  Failure is logged
+ * exactly as before; the caller's `done` epilogue then releases the config. */
+static void server_run_st_receiver(ServerSession* state) {
+  if (receiver_receive_files(state->config, state->fd) != 0)
+    log_message(LOG_LEVEL_ERROR, "Transfer failed");
+}
+
+/* Phase 4 dispatch -- choose the receiver implementation the config asks for.
+ * Both helpers own their success/failure logging; the caller falls through to
+ * the shared `done` epilogue either way. */
+static void server_run_transfer(ServerSession* state) {
+  if (state->config->use_multithreading)
+    server_run_mt_receiver(state);
+  else
+    server_run_st_receiver(state);
+}
+
+void handler(int file_descriptor) {
+  /* Single per-connection state; every phase helper below advances it and
+   * returns false on a logged failure.  All teardown state starts empty so the
+   * single `done` epilogue is safe to reach from any error path (including
+   * before the config frame arrives). */
+  ServerSession state;
+  state.fd = file_descriptor;
+  state.ssl = io_get_ssl();
+  protocol_session_init(&state.session, file_descriptor, file_descriptor);
+  protocol_session_set_ssl(&state.session, state.ssl);
+  protocol_session_bind(&state.session);
+  state.gate_ctx.ssl = state.ssl;
+  state.gate_ctx.fd = file_descriptor;
+  state.gate_ctx.super_mode_override = -1;
+  state.gate_ctx.has_peer_ip = false;
+  state.gate_ctx.peer_ip[0] = '\0';
+  state.gate_ctx.is_local = false;
+  state.config = NULL;
+  state.context = NULL;
+  state.joined_destination = NULL;
+  state.charset_ready = false;
+
+  if (!server_accept_config(&state))
+    goto done;
+  if (!server_apply_security_gates(&state))
+    goto done;
+  if (!server_prepare_session(&state))
+    goto done;
+  server_run_transfer(&state);
 
 done:
   /* Single cleanup epilogue: every error path jumps here, so the iconv
@@ -1034,36 +1118,61 @@ done:
    * connection fd is deliberately NOT closed here -- the child functions own
    * its single close (plain_child_fn / tls_child_fn), and the --stdio call
    * site must leave stdin/stdout open. */
-  if (charset_ready)
+  if (state.charset_ready)
     charset_wire_free();
   /* The delay-updates staging tree is released by config_delete (which the
      branch below always reaches), so it is cleaned exactly once. */
   identity_clear_active();
   protocol_session_unbind();
-  if (context != NULL) {
+  if (state.context != NULL) {
     /* context owns both the config and the queue it was created with. */
-    pipeline_context_receiver_destroy(context);
-    context = NULL;
-    config = NULL;
+    pipeline_context_receiver_destroy(state.context);
+    state.context = NULL;
+    state.config = NULL;
   } else {
-    config_delete(config);
-    config = NULL;
+    config_delete(state.config);
+    state.config = NULL;
   }
-  free(joined_destination);
+  free(state.joined_destination);
 }
 
 #ifndef FASTSYNC_SERVER_AS_LIB
 static Server* g_server = NULL;
 
+/* Signal handler for the foreground daemon/standalone listener.
+ *
+ * Async-signal-safety: _exit(2) is on the POSIX async-signal-safe list and is
+ * the ONLY thing done here.  The previous body called server_delete()
+ * (close/free/SSL_CTX_free), daemon_conf_free() and credentials_free(); none of
+ * those (free/malloc, and much of OpenSSL teardown) are async-signal-safe, so a
+ * signal delivered while the main thread was inside malloc/free could deadlock
+ * or corrupt the heap.
+ *
+ * Residual (documented, not hidden): the in-memory teardown is skipped on the
+ * signal path.  That is safe because the parent daemon owns no persistent
+ * resource that survives process exit -- the listening socket is closed by the
+ * kernel, the connection registry is an anonymous MAP_SHARED mapping with no
+ * named backing object, and the daemon config/credential stores are plain heap
+ * allocations.  Connection children are separate processes and handle their own
+ * temp files/locks.  The normal (non-signal) shutdown path in main() still runs
+ * the full teardown, so no cleanup is dropped on the common path.  Wiring the
+ * accept loop (transport_tcp.c, outside this change's scope) to a flag-based
+ * self-pipe shutdown would let the frees run context-safely; it is deliberately
+ * deferred rather than risk restructuring the daemon loop. */
 static void cleanup(int sig) {
   (void)sig;
-  if (g_server)
-    server_delete(&g_server);
-  daemon_conf_free(g_daemon_conf);
-  g_daemon_conf = NULL;
-  credentials_free(g_credentials);
-  g_credentials = NULL;
   _exit(0);
+}
+
+/* Install a signal handler with sigaction(2) (the required async-signal-safe
+ * install primitive; signal(3) is not specified to be async-signal-safe). */
+static void install_cleanup_handler(int signo) {
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = cleanup;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;
+  sigaction(signo, &action, NULL);
 }
 
 static void print_server_usage(void) {
@@ -1178,13 +1287,19 @@ static bool daemonize(void) {
       close(devnull);
   }
   /* Do not pin the launch CWD (module-relative 'path' entries would resolve
-   * against an unstable working directory) and drop the restrictive host umask
-   * so modules can create files/dirs with the modes the config requests. */
+   * against an unstable working directory).  Set a conservative daemon umask
+   * of 022 (the conventional service default): rsync never forces umask 0 --
+   * it reads and restores the inherited umask and creates new entries as
+   * 0777 & ~umask / source & ~umask without -p.  Forcing 0 here made every
+   * implied parent directory world-writable (0777) whenever -p metadata was not
+   * applied.  022 gives 0755 directories and source&~022 files, matching rsync
+   * under a normal daemon umask; -p/-a still restore the exact source mode via
+   * fchmod, which is unaffected by the umask. */
   if (chdir("/") != 0)
     log_message(LOG_LEVEL_WARNING, "daemon: chdir to / failed: %s", strerror(errno));
-  umask(0);
+  umask(022);
   /* Refresh the cached umask: main() captured the launch umask before this
-   * (single-threaded) umask(0), and file_mode_base() must see the daemon's
+   * (single-threaded) umask(022), and file_mode_base() must see the daemon's
    * actual umask. */
   file_umask_capture();
   return true;
@@ -1253,8 +1368,8 @@ int main(int argc, char* argv[]) {
    * this process-global policy cannot be re-enabled by a future caller. */
   server_allow_super = opts.allow_super && !opts.stdio_mode;
   server_iconv_spec = opts.iconv_spec;
-  signal(SIGINT, cleanup);
-  signal(SIGTERM, cleanup);
+  install_cleanup_handler(SIGINT);
+  install_cleanup_handler(SIGTERM);
   /* Server-owned socket deadline floor: the client default --timeout=0 would
    * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
    * silent peer hold a connection (and its process slot) forever. */

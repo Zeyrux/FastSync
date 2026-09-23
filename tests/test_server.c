@@ -458,6 +458,11 @@ static void test_incremental_check_size_mismatch_full_transfer() {
     File* file = receive_incremental_check(p[0], cfg, &skipped);
     bool ok = file != NULL && !skipped && file->path != NULL && strcmp(file->path, "file.txt") == 0;
     file_destroy(file);
+    /* Stay alive until the parent closes its write end so its send_data can
+       never race this exit into a spurious EPIPE. */
+    char drain;
+    while (read(p[0], &drain, 1) > 0) {
+    }
     config_delete(cfg);
     close(p[0]);
     _exit(ok ? 0 : 1);
@@ -487,9 +492,9 @@ static void test_incremental_check_size_mismatch_full_transfer() {
     EXPECT_TRUE(send_data(p[1], body));
     data_destroy(body);
 
+    close(p[1]);
     int status;
     waitpid(pid, &status, 0);
-    close(p[1]);
     config_delete(cfg);
     unlink(path);
     rmdir(root);
@@ -1025,6 +1030,11 @@ static void test_incremental_check_fifo_destination_does_not_hang() {
     File* file = receive_incremental_check(p[0], cfg, &skipped);
     bool ok = file != NULL && !skipped;
     file_destroy(file);
+    /* Stay alive until the parent closes its write end so its send_data can
+       never race this exit into a spurious EPIPE. */
+    char drain;
+    while (read(p[0], &drain, 1) > 0) {
+    }
     config_delete(cfg);
     close(p[0]);
     _exit(ok ? 0 : 1);
@@ -1051,9 +1061,9 @@ static void test_incremental_check_fifo_destination_does_not_hang() {
     EXPECT_TRUE(send_data(p[1], body));
     data_destroy(body);
 
+    close(p[1]);
     int status;
     waitpid(pid, &status, 0);
-    close(p[1]);
     config_delete(cfg);
     unlink(path);
     rmdir(root);
@@ -1191,6 +1201,12 @@ static void test_incremental_check_basis_fifo_does_not_hang() {
     File* file = receive_incremental_check(p[0], cfg, &skipped);
     bool ok = file != NULL && !skipped;
     file_destroy(file);
+    /* The parent sends the data body after the check reply and only then closes
+       its write end.  Stay alive until that EOF so the parent's send_data can
+       never race this exit into a spurious EPIPE. */
+    char drain;
+    while (read(p[0], &drain, 1) > 0) {
+    }
     config_delete(cfg);
     close(p[0]);
     _exit(ok ? 0 : 1);
@@ -1222,9 +1238,11 @@ static void test_incremental_check_basis_fifo_does_not_hang() {
     EXPECT_TRUE(send_data(p[1], body));
     data_destroy(body);
 
+    /* Close the write end before waiting: this hands the child EOF so it can
+       exit, and guarantees the child was still alive for the data write. */
+    close(p[1]);
     int status;
     waitpid(pid, &status, 0);
-    close(p[1]);
     config_delete(cfg);
     unlink(basis_path);
     rmdir(basis_dir);

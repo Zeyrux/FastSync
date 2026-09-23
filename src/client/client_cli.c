@@ -54,13 +54,26 @@ bool client_abort_pending(void) {
 }
 
 #ifndef FASTSYNC_TEST_BUILD
+/* SIG_DFL disposition used by the handler's "not armed" fallback.  It is built
+ * once at load time so the handler can restore the default action with
+ * sigaction(2) -- which is async-signal-safe -- instead of signal(3), which is
+ * not.  The zero-initialized sa_mask is the empty set. */
+static const struct sigaction client_default_action = {
+    .sa_handler = SIG_DFL,
+    .sa_flags = 0,
+};
+
 /* Signal handler: perform NO work beyond storing the flag.  Logging, protocol
  * I/O and the STATUS_ABORT frame are all done later on the normal send path,
- * which is not async-signal-safe.  When no transfer is armed, fall back to the
- * default action so local-only modes remain interruptible. */
+ * which is not async-signal-safe.  When no transfer is armed, restore the
+ * default disposition (async-signal-safe sigaction) and re-raise so local-only
+ * modes remain interruptible.  The handler deliberately stays installed while a
+ * transfer is armed -- rather than using SA_RESETHAND -- so a second Ctrl-C
+ * during the graceful abort keeps setting the flag instead of hard-killing the
+ * process mid-cleanup. */
 static void client_signal_handler(int signo) {
   if (!client_abort_armed) {
-    signal(signo, SIG_DFL);
+    sigaction(signo, &client_default_action, NULL);
     raise(signo);
     return;
   }
@@ -157,7 +170,7 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
  * name is a hard error with rsync's exit code 4, never a silent no-op. */
 static int set_compression_choice(Config* config, const char* value) {
   if (!value) {
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   int algo;
@@ -165,7 +178,7 @@ static int set_compression_choice(Config* config, const char* value) {
     algo = compression_choice_resolve();
     if (algo < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
   } else {
@@ -176,7 +189,7 @@ static int set_compression_choice(Config* config, const char* value) {
                 "--compress-choice '%s' is not a supported algorithm; FastSync supports zstd, "
                 "lz4, zlib, zlibx, none or auto",
                 value);
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   const char* canonical = compression_algo_name((CompressionAlgo)algo);
@@ -213,7 +226,7 @@ static int resolve_checksum_name(const char* name, size_t len, int* out) {
  * resolves to FastSync's negotiated default (xxh128). */
 static int set_checksum_choice(Config* config, const char* value) {
   if (!value) {
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   const char* comma = strchr(value, ',');
@@ -231,7 +244,7 @@ static int set_checksum_choice(Config* config, const char* value) {
                 "--checksum-choice '%s' is invalid; FastSync supports xxh64 (or xxhash), xxh128, "
                 "xxh3, md5, md4, sha1, none or auto, optionally as 'transfer,pre-transfer'",
                 value);
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   int negotiated = -1;
@@ -239,7 +252,7 @@ static int set_checksum_choice(Config* config, const char* value) {
     negotiated = checksum_choice_resolve();
     if (negotiated < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
   }
@@ -251,8 +264,8 @@ static int set_checksum_choice(Config* config, const char* value) {
     pre = negotiated;
 
   config->checksum_algo = pre;
-  config->checksum_transfer_algo = transfer;
-  config->checksum_choice_set = true;
+  config->cli.checksum_transfer_algo = transfer;
+  config->cli.checksum_choice_set = true;
   /* rsync: "none" for the transfer checksum forces --whole-file. */
   if (transfer == (int)CHECKSUM_ALGO_NONE)
     config->whole_file = true;
@@ -504,9 +517,8 @@ static bool split_flag_level(const char* token, char* name, size_t name_size, in
  * of rsync's `symsafe`, `hlink`, and `own`. */
 static bool is_accepted_debug_category(const char* name) {
   static const char* const categories[] = {
-      "acl",   "backup", "bind",   "chdir", "cmd",   "connect", "del",  "deltasum",
-      "dup",   "exit",   "filter", "flist", "fuzzy", "genr",    "hash", "hl",
-      "hlink", "iconv",  "nstr",   "own",   "owner", "recv",    "send", "time",
+      "acl",  "backup", "bind",  "chdir", "cmd",  "connect", "dup",   "exit", "fuzzy",
+      "genr", "hl",     "hlink", "iconv", "nstr", "own",     "owner", "time",
   };
   for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
     if (strcmp(name, categories[i]) == 0)
@@ -518,7 +530,6 @@ static bool is_accepted_debug_category(const char* name) {
 static bool is_accepted_info_category(const char* name) {
   static const char* const categories[] = {
       "backup",
-      "mount",
       "syms",
       "symsafe",
   };
@@ -571,6 +582,18 @@ static int parse_debug_flags(const char* value, Config* config) {
       flag = LOG_DEBUG_PACK;
     } else if (strcmp(name, "util") == 0) {
       flag = LOG_DEBUG_UTIL;
+    } else if (strcmp(name, "flist") == 0) {
+      flag = LOG_DEBUG_FLIST;
+    } else if (strcmp(name, "del") == 0) {
+      flag = LOG_DEBUG_DEL;
+    } else if (strcmp(name, "hash") == 0 || strcmp(name, "deltasum") == 0) {
+      flag = LOG_DEBUG_HASH;
+    } else if (strcmp(name, "recv") == 0) {
+      flag = LOG_DEBUG_RECV;
+    } else if (strcmp(name, "filter") == 0) {
+      flag = LOG_DEBUG_FILTER;
+    } else if (strcmp(name, "send") == 0) {
+      flag = LOG_DEBUG_SEND;
     } else if (is_accepted_debug_category(name)) {
       continue;
     } else {
@@ -645,9 +668,12 @@ static int parse_info_flags(const char* value, Config* config) {
       flag = LOG_INFO_MISC;
     else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;
-    else if (strcmp(name, "stats") == 0)
+    else if (strcmp(name, "stats") == 0) {
       flag = LOG_INFO_STATS;
-    else if (strcmp(name, "del") == 0)
+      /* `--info=stats` requests the same transfer-statistics block as
+         `--stats`; `--info=stats0` turns it back off. */
+      config->stats = level > 0;
+    } else if (strcmp(name, "del") == 0)
       flag = LOG_INFO_DEL;
     else if (strcmp(name, "remove") == 0)
       flag = LOG_INFO_REMOVE;
@@ -655,6 +681,8 @@ static int parse_info_flags(const char* value, Config* config) {
       flag = LOG_INFO_FLIST;
     else if (strcmp(name, "nonreg") == 0)
       flag = LOG_INFO_NONREG;
+    else if (strcmp(name, "mount") == 0)
+      flag = LOG_INFO_MOUNT;
     else if (strcmp(name, "progress") == 0)
       flag = LOG_INFO_PROGRESS;
     else if (is_accepted_info_category(name))
@@ -934,8 +962,18 @@ static const OptionEntry OPTION_TABLE[] = {
     /* rsync -r/--recursive: FastSync is always recursive, so this is a
      * faithful no-op (accepted silently, never consumes an argument). */
     {"--recursive", "-r", OPT_NOOP, 0},
+    /* rsync's incremental-recursion scan-mode switch.  FastSync always performs
+     * a single full recursive scan, so both spellings are accepted as no-ops:
+     * the destination is identical whichever mode the caller requests.
+     * --no-inc-recursive is handled before the generic --no-* negation branch
+     * (see cli_handle_pre_negation) but is registered here for discoverability. */
+    {"--inc-recursive", NULL, OPT_NOOP, 0},
+    {"--no-inc-recursive", NULL, OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
-    {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
+    /* rsync's --old-args: accepted for CLI compatibility as a documented no-op
+     * (the remote server path is always safely quoted; see usage.c).  It is
+     * recognized but stores no Config field. */
+    {"--old-args", NULL, OPT_NOOP, 0},
     {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
     {"--blocking-io", NULL, OPT_FLAG, offsetof(Config, blocking_io)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
@@ -1168,12 +1206,12 @@ static int apply_negation(Config* config, const char* arg) {
     config->preserve_times = false;
     config->preserve_owner = false;
     config->preserve_group = false;
-    config->metadata_explicitly_disabled = true;
+    config->cli.metadata_explicitly_disabled = true;
     /* --no-preserve is an explicit opt-out of the whole bundle: record it so
      * the --incremental/--delta auto-preserve in cli_finalize_config does not
      * silently re-enable perms/times. */
-    config->preserve_perms_explicit_off = true;
-    config->preserve_times_explicit_off = true;
+    config->cli.preserve_perms_explicit_off = true;
+    config->cli.preserve_times_explicit_off = true;
     return 0;
   }
   *(bool*)((char*)config + entry->offset) = false;
@@ -1181,9 +1219,9 @@ static int apply_negation(Config* config, const char* arg) {
    * auto-preserve the OTHER attribute without undoing this one.  A later
    * -p/-t sets the attribute directly; this flag only gates the implication. */
   if (entry->offset == offsetof(Config, preserve_perms))
-    config->preserve_perms_explicit_off = true;
+    config->cli.preserve_perms_explicit_off = true;
   else if (entry->offset == offsetof(Config, preserve_times))
-    config->preserve_times_explicit_off = true;
+    config->cli.preserve_times_explicit_off = true;
   return 0;
 }
 
@@ -1213,7 +1251,13 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   void* field = (char*)config + entry->offset;
   switch (entry->kind) {
   case OPT_FLAG:
-    *(bool*)field = true;
+    /* -x/--one-file-system is repeatable in rsync: `-xx` increments the level so
+       the scanner drops mount-point directories instead of recreating them
+       empty.  Everything else is a plain boolean. */
+    if (entry->offset == offsetof(Config, one_file_system))
+      (*(int*)field)++;
+    else
+      *(bool*)field = true;
     return 0;
   case OPT_NOOP:
     return 0;
@@ -1350,6 +1394,12 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
       ctx->no_delta = true;
     else if (strcmp(arg, "--no-incremental") == 0)
       ctx->no_incremental = true;
+    /* Real rsync option names that merely start with "--no-" and are inert
+     * no-ops (e.g. --no-inc-recursive) are registered as OPT_NOOP entries;
+     * accept them before the generic negation table would reject the name. */
+    const OptionEntry* noop = find_table_option(arg);
+    if (noop && noop->kind == OPT_NOOP)
+      return true;
     if (apply_negation(config, arg) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1406,7 +1456,7 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->stop_at_set = true;
+    config->cli.stop_at_set = true;
     return true;
   }
   if (strcmp(arg, "--stop-at") == 0) {
@@ -1421,7 +1471,7 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->stop_at_set = true;
+    config->cli.stop_at_set = true;
     return true;
   }
   const char* threads_prefix = "--compress-threads=";
@@ -1492,7 +1542,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
         return true;
       }
       if (entry->offset == offsetof(Config, compression_level))
-        config->compression_level_set = true;
+        config->cli.compression_level_set = true;
       if (entry->offset == offsetof(Config, chmod_spec)) {
         mode_t ignored;
         if (!chmod_apply(0, config->chmod_spec, &ignored)) {
@@ -1505,7 +1555,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
          defaults to 127.0.0.1, so a value check cannot distinguish it).  Used
          by --dry-run to route an explicit remote target to the server. */
       if (entry->offset == offsetof(Config, server_host))
-        config->server_host_set = true;
+        config->cli.server_host_set = true;
     }
   } else if (apply_table_option(config, entry, NULL) != 0) {
     ctx->exit_code = -1;
@@ -1779,7 +1829,7 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
           return true;
         }
         config->compression_level = (int)level;
-        config->compression_level_set = true;
+        config->cli.compression_level_set = true;
         log_info_message(LOG_INFO_MISC, "Set Compression level to %ld", level);
         ctx->i++;
       }
@@ -1843,7 +1893,7 @@ static int set_server_port_option(Config* config, const char* value, const char*
     return -1;
   }
   config->server_port = port;
-  config->server_port_set = true;
+  config->cli.server_port_set = true;
   return 0;
 }
 
@@ -2574,7 +2624,11 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
  * load --files-from once every argument has been seen.  Returns 0 on success,
  * -1 on error. */
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
-  set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  /* An explicit --debug=FLAGS enables the debug log level by itself (rsync
+     behaviour); -v enables every other INFO-level message. */
+  bool debug_enabled = verbose || config->debug_level != 0;
+  set_log_level(config->quiet ? LOG_LEVEL_ERROR
+                              : (debug_enabled ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   /* rsync's plain --delete defaults to delete-during (--del): each directory's
      extras are removed as that directory is processed, so space is freed
      progressively and a tight destination never has to hold the whole old+new
@@ -2587,6 +2641,15 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   if (config->use_delete && !config->delete_before && !config->delete_during &&
       !config->delete_delay && !config->delete_after)
     config->delete_during = true;
+  /* rsync parity: --partial-dir=DIR chooses where an interrupted transfer's
+     partial file is kept, so it implies --partial.  rsync applies the
+     implication after option parsing, so it wins over an explicit --no-partial
+     regardless of the order the two options appear in (verified on rsync
+     3.4.1).  --inplace is the exception: the destination file is written in
+     place with no partial/temp staging, so the partial machinery is bypassed
+     and the implication is skipped to leave --inplace behavior untouched. */
+  if (config->partial_dir && !config->inplace)
+    config->partial = true;
   if (config->compress_choice) {
     int algo = compression_algo_from_name(config->compress_choice);
     if (algo >= 0) {
@@ -2601,7 +2664,7 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
     int resolved = compression_choice_resolve();
     if (resolved < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
     config->compression_algo = resolved;
@@ -2612,7 +2675,7 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * clamped to the codec's range, otherwise the codec's own default is used. */
   if (config->use_compression) {
     CompressionAlgo algo = (CompressionAlgo)config->compression_algo;
-    config->compression_level = config->compression_level_set
+    config->compression_level = config->cli.compression_level_set
                                     ? compression_clamp_level(algo, config->compression_level)
                                     : compression_default_level(algo);
     log_debug_message(LOG_DEBUG_UTIL, "Client compression: %s (level %d)",
@@ -2621,22 +2684,22 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   /* The negotiated checksum is always resolved (rsync negotiates one for the
    * delta strong sum even without --checksum): RSYNC_CHECKSUM_LIST first, then
    * the compiled-in order.  An explicit --checksum-choice already set it. */
-  if (!config->checksum_choice_set) {
+  if (!config->cli.checksum_choice_set) {
     int resolved = checksum_choice_resolve();
     if (resolved < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
     config->checksum_algo = resolved;
-    config->checksum_transfer_algo = resolved;
+    config->cli.checksum_transfer_algo = resolved;
   }
   /* rsync parity: "none" as the pre-transfer checksum cannot be combined with
    * --checksum (exit 4).  The check runs here because --checksum may appear on
    * either side of --checksum-choice. */
   if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
     log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
 
@@ -2715,11 +2778,11 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * explicitly negated them (--no-perms/--no-times/--no-preserve).  This runs
    * BEFORE the derived use_metadata bit so the transport frame is still sent
    * for the incremental/delta handshake even when both attributes were negated
-   * via --no-preserve (metadata_explicitly_disabled handles that opt-out). */
-  if (preserve_implied && !config->metadata_explicitly_disabled) {
-    if (!config->preserve_perms_explicit_off)
+   * via --no-preserve (cli.metadata_explicitly_disabled handles that opt-out). */
+  if (preserve_implied && !config->cli.metadata_explicitly_disabled) {
+    if (!config->cli.preserve_perms_explicit_off)
       config->preserve_perms = true;
-    if (!config->preserve_times_explicit_off)
+    if (!config->cli.preserve_times_explicit_off)
       config->preserve_times = true;
   }
 
@@ -2764,10 +2827,12 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   }
   /* --info=del on a real --delete run asks the receiver to report the paths it
      actually removed; the report rides the STATUS_STATS path list, so the wire
-     stats frame must be negotiated too. */
-  config->report_deletes = config->use_delete && !config->dry_run &&
-                           ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
-                            config->out_format != NULL);
+     stats frame must be negotiated too.  --debug=del needs the same paths, so
+     it opts into the existing report (no new wire field). */
+  config->report_deletes =
+      config->use_delete && !config->dry_run &&
+      ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
+       config->out_format != NULL || (config->debug_level & LOG_DEBUG_DEL) != 0);
   config->report_stats = config->stats || config->show_progress ||
                          (config->info_level & LOG_INFO_PROGRESS) || format_needs_wire ||
                          config->report_deletes || (config->dry_run && config->use_delete);
@@ -3104,7 +3169,7 @@ int main(int argc, char* argv[]) {
   int parse_ret = parse_args(config, argc, argv, positional_args, &positional_count);
   if (parse_ret != 0) {
     if (parse_ret < 0)
-      exit_code = config->cli_exit_code ? config->cli_exit_code : 1;
+      exit_code = config->cli.cli_exit_code ? config->cli.cli_exit_code : 1;
     goto cleanup;
   }
 
@@ -3247,7 +3312,7 @@ int main(int argc, char* argv[]) {
       exit_code = 1;
     }
   } else if (config->use_multithreading) {
-    exit_code = send_files_multithreaded(&config);
+    exit_code = send_files_multithreaded(config);
   } else {
     exit_code = send_files(config);
   }

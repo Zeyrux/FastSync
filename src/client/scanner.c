@@ -1,5 +1,6 @@
 #include "log.h"
 #include "scanner.h"
+#include "scanner_internal.h"
 #include "array_list.h"
 #include "chunk.h"
 #include "file.h"
@@ -17,674 +18,123 @@
 
 #include "xattr.h"
 
+/* One inspected directory entry buffered so the sequential scanner can emit the
+   stream in rsync's flist order.  `name` is the raw dirent name (owned here);
+   `entry` is the scanner_inspect_entry() result whose path/link_target are owned
+   when `inspection == 1`; `inspection` is that call's return code (1 keep,
+   0 skip, <0 fatal). */
 typedef struct {
-  char* path;
-  int depth;
-  FilterNode* context; /* inherited per-directory filter context */
-} DirEntry;
+  char* name;
+  ScannerEntry entry;
+  int inspection;
+} SortedEntry;
 
-/* A chain node: `own` holds the .rsync-filter rules of one directory, `parent`
- * the context that directory inherited (nearest ancestor with a filter file).
- * The chain for a directory's contents runs from that directory's own node up
- * to the root; the command-line base rules are evaluated after the whole
- * chain. */
-struct FilterNode {
-  FilterNode* parent;
-  FilterRuleList* own;
-};
+static void sorted_entry_destroy(void* item) {
+  SortedEntry* se = (SortedEntry*)item;
+  if (!se)
+    return;
+  free(se->name);
+  free(se->entry.path);
+  free(se->entry.link_target);
+}
 
-static void filter_node_destroy(void* item) {
-  if (item) {
-    FilterNode* node = (FilterNode*)item;
-    if (node->own)
-      filter_rule_list_free(node->own);
-    free(node);
+/* rsync flist order within one directory: non-directories first, then
+   directories, each group by ascending name.  strcmp() compares as unsigned
+   char, matching rsync's f_name_cmp(). */
+static int sorted_entry_cmp(const void* a, const void* b) {
+  const SortedEntry* x = (const SortedEntry*)a;
+  const SortedEntry* y = (const SortedEntry*)b;
+  bool x_dir = x->inspection > 0 && x->entry.is_directory;
+  bool y_dir = y->inspection > 0 && y->entry.is_directory;
+  if (x_dir != y_dir)
+    return x_dir ? 1 : -1;
+  return strcmp(x->name, y->name);
+}
+
+static void scanner_free_sorted(DirectoryScanner* scanner) {
+  SortedEntry* entries = (SortedEntry*)scanner->sorted_entries;
+  for (size_t i = 0; i < scanner->sorted_count; i++)
+    sorted_entry_destroy(&entries[i]);
+  free(entries);
+  scanner->sorted_entries = NULL;
+  scanner->sorted_count = 0;
+  scanner->sorted_index = 0;
+}
+
+/* Read every entry of the open directory, inspect it once and store it sorted in
+   rsync's flist order.  Returns 0 on success, -1 on a fatal error (the caller
+   aborts the scan). */
+static int scanner_buffer_current_directory(DirectoryScanner* scanner) {
+  size_t capacity = 64;
+  size_t count = 0;
+  SortedEntry* entries = malloc(capacity * sizeof(*entries));
+  if (!entries) {
+    scanner->failed = true;
+    return -1;
   }
-}
-
-static FilterNode* filter_node_alloc(FilterNode* parent, FilterRuleList* own) {
-  FilterNode* node = malloc(sizeof(FilterNode));
-  if (!node)
-    return NULL;
-  node->parent = parent;
-  node->own = own;
-  return node;
-}
-
-/* Evaluate a rule chain for one entry.  rsync precedence, highest first: the
- * innermost (current) directory's .rsync-filter rules, then each ancestor's,
- * then the root's, and finally the command-line base rules (--filter/-C).  The
- * sender-side verdict decides whether the entry is hidden from the transfer;
- * the receiver-side verdict decides whether its destination mirror is protected
- * from --delete.  Each side takes the FIRST matching rule independently. */
-typedef struct {
-  bool hide;    /* sender-side exclude matched */
-  bool protect; /* receiver-side exclude matched */
-} FilterOutcome;
-
-static void chain_rules_outcome(const FilterRuleList* base, const FilterNode* node, const char* rel,
-                                const char* leaf, bool is_dir, FilterOutcome* out) {
-  memset(out, 0, sizeof(*out));
-  bool sender_decided = false;
-  bool receiver_decided = false;
-  const FilterNode* n = node;
-  while (!sender_decided || !receiver_decided) {
-    const FilterRuleList* list = n ? n->own : base;
-    if (list) {
-      if (!sender_decided) {
-        FilterAction action = filter_rules_apply_side(list, rel, leaf, is_dir, FILTER_SIDE_SENDER);
-        if (action != FILTER_ACTION_NONE) {
-          out->hide = action == FILTER_ACTION_EXCLUDE;
-          sender_decided = true;
-        }
-      }
-      if (!receiver_decided) {
-        FilterAction action =
-            filter_rules_apply_side(list, rel, leaf, is_dir, FILTER_SIDE_RECEIVER);
-        if (action != FILTER_ACTION_NONE) {
-          out->protect = action == FILTER_ACTION_PROTECT;
-          receiver_decided = true;
-        }
-      }
-    }
-    if (!n)
-      break;
-    n = n->parent;
-  }
-}
-
-static bool entry_allowed(const FilterRuleList* base, const FilterNode* node, const char* rel,
-                          const char* leaf, bool is_dir, bool exclude_filter_files,
-                          bool* protect_out) {
-  /* -FF: per-directory .rsync-filter files are never transferred (single -F
-     transfers them, matching rsync). */
-  if (exclude_filter_files && !is_dir && strcmp(leaf, ".rsync-filter") == 0) {
-    if (protect_out)
-      *protect_out = false;
-    return false;
-  }
-  FilterOutcome outcome;
-  chain_rules_outcome(base, node, rel, leaf, is_dir, &outcome);
-  if (protect_out)
-    *protect_out = outcome.protect;
-  return !outcome.hide;
-}
-
-static void dir_entry_destroy(void* item) {
-  if (item) {
-    DirEntry* de = (DirEntry*)item;
-    free(de->path);
-    free(de);
-  }
-}
-
-static DirEntry* dir_entry_create(const char* path, int depth, FilterNode* context) {
-  DirEntry* de = malloc(sizeof(DirEntry));
-  if (!de)
-    return NULL;
-  de->path = str_dup(path);
-  if (!de->path) {
-    free(de);
-    return NULL;
-  }
-  de->depth = depth;
-  de->context = context;
-  return de;
-}
-
-/* How rsync's readlink_stat()/generator resolves one source symlink. */
-typedef enum {
-  LINK_ACTION_SKIP,           /* not transferred (no link option) */
-  LINK_ACTION_SKIP_PROTECTED, /* ignored as unsafe by --safe-links; rsync keeps
-                                 it in the transfer, so its destination mirror
-                                 must be protected from --delete */
-  LINK_ACTION_DEREF,          /* follow the referent (--copy-links, an unsafe
-                                 target under --copy-unsafe-links, or -k dir) */
-  LINK_ACTION_CARRY,          /* transmit the link itself (-l) */
-} LinkAction;
-
-/* Apply rsync's symlink-resolution precedence to one S_ISLNK entry:
- *   --copy-links  dereferences every symlink;
- *   --copy-unsafe-links  dereferences only targets unsafe_symlink() flags;
- *   -k/--copy-dirlinks  dereferences only a symlink whose referent is a dir;
- *   --safe-links  (receiver-side in rsync; modelled here) ignores an unsafe
- *                 target that would otherwise be carried; with --munge-links
- *                 every stored target becomes absolute, so --safe-links then
- *                 ignores every symlink, exactly as rsync documents;
- *   -l/--links  carries the link.
- * `link_rel` is the symlink's transfer-relative path (incl. name) and is used
- * only for the lexical unsafe test.  `target` receives the raw link value. */
-static LinkAction scanner_link_action(const ScannerOptions* options, const char* path,
-                                      const char* link_rel, char* target, size_t target_size) {
-  if (!options->follow_symlinks && !options->copy_links && !options->safe_links &&
-      !options->copy_unsafe_links && !options->copy_dirlinks)
-    return LINK_ACTION_SKIP;
-  ssize_t length = readlink(path, target, target_size - 1);
-  if (length < 0)
-    return LINK_ACTION_SKIP;
-  target[length] = '\0';
-
-  bool unsafe = file_symlink_unsafe(target, link_rel);
-  if (options->copy_links || (options->copy_unsafe_links && unsafe))
-    return LINK_ACTION_DEREF;
-  if (options->copy_dirlinks) {
-    struct stat ref;
-    if (stat(path, &ref) == 0 && S_ISDIR(ref.st_mode))
-      return LINK_ACTION_DEREF;
-  }
-  if (options->safe_links && (unsafe || options->munge_links))
-    return LINK_ACTION_SKIP_PROTECTED;
-  if (!options->follow_symlinks || target[0] == '\0')
-    return LINK_ACTION_SKIP;
-  return LINK_ACTION_CARRY;
-}
-
-typedef struct {
-  char* path;
-  struct stat stats;
-  bool is_directory;
-  /* True when the entry should be carried through as a SYMLINK (is_symlink)
-     rather than a dereferenced file/directory.  When true, `link_target` holds
-     the owned target string to transmit (sender-munged under --munge-links);
-     ownership transfers to the File built from this entry. */
-  bool is_symlink;
-  char* link_target;
-  /* True when the entry was pruned by a user selection rule (--filter/-C/per-dir
-     rules or the --exclude/--include layer) rather than skipped for another
-     reason (unreadable, symlink policy, not applicable). */
-  bool excluded;
-  /* True when the entry was skipped specifically by --max-size/--min-size.
-     Size pruning protects the destination mirror even under --delete-excluded,
-     so it is recorded into a separate sink from `excluded`. */
-  bool size_excluded;
-  /* True when a symlink selected for dereferencing (-L/--copy-links or an
-     unsafe target under --copy-unsafe-links) had no usable referent (a broken
-     link or a stat() failure).  rsync still reports this as a partial transfer
-     (exit 23) even though the entry is skipped, so the scanner records it as a
-     non-fatal I/O error. */
-  bool referent_error;
-} ScannerEntry;
-
-/* --one-file-system (-x) decision. Only directories can carry a different
- * device than their parent (mount points), so this is checked when a child
- * directory is about to be descended into. */
-bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device) {
-  return !one_file_system || entry_device == root_device;
-}
-
-/* Build a payload-less directory File carrying the captured metadata (when
- * requested).  Used by -x mount-point emission and --list-only directory
- * entries.  Returns NULL on allocation failure. */
-static File* scanner_build_dir_file(const char* path, const struct stat* stats,
-                                    const ScannerOptions* options) {
-  File* dir = file_create(path);
-  if (dir == NULL)
-    return NULL;
-  dir->is_dir = true;
-  if (options->use_metadata) {
-    dir->metadata =
-        file_metadata_create(dir->path, stats, options->preserve_atimes, options->preserve_crtimes);
-    if (!dir->metadata) {
-      file_destroy(dir);
-      return NULL;
-    }
-  }
-  return dir;
-}
-
-/* Relative path of an on-disk path below `root`. The transfer root may be
- * given with a trailing slash; the returned rel path never has one and is ""
- * for the root itself. A root of "/" is handled (its children start at "/").
- * Exposed so tests can exercise the mapping directly. */
-char* scanner_path_relative(const char* root, const char* fs_path) {
-  size_t root_len = strlen(root);
-  while (root_len > 1 && root[root_len - 1] == '/')
-    root_len--;
-  if (strncmp(root, fs_path, root_len) != 0)
-    return NULL;
-  if (root_len == 1 && root[0] == '/') {
-    if (fs_path[1] == '\0')
-      return str_dup("");
-    return str_dup(fs_path + 1);
-  }
-  if (fs_path[root_len] == '\0')
-    return str_dup("");
-  if (fs_path[root_len] != '/')
-    return NULL;
-  return str_dup(fs_path + root_len + 1);
-}
-
-/* -R/--relative destination-relative prefix reconstructed from a source spec:
- * everything after the first '.' path component (rsync's '/./' cut point),
- * with leading/trailing slashes removed; or the whole spec (normalized) when
- * there is no cut.  Returns "" for the receive root.  Exposed for tests. */
-char* scanner_relative_prefix(const char* spec) {
-  if (!spec || spec[0] == '\0')
-    return NULL;
-  const char* after = spec;
-  if (spec[0] == '.' && spec[1] == '/') {
-    after = spec + 2;
-  } else {
-    const char* cut = strstr(spec, "/./");
-    if (cut)
-      after = cut + 3;
-  }
-  size_t cap = strlen(spec) + 1;
-  char* out = malloc(cap);
-  if (!out)
-    return NULL;
-  size_t len = 0;
-  for (const char* s = after; *s;) {
-    while (*s == '/')
-      s++;
-    const char* comp = s;
-    while (*s && *s != '/')
-      s++;
-    size_t clen = (size_t)(s - comp);
-    if (clen == 0 || (clen == 1 && comp[0] == '.'))
+  const struct dirent* dirent;
+  while ((dirent = readdir(scanner->current_dir)) != NULL) {
+    if (strcmp(dirent->d_name, ".") == 0 || strcmp(dirent->d_name, "..") == 0)
       continue;
-    if (len)
-      out[len++] = '/';
-    memcpy(out + len, comp, clen);
-    len += clen;
-  }
-  out[len] = '\0';
-  return out;
-}
-
-/* Relative path of a child entry below the current directory. */
-static char* child_rel_path(const char* parent_rel, const char* name) {
-  if (!parent_rel || parent_rel[0] == '\0')
-    return str_dup(name);
-  return path_cat(parent_rel, name);
-}
-
-/* Destination-relative wire path for an entry under an -R prefix. */
-static char* scanner_prefix_send_path(const char* prefix, const char* rel) {
-  if (prefix[0] == '\0')
-    return str_dup(rel);
-  if (rel[0] == '\0')
-    return str_dup(prefix);
-  return path_cat(prefix, rel);
-}
-
-/* Apply the --files-from allow-set and the filter layer to one entry.  On
- * return `*protect_out` is true when a receiver-side rule protects the entry's
- * destination mirror from deletion. */
-static bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* base,
-                                   const FilterNode* node, const char* rel, const char* leaf,
-                                   bool is_dir, bool per_dir_filters, bool exclude_filter_files,
-                                   bool* protect_out) {
-  if (protect_out)
-    *protect_out = false;
-  if (file_list && !file_list_affects(file_list, rel))
-    return false;
-  if (base || per_dir_filters)
-    return entry_allowed(base, node, rel, leaf, is_dir, exclude_filter_files, protect_out);
-  return true;
-}
-
-/* Best-effort capture of the file's whitelisted xattrs (-X/-A).  A failure to
- * read xattrs is non-fatal: the file is transferred without them. */
-static void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file) {
-  if (!scanner || !file || !(scanner->options.preserve_xattrs || scanner->options.preserve_acls))
-    return;
-  file->xattrs = xattr_capture_path(file->path, scanner->options.preserve_acls);
-}
-
-/* Apply --hard-links (-H) detection to one regular File.  On a sibling (a
- * later member of an already-seen source inode) the File keeps the group id
- * and the first member's wire path but carries NO data payload (size 0); the
- * first member is left untouched (data present, link_first).  Allocation
- * failure is fatal: the scanner is marked failed. */
-static void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* table, File* file,
-                                    const struct stat* stats) {
-  if (!table || !file || !stats)
-    return;
-  int gid;
-  bool is_first;
-  char* first_path = NULL;
-  if (!hardlink_table_assign(table, file_wire_path(file), stats->st_dev, stats->st_ino, &gid,
-                             &is_first, &first_path)) {
-    if (scanner)
+    if (count == capacity) {
+      size_t next = capacity * 2;
+      SortedEntry* grown = realloc(entries, next * sizeof(*entries));
+      if (!grown) {
+        scanner->failed = true;
+        break;
+      }
+      entries = grown;
+      capacity = next;
+    }
+    char* name = str_dup(dirent->d_name);
+    if (!name) {
       scanner->failed = true;
-    return;
-  }
-  file->link_group = gid;
-  file->link_first = is_first;
-  if (!is_first) {
-    file->hardlink_target = first_path;
-    file->data->size = 0;
-  } else {
-    free(first_path);
-  }
-}
-
-/* Phase 4 special/devices decision for one non-regular entry, matching rsync:
-   - a char/block device is RECREATED as a node under -D/--devices, unless
-     --copy-devices asks for its content to be copied into a regular file;
-   - a FIFO/socket is RECREATED under --specials;
-   - when the matching flag is absent the entry is SKIPPED ("skipping
-     non-regular file"), exactly like rsync's default, instead of being
-     silently copied as a zero-length regular file;
-   - anything else (regular/directory) is left to the normal data path. */
-typedef enum {
-  SCANNER_SPECIAL_REGULAR,  /* ordinary file: transfer content */
-  SCANNER_SPECIAL_RECREATE, /* is_special node to recreate on the receiver */
-  SCANNER_SPECIAL_SKIP,     /* non-regular entry not requested: skip */
-} ScannerSpecial;
-
-static ScannerSpecial scanner_prepare_special(bool preserve_devices, bool preserve_specials,
-                                              bool copy_devices, File* file,
-                                              const struct stat* stats) {
-  if (!file || !stats)
-    return SCANNER_SPECIAL_REGULAR;
-  bool is_device = S_ISCHR(stats->st_mode) || S_ISBLK(stats->st_mode);
-  bool is_fifo = S_ISFIFO(stats->st_mode);
-  bool is_socket = S_ISSOCK(stats->st_mode);
-  if (!is_device && !is_fifo && !is_socket)
-    return SCANNER_SPECIAL_REGULAR;
-  if (is_device && copy_devices)
-    return SCANNER_SPECIAL_REGULAR; /* copy device content as a regular file */
-  bool preserve = is_device ? preserve_devices : preserve_specials;
-  if (!preserve)
-    return SCANNER_SPECIAL_SKIP;
-  file->is_special = true;
-  file->data->size = 0;
-  file->data->data = NULL;
-  if (is_device) {
-    file->rdev_major = (int32_t)major(stats->st_rdev);
-    file->rdev_minor = (int32_t)minor(stats->st_rdev);
-  }
-  return SCANNER_SPECIAL_RECREATE;
-}
-
-/* Append `rel` to the caller's exclusion sink, taking `mtx` when shared across
-   parallel worker threads.  Returns false on allocation failure (list left
-   unchanged). */
-static bool excluded_sink_append(ArrayList* list, mtx_t* mtx, const char* rel) {
-  if (!list)
-    return true;
-  char* dup = str_dup(rel);
-  if (!dup)
-    return false;
-  if (mtx)
-    mtx_lock(mtx);
-  bool ok = array_list_add(list, dup);
-  if (mtx)
-    mtx_unlock(mtx);
-  if (!ok)
-    free(dup);
-  return ok;
-}
-
-/* Record one pruned filesystem path in a delete-protection sink.  The stored
-   form is the entry's wire/destination-relative path (a single leading '/'
-   removed, exactly how manifest keep entries are stored), so the receiver's
-   walker prefixes match the destination layout.  An allocation failure is a
-   fatal scan error. */
-static void scanner_record_protected(DirectoryScanner* scanner, const char* fs_path,
-                                     ArrayList* sink) {
-  if (!sink || !fs_path)
-    return;
-  const char* rel = *fs_path == '/' ? fs_path + 1 : fs_path;
-  if (!excluded_sink_append(sink, scanner->options.excluded_mutex, rel))
-    scanner->failed = true;
-}
-
-/* rsync's `--info=nonreg` line for a non-regular entry that is not being
- * preserved: `skipping non-regular file "NAME"`.  The name is the path relative
- * to the transfer root, so it matches rsync's displayed name. */
-static void scanner_note_nonreg(const ScannerOptions* options, const char* fs_path) {
-  if (!options || !options->note_nonreg || !fs_path)
-    return;
-  const char* rel = utils_strip_transfer_root(fs_path, options->send_directory);
-  char* escaped = output_escape(rel, options->eight_bit_output);
-  printf("skipping non-regular file \"%s\"\n", escaped ? escaped : rel);
-  free(escaped);
-  fflush(stdout);
-}
-
-/* A user-selection exclusion (--filter/-C/per-dir or --exclude/--include). */
-static void scanner_record_excluded(DirectoryScanner* scanner, const char* fs_path) {
-  scanner_record_protected(scanner, fs_path, scanner->options.excluded_paths);
-}
-
-/* A --max-size/--min-size prune (always protected, even under --delete-excluded). */
-static void scanner_record_size_skipped(DirectoryScanner* scanner, const char* fs_path) {
-  scanner_record_protected(scanner, fs_path, scanner->options.size_skipped_paths);
-}
-
-/* Record a directory the scan synchronized.  `fs_path` is its absolute path and
-   `rel` its path relative to the transfer root ("" for the root); the stored
-   form matches the wire layout (the bare relative path in -R+--files-from, else
-   the source path with a leading '/' removed, with "." for the receive root).
-   Returns false on allocation failure. */
-static bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_path,
-                                      const char* rel, bool relative_mode) {
-  if (!options->synced_dirs && !options->plan_dirs)
-    return true;
-  if (!file_list_dir_in_scope(options->file_list, rel))
-    return true;
-  char* prefixed = NULL;
-  const char* dest;
-  if (relative_mode) {
-    dest = rel;
-  } else if (options->relative_prefix) {
-    prefixed = scanner_prefix_send_path(options->relative_prefix, rel);
-    if (!prefixed)
-      return false;
-    dest = prefixed;
-  } else {
-    dest = fs_path;
-  }
-  if (dest[0] == '/')
-    dest++;
-  if (dest[0] == '\0')
-    dest = ".";
-  bool ok = true;
-  if (options->synced_dirs)
-    ok = excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
-  /* The delete-plan keep set needs an entry for every traversed source
-     directory, including empty ones, so its destination mirror is kept rather
-     than deleted as an extra; the receive root (".") is implicit. */
-  if (ok && options->plan_dirs && strcmp(dest, ".") != 0)
-    ok = excluded_sink_append(options->plan_dirs, options->excluded_mutex, dest);
-  free(prefixed);
-  return ok;
-}
-
-/* Read every per-directory filter file that applies to `dir_path` (its
- * .rsync-filter when -F is active, plus each registered "dir-merge NAME") into a
- * fresh list.  Returns NULL on allocation/parse failure (message in `err`);
- * returns an empty list (and *any_exists=false) when no file exists. */
-static FilterRuleList* read_dir_filters(const ScannerOptions* options, const char* dir_path,
-                                        const char* rel, bool* any_exists, char* err,
-                                        size_t err_size) {
-  if (err && err_size > 0)
-    err[0] = '\0';
-  const FilterRuleList* base = options->base_filters;
-  bool have_names = options->per_dir_filters || (base && base->dir_merge_count > 0);
-  if (any_exists)
-    *any_exists = false;
-  if (!have_names)
-    return NULL;
-  FilterRuleList* own = filter_rule_list_create();
-  if (!own) {
-    snprintf(err, err_size, "memory allocation failed");
-    return NULL;
-  }
-  FilterParseOptions opts = {.delete_excluded = options->delete_excluded, .cvs_exclude = false};
-  bool exists = false;
-  if (options->per_dir_filters) {
-    if (!filter_file_append(own, dir_path, ".rsync-filter", rel, &opts, &exists, err, err_size))
-      goto fail;
-    if (exists && any_exists)
-      *any_exists = true;
-  }
-  if (base) {
-    for (int i = 0; i < base->dir_merge_count; i++) {
-      if (!filter_file_append(own, dir_path, base->dir_merge_names[i], rel, &opts, &exists, err,
-                              err_size))
-        goto fail;
-      if (exists && any_exists)
-        *any_exists = true;
+      break;
     }
-  }
-  return own;
-fail:
-  filter_rule_list_free(own);
-  return NULL;
-}
-
-/* Merge the open directory's own per-directory filter files (the default
- * .rsync-filter when -F is active, plus every "dir-merge NAME" registered on the
- * base rule list) into the inherited context, returning the context used for
- * this directory's entries. On a parse error the scanner is marked failed.
- * Returns 0 on success, -1 on failure. */
-static int open_directory_filter_context(DirectoryScanner* scanner, const FilterNode* inherited) {
-  char err[256];
-  bool any_exists = false;
-  FilterRuleList* own = read_dir_filters(&scanner->options, scanner->current_path,
-                                         scanner->current_rel ? scanner->current_rel : "",
-                                         &any_exists, err, sizeof(err));
-  if (!own) {
-    /* read_dir_filters() leaves `err` set on a parse/allocation failure even
-       when an earlier merge file in the same directory existed (any_exists true);
-       key off the error text rather than any_exists so an invalid per-directory
-       filter file can never be silently ignored. */
-    if (err[0] == '\0') {
-      scanner->current_node = (FilterNode*)inherited;
-      return 0;
+    char* link_rel = child_rel_path(scanner->current_rel, dirent->d_name);
+    if (!link_rel) {
+      free(name);
+      scanner->failed = true;
+      break;
     }
-    char* escaped_path = output_escape(scanner->current_path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_ERROR, "invalid per-directory filter in %s: %s",
-                escaped_path ? escaped_path : "<allocation failed>", err);
-    free(escaped_path);
-    scanner->failed = true;
+    int inspection = scanner_inspect_entry(&scanner->options, scanner->current_path, link_rel,
+                                           dirent->d_name, &entries[count].entry);
+    free(link_rel);
+    if (inspection < 0) {
+      free(name);
+      scanner->failed = true;
+      break;
+    }
+    entries[count].name = name;
+    entries[count].inspection = inspection;
+    count++;
+  }
+  if (scanner->failed) {
+    for (size_t i = 0; i < count; i++)
+      sorted_entry_destroy(&entries[i]);
+    free(entries);
     return -1;
   }
-  if (any_exists && (own->count > 0 || own->dir_merge_count > 0)) {
-    FilterNode* node = filter_node_alloc((FilterNode*)inherited, own);
-    if (!node || !array_list_add(scanner->filter_nodes, node)) {
-      filter_node_destroy(node);
-      scanner->failed = true;
-      return -1;
-    }
-    scanner->current_node = node;
-  } else {
-    filter_rule_list_free(own);
-    scanner->current_node = (FilterNode*)inherited;
-  }
+  qsort(entries, count, sizeof(*entries), sorted_entry_cmp);
+  scanner->sorted_entries = entries;
+  scanner->sorted_count = count;
+  scanner->sorted_index = 0;
   return 0;
 }
 
-/* Inspect symlinks, resolve the entry type, and apply file filters once for both scanners.
- * `link_rel` is the entry's path relative to the transfer root (including its
- * name), used for the lexical rsync unsafe-symlink test. */
-static int scanner_inspect_entry(const ScannerOptions* options, const char* containing_dir,
-                                 const char* link_rel, const char* name, ScannerEntry* entry) {
-  entry->excluded = false;
-  entry->size_excluded = false;
-  entry->referent_error = false;
-  entry->is_symlink = false;
-  entry->link_target = NULL;
-  entry->path = path_cat(containing_dir, name);
-  if (!entry->path)
-    return -1;
-
-  struct stat link_stats;
-  if (lstat(entry->path, &link_stats) != 0) {
-    free(entry->path);
-    return 0;
-  }
-  if (!S_ISLNK(link_stats.st_mode))
-    goto regular;
-
-  char link_target[4096];
-  switch (scanner_link_action(options, entry->path, link_rel, link_target, sizeof(link_target))) {
-  case LINK_ACTION_SKIP:
-    goto skip;
-  case LINK_ACTION_SKIP_PROTECTED:
-    /* --safe-links ignored the link, but rsync still counts it as present in
-       the transfer, so its destination mirror survives --delete.  Record it as
-       an excluded path (the same delete-protection channel as a filter prune). */
-    entry->excluded = true;
-    goto skip;
-  case LINK_ACTION_DEREF:
-    if (stat(entry->path, &entry->stats) != 0) {
-      /* rsync reports "symlink has no referent" and continues with a partial
-         transfer (exit 23); record the error so the run exits 23 too. */
-      char* escaped = output_escape(entry->path, log_get_8_bit_output());
-      log_message(LOG_LEVEL_WARNING, "symlink has no referent: %s",
-                  escaped ? escaped : "<allocation failed>");
-      free(escaped);
-      entry->referent_error = true;
-      goto skip;
-    }
-    entry->is_directory = S_ISDIR(entry->stats.st_mode);
-    if (entry->is_directory)
-      return 1;
-    goto apply_filters;
-  case LINK_ACTION_CARRY:
-    break;
-  }
-
-  /* Carry the link as a symlink.  --munge-links is applied by the RECEIVER (it
-     prefixes every stored target with /rsyncd-munged/); when the SOURCE already
-     holds a munged value the sender strips it so the receiver re-munges a clean
-     target, round-tripping a munged tree exactly like rsync. */
-  entry->is_symlink = true;
-  entry->stats = link_stats;
-  entry->is_directory = false;
-  entry->link_target = str_dup(link_target);
-  if (!entry->link_target)
-    goto skip;
-  if (options->munge_links)
-    file_symlink_unmunge(entry->link_target);
-  goto apply_filters;
-
-regular:
-  /* Not a symlink: the lstat() above already described this entry, and lstat
-     and stat are identical for every non-symlink, so reuse that result instead
-     of issuing a redundant stat() on the scanner hot path.  stat() is still
-     used on the dereference paths above/below for actual symlinks (copy-links,
-     safe/copy-unsafe links, and -k symlinks-to-directories). */
-  entry->stats = link_stats;
-  entry->is_directory = S_ISDIR(link_stats.st_mode);
-  if (entry->is_directory)
-    return 1;
-
-apply_filters:
-  for (int i = 0; i < options->exclude_count; i++)
-    if (glob_match(options->exclude_patterns[i], name)) {
-      entry->excluded = true;
-      goto skip;
-    }
-  if (options->include_count > 0) {
-    bool included = false;
-    for (int i = 0; i < options->include_count; i++)
-      if (glob_match(options->include_patterns[i], name))
-        included = true;
-    if (!included) {
-      entry->excluded = true;
-      goto skip;
+/* Push this directory's collected child directories onto the LIFO stack in
+   reverse so the first (ascending) child is popped first (depth-first). */
+static void scanner_push_pending_dirs(DirectoryScanner* scanner) {
+  ArrayList* pending = (ArrayList*)scanner->pending_dirs;
+  if (!pending)
+    return;
+  for (int i = pending->size - 1; i >= 0; i--) {
+    if (!queue_push(scanner->directories, pending->items[i])) {
+      dir_entry_destroy(pending->items[i]);
+      scanner->failed = true;
     }
   }
-  if ((options->max_size > 0 && (unsigned long long)entry->stats.st_size > options->max_size) ||
-      (options->min_size > 0 && (unsigned long long)entry->stats.st_size < options->min_size)) {
-    entry->excluded = true;
-    entry->size_excluded = true;
-    goto skip;
-  }
-  return 1;
-
-skip:
-  free(entry->path);
-  entry->path = NULL;
-  free(entry->link_target);
-  entry->link_target = NULL;
-  return 0;
+  pending->size = 0;
 }
 
 DirectoryScanner* directory_scanner_create_with_options(const char* root_directory,
@@ -704,12 +154,22 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
     free(scanner);
     return NULL;
   }
+  scanner->pending_dirs = array_list_create(NULL);
+  if (!scanner->pending_dirs) {
+    queue_destroy(scanner->directories);
+    free(scanner);
+    return NULL;
+  }
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->current_depth = 0;
   scanner->failed = false;
+  scanner->sorted_entries = NULL;
+  scanner->sorted_count = 0;
+  scanner->sorted_index = 0;
   scanner->root_path = str_dup(root_directory);
   if (!scanner->root_path) {
+    array_list_delete(scanner->pending_dirs);
     queue_destroy(scanner->directories);
     free(scanner);
     return NULL;
@@ -729,6 +189,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
     scanner->filter_nodes = array_list_create(filter_node_destroy);
     if (!scanner->filter_nodes) {
       free(scanner->root_path);
+      array_list_delete(scanner->pending_dirs);
       queue_destroy(scanner->directories);
       free(scanner);
       return NULL;
@@ -739,6 +200,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
     if (stat(root_directory, &root_stats) != 0) {
       log_perror("Could not stat source directory");
       free(scanner->root_path);
+      array_list_delete(scanner->pending_dirs);
       queue_destroy(scanner->directories);
       array_list_delete(scanner->filter_nodes);
       free(scanner);
@@ -757,6 +219,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   if (!queue_enqueue(scanner->directories, root)) {
     dir_entry_destroy(root);
     free(scanner->root_path);
+    array_list_delete(scanner->pending_dirs);
     queue_destroy(scanner->directories);
     array_list_delete(scanner->filter_nodes);
     free(scanner);
@@ -808,6 +271,13 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
   free(scanner->current_path);
   free(scanner->current_rel);
   free(scanner->root_path);
+  scanner_free_sorted(scanner);
+  ArrayList* pending = (ArrayList*)scanner->pending_dirs;
+  if (pending) {
+    for (int i = 0; i < pending->size; i++)
+      dir_entry_destroy(pending->items[i]);
+    array_list_delete(pending);
+  }
   array_list_delete(scanner->filter_nodes);
   array_list_delete(scanner->dirs_batch);
   queue_destroy(scanner->directories);
@@ -839,12 +309,11 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
  * append for the parallel scanner's shared workers.  An unstattable or
  * non-directory path is silently skipped (the transfer is unaffected); an
  * allocation failure is fatal and reported to the caller. */
-static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const char* root_path,
-                                     const char* fs_path, bool relative_mode,
-                                     const char* relative_prefix, bool preserve_atimes,
-                                     bool preserve_crtimes, bool preserve_xattrs,
-                                     bool preserve_acls, bool no_implied_dirs,
-                                     const FileListSet* file_list) {
+bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const char* root_path,
+                              const char* fs_path, bool relative_mode, const char* relative_prefix,
+                              bool preserve_atimes, bool preserve_crtimes, bool preserve_xattrs,
+                              bool preserve_acls, bool no_implied_dirs,
+                              const FileListSet* file_list) {
   if (!dir_entries || !root_path || !fs_path)
     return true;
   struct stat st;
@@ -957,6 +426,9 @@ static bool scanner_emit_empty_dir(DirectoryScanner* scanner, ArrayList* chunk_d
     file_destroy(dir);
     return false;
   }
+  /* The directory was counted when it was opened; this inline entry represents
+     it, so drop the counter to avoid counting it twice in --stats. */
+  scanner_dir_count_uncount(&scanner->options);
   return true;
 }
 
@@ -975,7 +447,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
   scanner->current_path = NULL;
 
   while (!queue_is_empty(scanner->directories)) {
-    DirEntry* de = (DirEntry*)queue_dequeue(scanner->directories);
+    DirEntry* de = (DirEntry*)queue_pop(scanner->directories);
     scanner->current_path = de->path;
     scanner->current_depth = de->depth;
     /* The seed directory inherits the scanner's configured context (the root
@@ -1046,6 +518,8 @@ static int open_next_directory(DirectoryScanner* scanner) {
       scanner->failed = true;
       return -1;
     }
+    scanner_dir_count_count(&scanner->options);
+    log_debug_message(LOG_DEBUG_FLIST, "flist: scanning %s", scanner->current_path);
     if (scanner->options.capture_dir_times &&
         !scanner_capture_dir_time(
             scanner->options.dir_entries, scanner->options.dir_entries_mutex, scanner->root_path,
@@ -1058,6 +532,14 @@ static int open_next_directory(DirectoryScanner* scanner) {
       free(scanner->current_path);
       scanner->current_path = NULL;
       scanner->failed = true;
+      return -1;
+    }
+    /* Buffer and sort this directory's entries in rsync's flist order. */
+    if (scanner_buffer_current_directory(scanner) != 0) {
+      closedir(scanner->current_dir);
+      scanner->current_dir = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
       return -1;
     }
     return 1;
@@ -1304,6 +786,17 @@ static File* dirs_next_file(DirectoryScanner* scanner) {
         scanner->dirs_root_emitted = true;
         if (scanner->options.prune_empty_dirs && dirs_source_dir_is_empty(scanner->root_path))
           return NULL;
+        /* The listed directory's direct children are about to be enumerated, so
+           its destination mirror is a synchronized directory: record it for the
+           per-directory delete plan.  The plan keeps the enumerated children and
+           shields untraversed subdirectories, so --delete-during removes extras
+           directly inside the listed directory without descending into a kept
+           (but untraversed) child -- exactly rsync's `-d DIR/ --delete`. */
+        if (!scanner_record_synced_dir(&scanner->options, scanner->root_path, "",
+                                       scanner->relative_mode)) {
+          scanner->failed = true;
+          return NULL;
+        }
         scanner->current_dir = opendir(scanner->root_path);
         if (!scanner->current_dir) {
           scanner->io_error = true;
@@ -1391,6 +884,296 @@ static Chunk* directory_scanner_next_dirs(DirectoryScanner* scanner) {
   return dirs_flush_batch(scanner);
 }
 
+/* Result of processing one inspected entry inside directory_scanner_next(). */
+typedef enum {
+  SCANNER_ACTION_CONTINUE, /* advance to the next buffered entry */
+  SCANNER_ACTION_BREAK,    /* stop the scan loop (failure recorded) */
+  SCANNER_ACTION_CHUNK,    /* return the Chunk produced in *out_chunk */
+} ScannerAction;
+
+/* Reconstruct the delete-protection path for a skipped (inspection == 0) entry
+ * whose destination mirror must be protected. */
+static char* scanner_entry_protected_path(DirectoryScanner* scanner, const char* name) {
+  if (scanner->relative_mode)
+    return child_rel_path(scanner->current_rel, name);
+  if (scanner->options.relative_prefix) {
+    char* relc = child_rel_path(scanner->current_rel, name);
+    char* prefixed = relc ? scanner_prefix_send_path(scanner->options.relative_prefix, relc) : NULL;
+    free(relc);
+    return prefixed;
+  }
+  return path_cat(scanner->current_path, name);
+}
+
+/* Handle a buffered entry that scanner_inspect_entry() skipped (inspection ==
+ * 0): record a partial-transfer I/O error and protect the destination mirror
+ * of a user-selection or size prune.  Returns 0 to continue, -1 on failure. */
+static int scanner_handle_skipped_entry(DirectoryScanner* scanner, const ScannerEntry* inspected,
+                                        const char* name) {
+  /* A dereferenced symlink with no referent is a partial-transfer error
+     (rsync exit 23): record it as a non-fatal scan I/O error. */
+  if (inspected->referent_error)
+    scanner->io_error = true;
+  /* A user-selection exclude protects its destination mirror from --delete
+     unless --delete-excluded; a size prune is always protected.  Other
+     skips (unreadable, symlink policy) protect nothing.  Under -R +
+     --files-from the protected prefix must be the entry's bare relative
+     wire path, not its source path (which would not match the destination
+     layout and would leave the mirror deletable). */
+  if (inspected->excluded) {
+    char* protected_path = scanner_entry_protected_path(scanner, name);
+    if (!protected_path) {
+      scanner->failed = true;
+      return -1;
+    }
+    if (inspected->size_excluded)
+      scanner_record_size_skipped(scanner, protected_path);
+    else
+      scanner_record_excluded(scanner, protected_path);
+    free(protected_path);
+  }
+  return 0;
+}
+
+/* Record the delete-protection prefix for an entry dropped by the --files-from
+ * allow-set or a filter rule (sender-hide or receiver-protect).  Returns 0 on
+ * success, -1 on allocation failure (caller reports it). */
+static int scanner_record_selection_protection(DirectoryScanner* scanner, bool protect,
+                                               bool passes_selection, const char* rel,
+                                               const char* cur_path) {
+  if (passes_selection && !protect)
+    return 0;
+  /* --files-from subset pruning is not a filter exclusion: its delete
+     semantics stay keep-set-only (an unlisted source path is treated as
+     absent, so its destination mirror is a deletable extra).  A rule-based
+     exclusion is recorded as a protected prefix.  -R + --files-from bare
+     wire paths are never recorded (see ScannerOptions.excluded_paths). */
+  bool files_from_prune =
+      scanner->options.file_list && !file_list_affects(scanner->options.file_list, rel);
+  if (protect && scanner->relative_mode) {
+    /* -R + --files-from: the destination/wire path is the bare relative
+       name, so the protected mirror prefix must be `rel` (not the source
+       path) for the delete walker to match it. */
+    scanner_record_excluded(scanner, rel);
+  } else if (!files_from_prune && !scanner->relative_mode) {
+    if (scanner->options.relative_prefix) {
+      char* wrel = scanner_prefix_send_path(scanner->options.relative_prefix, rel);
+      if (!wrel)
+        return -1;
+      scanner_record_excluded(scanner, wrel);
+      free(wrel);
+    } else {
+      scanner_record_excluded(scanner, cur_path);
+    }
+  }
+  return 0;
+}
+
+/* -x/--one-file-system handling for a directory entry: 1 when the entry was
+ * fully handled (caller continues), 0 when it is on the same filesystem as the
+ * root (caller descends), -1 on a fatal allocation failure. */
+static int scanner_handle_mount_dir(DirectoryScanner* scanner, ArrayList* chunk_data,
+                                    const char* cur_path, const struct stat* stats) {
+  if (scanner_same_filesystem(scanner->options.one_file_system, scanner->root_dev, stats->st_dev))
+    return 0;
+  if (scanner->options.one_file_system > 1) {
+    /* rsync's -xx drops the mount-point directory entirely (the plain -x
+       path below keeps it as an empty directory) and prints the
+       --info=mount line when that category is enabled. */
+    scanner_note_mount(&scanner->options, cur_path);
+    return 1;
+  }
+  /* rsync's -x/--one-file-system emits the mount-point directory entry
+     itself (so the destination gets an empty directory) but does NOT
+     descend into it.  Build a payload-less directory File and hand it to
+     the caller; never enqueue it for traversal. */
+  File* mount = scanner_build_dir_file(cur_path, stats, &scanner->options);
+  if (mount == NULL || !array_list_add(chunk_data, mount)) {
+    file_destroy(mount);
+    scanner->failed = true;
+    return -1;
+  }
+  scanner->current_dir_produced = true;
+  return 1;
+}
+
+/* Finish the open directory (exhausted entries): emit an empty-directory entry
+ * when appropriate, push its pending children and reset the per-directory
+ * state.  Returns false when the scanner failed. */
+static bool scanner_finish_current_directory(DirectoryScanner* scanner, ArrayList* chunk_data) {
+  /* The directory is exhausted: if nothing was transferred or descended
+     from it, recreate it at the destination as an explicit entry. */
+  if (scanner->options.emit_empty_dirs && !scanner->current_dir_produced &&
+      !scanner->options.prune_empty_dirs && !scanner->options.list_dirs &&
+      scanner->options.file_list == NULL) {
+    if (!scanner_emit_empty_dir(scanner, chunk_data))
+      scanner->failed = true;
+  }
+  scanner_push_pending_dirs(scanner);
+  closedir(scanner->current_dir);
+  scanner->current_dir = NULL;
+  free(scanner->current_path);
+  scanner->current_path = NULL;
+  scanner_free_sorted(scanner);
+  return !scanner->failed;
+}
+
+/* Handle one kept buffered entry (inspection == 1): selection recording,
+ * directory descent and regular-file emission.  `*chunk_data_size` tracks the
+ * accumulated payload so a chunk is cut at the same point as before. */
+static ScannerAction scanner_process_entry(DirectoryScanner* scanner, ArrayList* chunk_data,
+                                           unsigned long long* chunk_data_size, SortedEntry* sorted,
+                                           Chunk** out_chunk) {
+  const char* name = sorted->name;
+  ScannerEntry* inspected = &sorted->entry;
+  char* cur_path = inspected->path;
+  struct stat stats = inspected->stats;
+
+  /* --files-from allow-set and the filter layer apply to files and to
+   * directories (an excluded directory is not descended into). */
+  bool is_dir = inspected->is_directory;
+  char* rel = child_rel_path(scanner->current_rel, name);
+  if (!rel) {
+    scanner->failed = true;
+    return SCANNER_ACTION_BREAK;
+  }
+  bool protect = false;
+  bool passes_selection = entry_passes_selection(
+      scanner->options.file_list, scanner->options.base_filters, scanner->current_node, rel, name,
+      is_dir, scanner->options.per_dir_filters, scanner->options.exclude_per_dir_filter_files,
+      &protect);
+  /* A sender-side hide leaves the entry out of the transfer; an independent
+     receiver-side protect rule keeps a transferred entry's destination mirror
+     from being deleted.  Both are recorded in the same protection set. */
+  if (!passes_selection || protect) {
+    if (scanner_record_selection_protection(scanner, protect, passes_selection, rel, cur_path) !=
+        0) {
+      free(rel);
+      scanner->failed = true;
+      return SCANNER_ACTION_BREAK;
+    }
+  }
+  /* With -R the wire/destination path is a reconstructed relative path, not
+     the source path; keep `rel` alive to build it for a transferred file. */
+  bool needs_rel = scanner->relative_mode || scanner->options.relative_prefix != NULL;
+  char* rel_copy = needs_rel ? str_dup(rel) : NULL;
+  free(rel);
+  if (rel_copy == NULL && needs_rel) {
+    scanner->failed = true;
+    return SCANNER_ACTION_BREAK;
+  }
+  if (!passes_selection) {
+    scanner_note_filter(&scanner->options, name);
+    free(rel_copy);
+    return SCANNER_ACTION_CONTINUE;
+  }
+
+  if (is_dir) {
+    free(rel_copy);
+    int mount = scanner_handle_mount_dir(scanner, chunk_data, cur_path, &stats);
+    if (mount < 0)
+      return SCANNER_ACTION_BREAK;
+    if (mount > 0)
+      return SCANNER_ACTION_CONTINUE;
+    /* --list-only: list directory entries too (rsync prints them), even
+       though a real transfer never sends them explicitly. */
+    if (scanner->options.list_dirs) {
+      File* dir = scanner_build_dir_file(cur_path, &stats, &scanner->options);
+      if (dir == NULL || !array_list_add(chunk_data, dir)) {
+        file_destroy(dir);
+        scanner->failed = true;
+        return SCANNER_ACTION_BREAK;
+      }
+    }
+    scanner->current_dir_produced = true;
+    int next_depth = scanner->current_depth + 1;
+    if (scanner->options.max_depth <= 0 || next_depth < scanner->options.max_depth) {
+      DirEntry* de = dir_entry_create(cur_path, next_depth, scanner->current_node);
+      if (!de || !array_list_add((ArrayList*)scanner->pending_dirs, de)) {
+        dir_entry_destroy(de);
+        scanner->failed = true;
+      }
+    }
+    return SCANNER_ACTION_CONTINUE;
+  }
+
+  if (scanner->options.max_depth > 0 && scanner->current_depth + 1 > scanner->options.max_depth) {
+    free(rel_copy);
+    return SCANNER_ACTION_CONTINUE;
+  }
+  File* file = file_create(cur_path);
+  if (file == NULL) {
+    free(rel_copy);
+    free(inspected->link_target);
+    inspected->link_target = NULL;
+    scanner->failed = true;
+    return SCANNER_ACTION_CONTINUE;
+  }
+  if (inspected->is_symlink) {
+    file->is_symlink = true;
+    file->symlink_target = inspected->link_target;
+    inspected->link_target = NULL;
+  } else {
+    file->data->size = stats.st_size;
+  }
+  if (scanner->relative_mode) {
+    file->send_path = rel_copy;
+    rel_copy = NULL;
+  } else if (scanner->options.relative_prefix) {
+    file->send_path = scanner_prefix_send_path(scanner->options.relative_prefix, rel_copy);
+    free(rel_copy);
+    rel_copy = NULL;
+    if (!file->send_path) {
+      file_destroy(file);
+      scanner->failed = true;
+      return SCANNER_ACTION_BREAK;
+    }
+  }
+  /* --devices/--specials: a device/FIFO/socket entry marked for preservation
+     becomes a node to recreate (is_special, no data, rdev captured); an
+     unrequested non-regular entry is skipped (rsync default). */
+  ScannerSpecial special =
+      scanner_prepare_special(scanner->options.preserve_devices, scanner->options.preserve_specials,
+                              scanner->options.copy_devices, file, &stats);
+  if (special == SCANNER_SPECIAL_SKIP) {
+    scanner_note_nonreg(&scanner->options, file->path);
+    free(rel_copy);
+    file_destroy(file);
+    return SCANNER_ACTION_CONTINUE;
+  }
+  if (scanner->options.hardlinks && S_ISREG(stats.st_mode))
+    scanner_assign_hardlink(scanner, scanner->options.hardlinks, file, &stats);
+  if (scanner->options.use_metadata)
+    file->metadata = file_metadata_create(file->path, &stats, scanner->options.preserve_atimes,
+                                          scanner->options.preserve_crtimes);
+  if (scanner->options.use_metadata && !file->metadata) {
+    free(rel_copy);
+    file_destroy(file);
+    scanner->failed = true;
+    return SCANNER_ACTION_BREAK;
+  }
+  if (!(file->link_group != 0 && !file->link_first))
+    scanner_capture_xattrs(scanner, file);
+  if (!array_list_add(chunk_data, file)) {
+    free(rel_copy);
+    file_destroy(file);
+    scanner->failed = true;
+    return SCANNER_ACTION_BREAK;
+  }
+  scanner->current_dir_produced = true;
+  *chunk_data_size += file->data->size;
+  if (*chunk_data_size > scanner->options.chunk_size) {
+    free(rel_copy);
+    Chunk* result = chunk_data_to_chunk(chunk_data);
+    if (!result)
+      scanner->failed = true;
+    *out_chunk = result;
+    return SCANNER_ACTION_CHUNK;
+  }
+  free(rel_copy);
+  return SCANNER_ACTION_CONTINUE;
+}
+
 Chunk* directory_scanner_next(DirectoryScanner* scanner) {
   if (scanner && scanner->options.dirs)
     return directory_scanner_next_dirs(scanner);
@@ -1415,261 +1198,30 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         break;
     }
 
-    const struct dirent* entry = readdir(scanner->current_dir);
-    if (entry == NULL) {
-      /* The directory is exhausted: if nothing was transferred or descended
-         from it, recreate it at the destination as an explicit entry. */
-      if (scanner->options.emit_empty_dirs && !scanner->current_dir_produced &&
-          !scanner->options.prune_empty_dirs && !scanner->options.list_dirs &&
-          scanner->options.file_list == NULL) {
-        if (!scanner_emit_empty_dir(scanner, chunk_data))
-          scanner->failed = true;
-      }
-      closedir(scanner->current_dir);
-      scanner->current_dir = NULL;
-      free(scanner->current_path);
-      scanner->current_path = NULL;
-      if (scanner->failed) {
+    if (scanner->sorted_index >= scanner->sorted_count) {
+      if (!scanner_finish_current_directory(scanner, chunk_data)) {
         array_list_delete(chunk_data);
         return NULL;
       }
       continue;
     }
 
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
+    SortedEntry* sorted = &((SortedEntry*)scanner->sorted_entries)[scanner->sorted_index++];
+    int inspection = sorted->inspection;
 
-    ScannerEntry inspected;
-    char* link_rel = child_rel_path(scanner->current_rel, entry->d_name);
-    if (!link_rel) {
-      scanner->failed = true;
-      break;
-    }
-    int inspection = scanner_inspect_entry(&scanner->options, scanner->current_path, link_rel,
-                                           entry->d_name, &inspected);
-    free(link_rel);
-    if (inspection < 0) {
-      scanner->failed = true;
-      break;
-    }
     if (inspection == 0) {
-      /* A dereferenced symlink with no referent is a partial-transfer error
-         (rsync exit 23): record it as a non-fatal scan I/O error. */
-      if (inspected.referent_error)
-        scanner->io_error = true;
-      /* A user-selection exclude protects its destination mirror from --delete
-         unless --delete-excluded; a size prune is always protected.  Other
-         skips (unreadable, symlink policy) protect nothing.  Under -R +
-         --files-from the protected prefix must be the entry's bare relative
-         wire path, not its source path (which would not match the destination
-         layout and would leave the mirror deletable). */
-      if (inspected.excluded) {
-        char* protected_path;
-        if (scanner->relative_mode) {
-          protected_path = child_rel_path(scanner->current_rel, entry->d_name);
-        } else if (scanner->options.relative_prefix) {
-          char* relc = child_rel_path(scanner->current_rel, entry->d_name);
-          protected_path =
-              relc ? scanner_prefix_send_path(scanner->options.relative_prefix, relc) : NULL;
-          free(relc);
-        } else {
-          protected_path = path_cat(scanner->current_path, entry->d_name);
-        }
-        if (!protected_path) {
-          scanner->failed = true;
-          break;
-        }
-        if (inspected.size_excluded)
-          scanner_record_size_skipped(scanner, protected_path);
-        else
-          scanner_record_excluded(scanner, protected_path);
-        free(protected_path);
-      }
-      continue;
-    }
-    char* cur_path = inspected.path;
-    struct stat stats = inspected.stats;
-
-    /* --files-from allow-set and the filter layer apply to files and to
-     * directories (an excluded directory is not descended into). */
-    bool is_dir = inspected.is_directory;
-    char* rel = child_rel_path(scanner->current_rel, entry->d_name);
-    if (!rel) {
-      free(cur_path);
-      scanner->failed = true;
-      break;
-    }
-    bool protect = false;
-    bool passes_selection = entry_passes_selection(
-        scanner->options.file_list, scanner->options.base_filters, scanner->current_node, rel,
-        entry->d_name, is_dir, scanner->options.per_dir_filters,
-        scanner->options.exclude_per_dir_filter_files, &protect);
-    /* A sender-side hide leaves the entry out of the transfer; an independent
-       receiver-side protect rule keeps a transferred entry's destination mirror
-       from being deleted.  Both are recorded in the same protection set. */
-    if (!passes_selection || protect) {
-      /* --files-from subset pruning is not a filter exclusion: its delete
-         semantics stay keep-set-only (an unlisted source path is treated as
-         absent, so its destination mirror is a deletable extra).  A rule-based
-         exclusion is recorded as a protected prefix.  -R + --files-from bare
-         wire paths are never recorded (see ScannerOptions.excluded_paths). */
-      bool files_from_prune =
-          scanner->options.file_list && !file_list_affects(scanner->options.file_list, rel);
-      if (protect && scanner->relative_mode) {
-        /* -R + --files-from: the destination/wire path is the bare relative
-           name, so the protected mirror prefix must be `rel` (not the source
-           path) for the delete walker to match it. */
-        scanner_record_excluded(scanner, rel);
-      } else if (!files_from_prune && !scanner->relative_mode) {
-        if (scanner->options.relative_prefix) {
-          char* wrel = scanner_prefix_send_path(scanner->options.relative_prefix, rel);
-          if (!wrel) {
-            free(rel);
-            free(cur_path);
-            scanner->failed = true;
-            break;
-          }
-          scanner_record_excluded(scanner, wrel);
-          free(wrel);
-        } else {
-          scanner_record_excluded(scanner, cur_path);
-        }
-      }
-    }
-    /* With -R the wire/destination path is a reconstructed relative path, not
-       the source path; keep `rel` alive to build it for a transferred file. */
-    bool needs_rel = scanner->relative_mode || scanner->options.relative_prefix != NULL;
-    char* rel_copy = needs_rel ? str_dup(rel) : NULL;
-    free(rel);
-    if (rel_copy == NULL && needs_rel) {
-      free(cur_path);
-      scanner->failed = true;
-      break;
-    }
-    if (!passes_selection) {
-      free(rel_copy);
-      free(cur_path);
+      if (scanner_handle_skipped_entry(scanner, &sorted->entry, sorted->name) != 0)
+        break;
       continue;
     }
 
-    if (is_dir) {
-      free(rel_copy);
-      if (!scanner_same_filesystem(scanner->options.one_file_system, scanner->root_dev,
-                                   stats.st_dev)) {
-        /* rsync's -x/--one-file-system emits the mount-point directory entry
-           itself (so the destination gets an empty directory) but does NOT
-           descend into it.  Build a payload-less directory File and hand it to
-           the caller; never enqueue it for traversal. */
-        File* mount = scanner_build_dir_file(cur_path, &stats, &scanner->options);
-        if (mount == NULL || !array_list_add(chunk_data, mount)) {
-          file_destroy(mount);
-          free(cur_path);
-          scanner->failed = true;
-          break;
-        }
-        scanner->current_dir_produced = true;
-        free(cur_path);
-        continue;
-      }
-      /* --list-only: list directory entries too (rsync prints them), even
-         though a real transfer never sends them explicitly. */
-      if (scanner->options.list_dirs) {
-        File* dir = scanner_build_dir_file(cur_path, &stats, &scanner->options);
-        if (dir == NULL || !array_list_add(chunk_data, dir)) {
-          file_destroy(dir);
-          free(cur_path);
-          scanner->failed = true;
-          break;
-        }
-      }
-      scanner->current_dir_produced = true;
-      int next_depth = scanner->current_depth + 1;
-      if (scanner->options.max_depth <= 0 || next_depth < scanner->options.max_depth) {
-        DirEntry* de = dir_entry_create(cur_path, next_depth, scanner->current_node);
-        if (!de || !queue_enqueue(scanner->directories, de)) {
-          dir_entry_destroy(de);
-          scanner->failed = true;
-        }
-      }
-      free(cur_path);
-    } else {
-      if (scanner->options.max_depth > 0 &&
-          scanner->current_depth + 1 > scanner->options.max_depth) {
-        free(rel_copy);
-        free(cur_path);
-        continue;
-      }
-      File* file = file_create(cur_path);
-      free(cur_path);
-      if (file == NULL) {
-        free(rel_copy);
-        free(inspected.link_target);
-        inspected.link_target = NULL;
-        scanner->failed = true;
-        continue;
-      }
-      if (inspected.is_symlink) {
-        file->is_symlink = true;
-        file->symlink_target = inspected.link_target;
-        inspected.link_target = NULL;
-      } else {
-        file->data->size = stats.st_size;
-      }
-      if (scanner->relative_mode) {
-        file->send_path = rel_copy;
-        rel_copy = NULL;
-      } else if (scanner->options.relative_prefix) {
-        file->send_path = scanner_prefix_send_path(scanner->options.relative_prefix, rel_copy);
-        free(rel_copy);
-        rel_copy = NULL;
-        if (!file->send_path) {
-          file_destroy(file);
-          scanner->failed = true;
-          break;
-        }
-      }
-      /* --devices/--specials: a device/FIFO/socket entry marked for preservation
-         becomes a node to recreate (is_special, no data, rdev captured); an
-         unrequested non-regular entry is skipped (rsync default). */
-      ScannerSpecial special = scanner_prepare_special(scanner->options.preserve_devices,
-                                                       scanner->options.preserve_specials,
-                                                       scanner->options.copy_devices, file, &stats);
-      if (special == SCANNER_SPECIAL_SKIP) {
-        scanner_note_nonreg(&scanner->options, file->path);
-        free(rel_copy);
-        file_destroy(file);
-        continue;
-      }
-      if (scanner->options.hardlinks && S_ISREG(stats.st_mode))
-        scanner_assign_hardlink(scanner, scanner->options.hardlinks, file, &stats);
-      if (scanner->options.use_metadata)
-        file->metadata = file_metadata_create(file->path, &stats, scanner->options.preserve_atimes,
-                                              scanner->options.preserve_crtimes);
-      if (scanner->options.use_metadata && !file->metadata) {
-        free(rel_copy);
-        file_destroy(file);
-        scanner->failed = true;
-        break;
-      }
-      if (!(file->link_group != 0 && !file->link_first))
-        scanner_capture_xattrs(scanner, file);
-      if (!array_list_add(chunk_data, file)) {
-        free(rel_copy);
-        file_destroy(file);
-        scanner->failed = true;
-        break;
-      }
-      scanner->current_dir_produced = true;
-      chunk_data_size += file->data->size;
-      if (chunk_data_size > scanner->options.chunk_size) {
-        free(rel_copy);
-        Chunk* result = chunk_data_to_chunk(chunk_data);
-        if (!result)
-          scanner->failed = true;
-        return result;
-      }
-      free(rel_copy);
-    }
+    Chunk* result = NULL;
+    ScannerAction action =
+        scanner_process_entry(scanner, chunk_data, &chunk_data_size, sorted, &result);
+    if (action == SCANNER_ACTION_CHUNK)
+      return result;
+    if (action == SCANNER_ACTION_BREAK)
+      break;
   }
 
   if (chunk_data->size > 0) {
@@ -1688,674 +1240,4 @@ bool directory_scanner_failed(const DirectoryScanner* scanner) {
 
 bool directory_scanner_had_io_error(const DirectoryScanner* scanner) {
   return scanner != NULL && (scanner->io_error || scanner->root_io_error);
-}
-
-typedef struct {
-  ParallelScanner* ps;
-  char** dirs;
-  int dir_count;
-  char* root_dir; /* the transfer root, for relative-path computation */
-  ScannerOptions options;
-  ProtocolSession* allocation_session;
-} ParallelWorkerArg;
-
-static int parallel_worker_thread(void* arg) {
-  ParallelWorkerArg* wa = (ParallelWorkerArg*)arg;
-  ProtocolSession* allocation_session = wa->allocation_session;
-  if (allocation_session)
-    protocol_session_bind(allocation_session);
-  for (int i = 0; i < wa->dir_count; i++) {
-    DirectoryScanner* ds = directory_scanner_create_with_options(wa->dirs[i], &wa->options);
-    if (!ds) {
-      mtx_lock(&wa->ps->result_mutex);
-      wa->ps->failed = true;
-      atomic_store(&wa->ps->cancelled, true);
-      cnd_broadcast(&wa->ps->result_not_empty);
-      cnd_broadcast(&wa->ps->result_not_full);
-      mtx_unlock(&wa->ps->result_mutex);
-      for (int j = i; j < wa->dir_count; j++)
-        free(wa->dirs[j]);
-      break;
-    }
-    /* Root .rsync-filter rules (parsed by the parallel scanner) apply to the
-     * contents of every assigned subdirectory. Relative paths (used by the
-     * allow-set and per-directory rules) are computed against the transfer
-     * root, not the subdirectory the worker is seeded with.  Exclusion
-     * recording shares one caller-owned list across the workers. */
-    free(ds->root_path);
-    ds->root_path = str_dup(wa->root_dir);
-    ds->seed_node = wa->ps->root_filter_node;
-    ds->options.excluded_mutex = &wa->ps->result_mutex;
-    Chunk* chunk;
-    while ((chunk = directory_scanner_next(ds)) != NULL) {
-      if (!queue_enqueue_multithreaded_cancel(wa->ps->result_queue, chunk, &wa->ps->result_mutex,
-                                              &wa->ps->result_not_empty, &wa->ps->result_not_full,
-                                              &wa->ps->cancelled)) {
-        chunk_destroy(chunk);
-        break;
-      }
-    }
-    if (directory_scanner_failed(ds)) {
-      mtx_lock(&wa->ps->result_mutex);
-      wa->ps->failed = true;
-      atomic_store(&wa->ps->cancelled, true);
-      cnd_broadcast(&wa->ps->result_not_empty);
-      cnd_broadcast(&wa->ps->result_not_full);
-      mtx_unlock(&wa->ps->result_mutex);
-    } else if (directory_scanner_had_io_error(ds)) {
-      /* --ignore-errors path: an unreadable directory was skipped, not fatal. */
-      mtx_lock(&wa->ps->result_mutex);
-      wa->ps->io_error = true;
-      mtx_unlock(&wa->ps->result_mutex);
-    }
-    directory_scanner_destroy(ds);
-    free(wa->dirs[i]);
-  }
-  ParallelScanner* ps = wa->ps;
-  free(wa->root_dir);
-  free(wa->dirs);
-  free(wa);
-  mtx_lock(&ps->result_mutex);
-  ps->completed++;
-  if (ps->completed >= ps->expected_threads) {
-    ps->done = true;
-    cnd_signal(&ps->result_not_empty);
-  }
-  mtx_unlock(&ps->result_mutex);
-  if (allocation_session)
-    protocol_session_unbind();
-  return thrd_success;
-}
-
-static void parallel_scanner_creation_failed(ParallelScanner* ps) {
-  mtx_lock(&ps->result_mutex);
-  ps->failed = true;
-  atomic_store(&ps->cancelled, true);
-  ps->expected_threads = ps->created_threads;
-  if (ps->completed >= ps->expected_threads)
-    ps->done = true;
-  cnd_broadcast(&ps->result_not_empty);
-  cnd_broadcast(&ps->result_not_full);
-  mtx_unlock(&ps->result_mutex);
-}
-
-/* Initialize result queue and synchronization primitives. Returns true on success. */
-static bool parallel_scanner_init(ParallelScanner* ps) {
-  ps->result_queue = queue_create(100, chunk_destroy);
-  if (!ps->result_queue)
-    return false;
-  atomic_init(&ps->cancelled, false);
-  int init = 0;
-  bool ok = true;
-  if (mtx_init(&ps->result_mutex, mtx_plain) != thrd_success)
-    ok = false;
-  if (ok) {
-    init++;
-    if (cnd_init(&ps->result_not_empty) != thrd_success)
-      ok = false;
-  }
-  if (ok) {
-    // cppcheck-suppress unreadVariable
-    init++;
-    if (cnd_init(&ps->result_not_full) != thrd_success)
-      ok = false;
-  }
-  if (!ok) {
-    if (init >= 3)
-      cnd_destroy(&ps->result_not_full);
-    if (init >= 2)
-      cnd_destroy(&ps->result_not_empty);
-    if (init >= 1)
-      mtx_destroy(&ps->result_mutex);
-    queue_destroy(ps->result_queue);
-    ps->result_queue = NULL;
-    return false;
-  }
-  return true;
-}
-
-/* Split files into chunks of roughly chunk_size bytes. Returns the first chunk (also stored
- * chunks beyond the first are enqueued on `queue`). Nulls out consumed entries in `files`.
- * Sets *failed on allocation/enqueue errors. */
-static Chunk* batch_files(ArrayList* files, unsigned long long chunk_size, Queue* queue,
-                          bool* failed) {
-  Chunk* first = NULL;
-  if (files->size <= 0)
-    return NULL;
-  ArrayList* batch = array_list_create(NULL);
-  if (!batch) {
-    *failed = true;
-    return NULL;
-  }
-  unsigned long long batch_size = 0;
-  for (int i = 0; i < files->size; i++) {
-    File* f = (File*)files->items[i];
-    if (!array_list_add(batch, f)) {
-      *failed = true;
-      break;
-    }
-    batch_size += f->data->size;
-    if (batch_size >= chunk_size || i == files->size - 1) {
-      void** items = array_list_to_array(batch);
-      if (!items) {
-        *failed = true;
-        array_list_delete(batch);
-        batch = NULL;
-        break;
-      }
-      Chunk* c = chunk_create((File**)items, batch->size);
-      free(items);
-      if (!c) {
-        *failed = true;
-        array_list_delete(batch);
-        batch = NULL;
-        break;
-      }
-      int batch_start = i - batch->size + 1;
-      for (int j = batch_start; j <= i; j++)
-        files->items[j] = NULL;
-      batch->item_destroyer = NULL;
-      array_list_delete(batch);
-      batch = NULL;
-      if (!first) {
-        first = c;
-      } else {
-        if (!queue_enqueue(queue, c)) {
-          chunk_destroy(c);
-          *failed = true;
-        }
-      }
-      if (i < files->size - 1) {
-        batch = array_list_create(NULL);
-        if (!batch) {
-          *failed = true;
-          break;
-        }
-        batch_size = 0;
-      }
-    }
-  }
-  if (batch) {
-    batch->item_destroyer = NULL;
-    array_list_delete(batch);
-  }
-  return first;
-}
-
-/* Scan one root-directory entry into either the subdirs or files list. */
-static void scan_root_entry(const ScannerOptions* options, const FilterNode* root_node,
-                            const char* root_directory, const struct dirent* entry,
-                            ArrayList* root_files, ArrayList* subdirs, dev_t root_dev,
-                            ParallelScanner* ps) {
-  ScannerEntry inspected;
-  int inspection =
-      scanner_inspect_entry(options, root_directory, entry->d_name, entry->d_name, &inspected);
-  if (inspection < 0) {
-    ps->failed = true;
-    return;
-  }
-  if (inspection == 0) {
-    if (inspected.referent_error)
-      ps->io_error = true;
-    ArrayList* sink = NULL;
-    if (inspected.excluded)
-      sink = inspected.size_excluded ? options->size_skipped_paths : options->excluded_paths;
-    if (sink) {
-      /* A root-level prune protects the destination mirror of the entry's wire
-         path: under -R + --files-from that is the bare relative name, otherwise
-         it is the full source path with a leading '/' removed (matching the
-         send_path/file_wire_path the scanner hands the sender). */
-      if (options->relative && options->file_list != NULL) {
-        if (!excluded_sink_append(sink, options->excluded_mutex, entry->d_name))
-          ps->failed = true;
-      } else if (options->relative_prefix) {
-        char* wrel = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
-        if (!wrel) {
-          ps->failed = true;
-        } else {
-          if (!excluded_sink_append(sink, options->excluded_mutex, wrel))
-            ps->failed = true;
-          free(wrel);
-        }
-      } else {
-        char* abs_path = path_cat(root_directory, entry->d_name);
-        if (!abs_path) {
-          ps->failed = true;
-        } else {
-          const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
-          if (!excluded_sink_append(sink, options->excluded_mutex, rel))
-            ps->failed = true;
-          free(abs_path);
-        }
-      }
-    }
-    return;
-  }
-  char* cur_path = inspected.path;
-  struct stat st = inspected.stats;
-  bool is_dir = inspected.is_directory;
-  char* rel = str_dup(entry->d_name);
-  if (!rel) {
-    free(cur_path);
-    ps->failed = true;
-    return;
-  }
-  bool protect = false;
-  bool passes = entry_passes_selection(options->file_list, options->base_filters, root_node, rel,
-                                       entry->d_name, is_dir, options->per_dir_filters,
-                                       options->exclude_per_dir_filter_files, &protect);
-  /* -R + --files-from: root-level files keep their bare relative send path. */
-  bool use_rel = options->relative && options->file_list != NULL;
-  if (!passes || protect) {
-    /* --files-from subset pruning is not a filter exclusion; -R bare-wire-path
-       exclusions are never recorded (see ScannerOptions.excluded_paths). */
-    bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
-    if ((!files_from_prune && !use_rel) || protect) {
-      const char* rel_path;
-      char* prefixed = NULL;
-      if (use_rel) {
-        /* -R + --files-from: the destination/wire path is the bare relative
-           name, not the source path. */
-        rel_path = rel;
-      } else if (options->relative_prefix) {
-        prefixed = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
-        if (!prefixed) {
-          free(rel);
-          free(cur_path);
-          ps->failed = true;
-          return;
-        }
-        rel_path = prefixed;
-      } else {
-        rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
-      }
-      if (options->excluded_paths &&
-          !excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
-        ps->failed = true;
-      free(prefixed);
-    }
-    if (!passes) {
-      free(rel);
-      free(cur_path);
-      return;
-    }
-  }
-  if (is_dir) {
-    if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
-      /* -x/--one-file-system: emit the mount-point directory entry (empty) but
-         do not descend into it (see the sequential scanner for the same rule). */
-      File* mount = file_create(cur_path);
-      free(cur_path);
-      if (mount == NULL) {
-        free(rel);
-        ps->failed = true;
-        return;
-      }
-      mount->is_dir = true;
-      if (options->use_metadata) {
-        mount->metadata = file_metadata_create(mount->path, &st, options->preserve_atimes,
-                                               options->preserve_crtimes);
-        if (!mount->metadata) {
-          free(rel);
-          file_destroy(mount);
-          ps->failed = true;
-          return;
-        }
-      }
-      if (options->relative_prefix) {
-        mount->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
-        if (!mount->send_path) {
-          free(rel);
-          file_destroy(mount);
-          ps->failed = true;
-          return;
-        }
-      }
-      free(rel);
-      if (!array_list_add(root_files, mount)) {
-        file_destroy(mount);
-        ps->failed = true;
-      }
-      return;
-    }
-    free(rel);
-    if (!array_list_add(subdirs, cur_path)) {
-      free(cur_path);
-      ps->failed = true;
-    }
-    return;
-  }
-  File* file = file_create(cur_path);
-  free(cur_path);
-  if (!file) {
-    free(rel);
-    free(inspected.link_target);
-    inspected.link_target = NULL;
-    ps->failed = true;
-    return;
-  }
-  if (inspected.is_symlink) {
-    file->is_symlink = true;
-    file->symlink_target = inspected.link_target;
-    inspected.link_target = NULL;
-  } else {
-    file->data->size = st.st_size;
-  }
-  if (use_rel) {
-    file->send_path = rel;
-    rel = NULL;
-  } else if (options->relative_prefix) {
-    file->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
-    free(rel);
-    rel = NULL;
-    if (!file->send_path) {
-      file_destroy(file);
-      ps->failed = true;
-      return;
-    }
-  }
-  ScannerSpecial special = scanner_prepare_special(
-      options->preserve_devices, options->preserve_specials, options->copy_devices, file, &st);
-  if (special == SCANNER_SPECIAL_SKIP) {
-    scanner_note_nonreg(ps->options, file->path);
-    free(rel);
-    file_destroy(file);
-    return;
-  }
-  if (options->hardlinks && S_ISREG(st.st_mode)) {
-    int gid;
-    bool is_first;
-    char* first_path = NULL;
-    if (!hardlink_table_assign((HardLinkTable*)options->hardlinks, file_wire_path(file), st.st_dev,
-                               st.st_ino, &gid, &is_first, &first_path)) {
-      ps->failed = true;
-    } else {
-      file->link_group = gid;
-      file->link_first = is_first;
-      if (!is_first) {
-        file->hardlink_target = first_path;
-        file->data->size = 0;
-      } else {
-        free(first_path);
-      }
-    }
-  }
-  if (options->use_metadata)
-    file->metadata =
-        file_metadata_create(file->path, &st, options->preserve_atimes, options->preserve_crtimes);
-  if (options->use_metadata && !file->metadata) {
-    free(rel);
-    file_destroy(file);
-    ps->failed = true;
-    return;
-  }
-  if ((options->preserve_xattrs || options->preserve_acls) &&
-      !(file->link_group != 0 && !file->link_first))
-    file->xattrs = xattr_capture_path(file->path, options->preserve_acls);
-  if (!array_list_add(root_files, file)) {
-    free(rel);
-    file_destroy(file);
-    ps->failed = true;
-    return;
-  }
-  free(rel);
-}
-
-/* Scan the root directory itself, collecting root files and subdirectories.
- * Returns false if the root directory could not be opened. */
-static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
-                                const ScannerOptions* options, const FilterNode* root_node,
-                                dev_t root_dev, ArrayList* root_files, ArrayList* subdirs) {
-  DIR* dir = opendir(root_directory);
-  if (!dir) {
-    log_perror("Could not open root directory for parallel scan");
-    return false;
-  }
-  /* The parallel scanner opens the transfer root directly (not through
-     open_next_directory), so record it as synchronized here. */
-  if (!scanner_record_synced_dir(options, root_directory, "",
-                                 options->relative && options->file_list != NULL)) {
-    closedir(dir);
-    ps->failed = true;
-    return false;
-  }
-  const struct dirent* entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
-    scan_root_entry(options, root_node, root_directory, entry, root_files, subdirs, root_dev, ps);
-  }
-  closedir(dir);
-  return true;
-}
-
-/* Spawn worker threads, one per group of subdirectories. */
-static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
-                                   const ScannerOptions* options, const char* root_directory,
-                                   unsigned long long cs) {
-  if (subdirs->size <= 0)
-    return;
-  int n = options->num_threads > 0 ? options->num_threads : 4;
-  if (n > subdirs->size)
-    n = subdirs->size;
-
-  ps->num_threads = n;
-  ps->expected_threads = n;
-  ps->threads = calloc(n, sizeof(thrd_t));
-  if (!ps->threads) {
-    ps->num_threads = 0;
-    ps->expected_threads = 0;
-    ps->failed = true;
-    return;
-  }
-  int dirs_per_thread = subdirs->size / n;
-  int remainder = subdirs->size % n;
-  int start = 0;
-  ps->num_threads = 0;
-  for (int t = 0; t < n; t++) {
-    int count = dirs_per_thread + (t < remainder ? 1 : 0);
-    if (count == 0)
-      break;
-    ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
-    if (!wa) {
-      parallel_scanner_creation_failed(ps);
-      break;
-    }
-    wa->ps = ps;
-    wa->dirs = calloc(count, sizeof(char*));
-    wa->root_dir = str_dup(root_directory);
-    if (!wa->dirs || !wa->root_dir) {
-      free(wa->root_dir);
-      free(wa->dirs);
-      free(wa);
-      parallel_scanner_creation_failed(ps);
-      break;
-    }
-    bool dup_ok = true;
-    for (int j = 0; j < count; j++) {
-      wa->dirs[j] = str_dup((char*)subdirs->items[start + j]);
-      if (!wa->dirs[j])
-        dup_ok = false;
-    }
-    if (!dup_ok) {
-      for (int j = 0; j < count; j++)
-        free(wa->dirs[j]);
-      free(wa->root_dir);
-      free(wa->dirs);
-      free(wa);
-      parallel_scanner_creation_failed(ps);
-      break;
-    }
-    wa->dir_count = count;
-    wa->options = *options;
-    wa->options.chunk_size = cs;
-    wa->allocation_session = ps->allocation_session;
-    start += count;
-    if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
-      for (int j = 0; j < count; j++)
-        free(wa->dirs[j]);
-      free(wa->root_dir);
-      free(wa->dirs);
-      free(wa);
-      parallel_scanner_creation_failed(ps);
-      break;
-    }
-    ps->num_threads++;
-    ps->created_threads++;
-  }
-}
-
-ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
-                                                      const ScannerOptions* options,
-                                                      ProtocolSession* allocation_session) {
-  if (!root_directory || !options)
-    return NULL;
-  ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
-  if (!ps)
-    return NULL;
-  if (!parallel_scanner_init(ps)) {
-    free(ps);
-    return NULL;
-  }
-  ps->allocation_session = allocation_session;
-  ps->options = options;
-
-  ArrayList* root_files = array_list_create(file_destroy);
-  ArrayList* subdirs = array_list_create(free);
-  if (!root_files || !subdirs) {
-    array_list_delete(root_files);
-    array_list_delete(subdirs);
-    parallel_scanner_destroy(ps);
-    return NULL;
-  }
-
-  dev_t root_dev = 0;
-  if (options->one_file_system) {
-    struct stat root_stats;
-    if (stat(root_directory, &root_stats) != 0) {
-      log_perror("Could not stat source directory");
-      array_list_delete(root_files);
-      array_list_delete(subdirs);
-      parallel_scanner_destroy(ps);
-      return NULL;
-    }
-    root_dev = root_stats.st_dev;
-  }
-
-  /* Build the root directory's per-directory filter context once; workers seed
-   * their scanners with it so per-dir rules behave identically to the sequential
-   * scanner. */
-  FilterNode* root_node = NULL;
-  {
-    char err[256];
-    bool any_exists = false;
-    FilterRuleList* own =
-        read_dir_filters(options, root_directory, "", &any_exists, err, sizeof(err));
-    if (!own) {
-      /* A parse/allocation failure must fail the scan even when an earlier
-         merge file in the same directory existed (see the sequential scanner). */
-      if (err[0] != '\0') {
-        log_message(LOG_LEVEL_ERROR, "invalid per-directory filter in %s: %s", root_directory, err);
-        array_list_delete(root_files);
-        array_list_delete(subdirs);
-        parallel_scanner_destroy(ps);
-        return NULL;
-      }
-      /* no files exist: leave root_node NULL */
-    } else if (any_exists && (own->count > 0 || own->dir_merge_count > 0)) {
-      root_node = filter_node_alloc(NULL, own);
-      if (!root_node) {
-        filter_rule_list_free(own);
-        array_list_delete(root_files);
-        array_list_delete(subdirs);
-        parallel_scanner_destroy(ps);
-        return NULL;
-      }
-    } else {
-      filter_rule_list_free(own);
-    }
-  }
-  ps->root_filter_node = root_node;
-
-  if (!scan_root_directory(ps, root_directory, options, root_node, root_dev, root_files, subdirs)) {
-    array_list_delete(root_files);
-    array_list_delete(subdirs);
-    parallel_scanner_destroy(ps);
-    return NULL;
-  }
-  /* P7 Wave D: the parallel scanner never runs a DirectoryScanner over the
-     transfer root itself (it hands the root's immediate subdirectories to
-     workers), so capture the root's directory time here. */
-  if (options->capture_dir_times &&
-      !scanner_capture_dir_time(
-          options->dir_entries, options->dir_entries_mutex, root_directory, root_directory,
-          options->relative && options->file_list != NULL, options->relative_prefix,
-          options->preserve_atimes, options->preserve_crtimes, options->preserve_xattrs,
-          options->preserve_acls, options->no_implied_dirs, options->file_list)) {
-    array_list_delete(root_files);
-    array_list_delete(subdirs);
-    parallel_scanner_destroy(ps);
-    return NULL;
-  }
-
-  unsigned long long cs = options->chunk_size > 0 ? options->chunk_size : DESIRED_CHUNK_SIZE;
-  ps->initial_chunk = batch_files(root_files, cs, ps->result_queue, &ps->failed);
-  array_list_delete(root_files);
-
-  spawn_parallel_workers(ps, subdirs, options, root_directory, cs);
-  array_list_delete(subdirs);
-  return ps;
-}
-
-Chunk* parallel_scanner_next(ParallelScanner* ps) {
-  if (ps->initial_chunk) {
-    Chunk* c = ps->initial_chunk;
-    ps->initial_chunk = NULL;
-    return c;
-  }
-  if (ps->num_threads == 0) {
-    mtx_lock(&ps->result_mutex);
-    if (!queue_is_empty(ps->result_queue)) {
-      Chunk* chunk = queue_dequeue(ps->result_queue);
-      mtx_unlock(&ps->result_mutex);
-      return chunk;
-    }
-    ps->done = true;
-    mtx_unlock(&ps->result_mutex);
-    return NULL;
-  }
-  Chunk* chunk = queue_dequeue_multithreaded(
-      ps->result_queue, &ps->result_mutex, &ps->result_not_empty, &ps->result_not_full, &ps->done);
-  return chunk;
-}
-
-bool parallel_scanner_failed(const ParallelScanner* ps) {
-  return ps == NULL || ps->failed;
-}
-
-bool parallel_scanner_had_io_error(const ParallelScanner* ps) {
-  return ps != NULL && ps->io_error;
-}
-
-void parallel_scanner_destroy(ParallelScanner* ps) {
-  if (!ps)
-    return;
-  mtx_lock(&ps->result_mutex);
-  ps->done = true;
-  atomic_store(&ps->cancelled, true);
-  cnd_broadcast(&ps->result_not_empty);
-  cnd_broadcast(&ps->result_not_full);
-  mtx_unlock(&ps->result_mutex);
-  for (int i = 0; i < ps->num_threads; i++)
-    thrd_join(ps->threads[i], NULL);
-  free(ps->threads);
-  if (ps->root_filter_node)
-    filter_node_destroy(ps->root_filter_node);
-  if (ps->initial_chunk)
-    chunk_destroy(ps->initial_chunk);
-  queue_destroy(ps->result_queue);
-  mtx_destroy(&ps->result_mutex);
-  cnd_destroy(&ps->result_not_empty);
-  cnd_destroy(&ps->result_not_full);
-  free(ps);
 }
