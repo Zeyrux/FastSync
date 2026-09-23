@@ -134,6 +134,11 @@ typedef struct {
      deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
      exit 25 like rsync.  Read by the caller after the sender thread is joined. */
   bool delete_limit;
+  /* Set by the sender thread when the receiver reported STATUS_PARTIAL (a
+     per-entry receiver failure that did not abort the stream): the transfer
+     otherwise succeeded, successfully stored --remove-source-files sources were
+     removed, and the process must exit 23 like rsync.  Read after join. */
+  bool partial;
 } PipelineContextSender;
 
 /* `config` is borrowed and must outlive the context: destroy does NOT free it,

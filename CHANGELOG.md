@@ -6,6 +6,20 @@ run the same version because the handshake is strict.
 
 ## [Unreleased]
 
+Wire backlog cycle (protocol 2.29.0 → 2.30.0; config-frame layout unchanged).
+
+- **`--stderr=client` client-message channel (#313):** the client now accepts
+  `--stderr=client` (and maps the deprecated `--no-msgs2stderr` to it), routing
+  its own diagnostics over the new bounded `STATUS_CLIENT_MSG` client->server
+  frame instead of writing them locally; the server writes each received
+  message to its stderr (respecting the server log destination).  `errors`/`all`
+  behavior is unchanged.
+- **Receiver partial failures exit 23 (#320):** a per-entry receiver failure
+  that does not abort the stream (e.g. an unprivileged `--devices` mknod) now
+  sends the terminal `STATUS_PARTIAL`; the client exits 23 like rsync and, under
+  `--remove-source-files`, still removes the sources it successfully
+  transferred.  A clean run stays 0 and a fatal/connection error stays non-23.
+
 ## [2.29.0] - 2026-09-23
 
 The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).

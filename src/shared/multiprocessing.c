@@ -53,6 +53,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->dir_entries_mutex_init = false;
   atomic_init(&context->dir_count, 0);
   context->delete_limit = false;
+  context->partial = false;
   int init = 0;
   if (config->use_metadata) {
     context->dir_entries = array_list_create(file_destroy);

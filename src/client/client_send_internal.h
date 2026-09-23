@@ -72,6 +72,13 @@ void client_progress_uptodate(const Config* config, const File* file);
 void client_progress_prepare(const Config* config, const ArrayList* plan_dirs,
                              unsigned long long plan_non_dir_count);
 bool receive_stats_record(int fd, ReceiverStats* stats, ArrayList* would_delete);
+/* --stderr=client diagnostic channel (client_report.c): install the queueing
+ * log sink for a transfer, mark the session live, flush queued diagnostics over
+ * the wire at a frame boundary, and tear the sink down. */
+void client_messages_install(void);
+void client_messages_activate(bool active);
+void client_flush_client_messages(int fd);
+void client_messages_end(void);
 
 /* client_send.c */
 void receive_daemon_motd(Client* client, const Config* config);

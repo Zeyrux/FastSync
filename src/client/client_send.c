@@ -127,6 +127,11 @@ Client* connect_transfer_client(const Config* config) {
 void disconnect_transfer_client(Client* client) {
   if (!client)
     return;
+  /* --stderr=client: push any diagnostics logged during the transfer to the
+     peer before the socket closes; once deactivated, later messages fall back
+     to local output instead of being lost. */
+  client_flush_client_messages(client->file_descriptor);
+  client_messages_activate(false);
   client_disconnect(client);
   client_delete(client);
 }
@@ -240,11 +245,16 @@ static void mark_sender_done(PipelineContextSender* context) {
    When --remove-source-files is active the receiver acknowledges each data
    file it processed, in send order: STATUS_NEXT means the file was written,
    STATUS_OK means the file was skipped/unchanged.  Skipped sources are marked
-   so the later removal pass keeps them. */
+   so the later removal pass keeps them.  `partial_out` is set when the receiver
+   reported STATUS_PARTIAL (a per-entry receiver failure): the transfer is
+   otherwise complete, so successfully stored sources are still removed and the
+   caller exits 23 (rsync's partial transfer) instead of a fatal non-zero. */
 static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources,
-                              bool* delete_limit_out, ReceiverStats* stats_out) {
+                              bool* delete_limit_out, bool* partial_out, ReceiverStats* stats_out) {
   if (delete_limit_out)
     *delete_limit_out = false;
+  if (partial_out)
+    *partial_out = false;
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     return false;
   /* The receiver emits its optional wire-stats frame (protocol 2.25.0) FIRST,
@@ -296,6 +306,16 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
                 "Deletions stopped due to --max-delete limit; some deletions were skipped");
     if (delete_limit_out)
       *delete_limit_out = true;
+    return true;
+  }
+  /* A per-entry receiver failure the receiver chose to continue past is a
+     rsync PARTIAL transfer: everything else succeeded and the stored sources
+     may be removed, but the client must exit 23. */
+  if (status == STATUS_PARTIAL) {
+    log_message(LOG_LEVEL_WARNING,
+                "some files could not be transferred (see the server log for details)");
+    if (partial_out)
+      *partial_out = true;
     return true;
   }
   if (status != STATUS_OK) {
@@ -815,6 +835,9 @@ static bool source_is_regular_file(const File* file) {
 
 static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
                                    ArrayList* remove_sources, TransferStats* stats) {
+  /* --stderr=client: this is a frame boundary, so forward any diagnostics the
+     scanner/log emitted since the previous chunk before the next frame. */
+  client_flush_client_messages(client->file_descriptor);
   if (config->use_chunk_serialization) {
     if (remove_sources) {
       for (int i = 0; i < chunk->element_count; i++) {
@@ -954,6 +977,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   protocol_session_set_io_timeout(&session, context->config->timeout);
   protocol_session_set_ssl(&session, (SSL*)client->ssl);
   protocol_session_bind(&session);
+  client_messages_activate(true);
   if (!config_send(client->file_descriptor, context->config)) {
     pipeline_cancel(context);
     disconnect_transfer_client(client);
@@ -1117,11 +1141,14 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       !send_dir_times(client, context->config, context->dir_entries))
     goto send_fail;
   bool delete_limit = false;
+  bool partial = false;
   ReceiverStats recv_stats;
   memset(&recv_stats, 0, sizeof(recv_stats));
+  client_flush_client_messages(client->file_descriptor);
   bool ok = finalize_transfer(client, context->config, context->remove_source_files, &delete_limit,
-                              &recv_stats);
+                              &partial, &recv_stats);
   context->delete_limit = delete_limit;
+  context->partial = partial;
   if (!ok && context->config->use_delete)
     log_message(LOG_LEVEL_ERROR,
                 "server reported a deletion failure (--delete); see the server log for the reason");
@@ -1823,9 +1850,12 @@ static int send_files_finalize(const Config* config, SendFilesState* state) {
   if (!send_dir_times(client, config, state->dir_entries))
     return 1;
   bool delete_limit = false;
+  bool partial = false;
   ReceiverStats recv_stats;
   memset(&recv_stats, 0, sizeof(recv_stats));
-  bool ok = finalize_transfer(client, config, state->remove_sources, &delete_limit, &recv_stats);
+  client_flush_client_messages(client->file_descriptor);
+  bool ok = finalize_transfer(client, config, state->remove_sources, &delete_limit, &partial,
+                              &recv_stats);
   if (!ok && config->use_delete)
     log_message(LOG_LEVEL_ERROR,
                 "server reported a deletion failure (--delete); see the server log for the reason");
@@ -1843,12 +1873,12 @@ static int send_files_finalize(const Config* config, SendFilesState* state) {
                    (double)state->transfer_stats.transferred_file_size / (double)BYTES_PER_MIB);
   /* A skipped source entry (--ignore-errors past an unreadable directory, or a
      dereferenced symlink with no referent) makes rsync report a partial
-     transfer (exit 23) even though the rest of the run succeeded.  A
-     --max-delete-capped commit is a successful transfer that rsync reports
+     transfer (exit 23), as does a receiver per-entry failure (STATUS_PARTIAL).
+     A --max-delete-capped commit is a successful transfer that rsync reports
      with exit code 25. */
   if (!ok)
     return 1;
-  if (state->had_scan_io)
+  if (state->had_scan_io || partial)
     return 23;
   return delete_limit ? 25 : 0;
 }
@@ -1885,7 +1915,18 @@ static void send_files_cleanup(SendFilesState* state) {
   client_set_abort_armed(false);
 }
 
+static int send_files_impl(Config* config);
+
 int send_files(Config* config) {
+  /* Install the --stderr=client sink for the whole run (it only queues while a
+     session is live) and release its queue on every return path. */
+  client_messages_install();
+  int rc = send_files_impl(config);
+  client_messages_end();
+  return rc;
+}
+
+static int send_files_impl(Config* config) {
   if (config->list_only)
     return send_list_only(config);
   if (config->dry_run)
@@ -1931,6 +1972,7 @@ int send_files(Config* config) {
   protocol_session_set_io_timeout(&session, config->timeout);
   protocol_session_set_ssl(&session, (SSL*)client->ssl);
   protocol_session_bind(&session);
+  client_messages_activate(true);
 
   int ret = 1;
   if (!send_files_prepare(config, &state))
@@ -1946,7 +1988,16 @@ send_fail:
   return ret;
 }
 
+static int send_files_multithreaded_impl(Config* config);
+
 int send_files_multithreaded(Config* config) {
+  client_messages_install();
+  int rc = send_files_multithreaded_impl(config);
+  client_messages_end();
+  return rc;
+}
+
+static int send_files_multithreaded_impl(Config* config) {
   if (!config)
     return 1;
   if (config->list_only)
@@ -2202,16 +2253,18 @@ int send_files_multithreaded(Config* config) {
   mtx_unlock(&context->mutex_scanner);
   bool sender_ok = sender_result == thrd_success;
   bool delete_limit = context->delete_limit;
+  bool partial = context->partial;
   /* A skipped source entry (--ignore-errors past an unreadable directory, or a
      dereferenced symlink with no referent) makes rsync report a partial
-     transfer (exit 23).  A --max-delete-capped commit is a successful transfer
-     that rsync reports with exit code 25. */
+     transfer (exit 23), as does a receiver per-entry failure (STATUS_PARTIAL).
+     A --max-delete-capped commit is a successful transfer that rsync reports
+     with exit code 25. */
   pipeline_context_sender_destroy(context);
   client_progress_cleanup();
   client_set_abort_armed(false);
   if (!sender_ok)
     return 1;
-  if (scan_io)
+  if (scan_io || partial)
     return 23;
   return delete_limit ? 25 : 0;
 }

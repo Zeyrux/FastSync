@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <time.h>
 
 /* Surface a server rejection to the user.  When the last status exchange
@@ -1050,4 +1051,110 @@ const char* delete_display_path(const Config* config, const char* path) {
   if (!config || !path || !config->send_directory)
     return path;
   return utils_strip_transfer_root(path, config->send_directory);
+}
+
+/* ---- --stderr=client diagnostic channel (protocol 2.30.0) ----
+ *
+ * When the client's --stderr mode is `client`, log_message() hands each of the
+ * client's own diagnostics to the sink installed here instead of writing them
+ * locally.  The sink QUEUES the text (it may be called from scanner worker
+ * threads while the sender is streaming) and the sender thread -- the sole
+ * writer of the protocol stream -- drains the queue over the wire at frame
+ * boundaries via client_flush_client_messages().  A bounded queue caps the
+ * memory a chatty run can pin; overflow falls back to local output so a
+ * diagnostic is never silently dropped. */
+#define CLIENT_MSG_MAX_QUEUED 256
+#define CLIENT_MSG_MAX_BYTES (256 * 1024)
+
+static mtx_t client_msg_mutex;
+static once_flag client_msg_mutex_once = ONCE_FLAG_INIT;
+static ArrayList* client_msg_queue = NULL; /* owns char* */
+static size_t client_msg_bytes = 0;
+/* True only while a live transfer session exists: before the connection is up
+   (or after it drops) the sink declines so log_message falls back to local
+   output, matching rsync's documented fallback. */
+static bool client_msg_active = false;
+
+static void client_msg_mutex_init(void) {
+  mtx_init(&client_msg_mutex, mtx_plain);
+}
+
+static bool client_msg_enqueue(const char* message);
+
+/* Install the global log sink for the duration of one transfer.  Safe to call
+ * more than once; the queue is created lazily. */
+void client_messages_install(void) {
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  if (!client_msg_queue)
+    client_msg_queue = array_list_create(free);
+  mtx_unlock(&client_msg_mutex);
+  log_set_client_msg_sink(client_msg_enqueue);
+}
+
+void client_messages_activate(bool active) {
+  client_msg_active = active;
+}
+
+/* log_message sink: takes ownership (queues) the message when a session is
+ * live; returns false otherwise so the caller writes it locally. */
+static bool client_msg_enqueue(const char* message) {
+  if (!message || message[0] == '\0')
+    return client_msg_active;
+  if (!client_msg_active)
+    return false;
+  size_t len = strlen(message);
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  bool queued = false;
+  if (client_msg_queue && (size_t)client_msg_queue->size < CLIENT_MSG_MAX_QUEUED &&
+      client_msg_bytes + len <= CLIENT_MSG_MAX_BYTES) {
+    char* copy = str_dup(message);
+    if (copy) {
+      if (array_list_add(client_msg_queue, copy)) {
+        client_msg_bytes += len;
+        queued = true;
+      } else {
+        free(copy);
+      }
+    }
+  }
+  mtx_unlock(&client_msg_mutex);
+  return queued;
+}
+
+/* Drain the queued diagnostics as STATUS_CLIENT_MSG frames on the sender
+ * thread.  Swaps the queue out under the mutex so a concurrent worker logging
+ * never blocks on the wire.  Must be called at a protocol frame boundary. */
+void client_flush_client_messages(int fd) {
+  if (fd < 0)
+    return;
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  ArrayList* pending = client_msg_queue;
+  client_msg_queue = array_list_create(free);
+  client_msg_bytes = 0;
+  mtx_unlock(&client_msg_mutex);
+  if (!pending)
+    return;
+  for (int i = 0; i < pending->size; i++) {
+    const char* message = pending->items[i];
+    if (message && message[0] != '\0' && !send_client_message(fd, message))
+      break; /* peer is gone; the rest would fail too */
+  }
+  array_list_delete(pending);
+}
+
+/* Tear down the sink after a transfer and free anything still queued. */
+void client_messages_end(void) {
+  log_set_client_msg_sink(NULL);
+  client_msg_active = false;
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  ArrayList* pending = client_msg_queue;
+  client_msg_queue = NULL;
+  client_msg_bytes = 0;
+  mtx_unlock(&client_msg_mutex);
+  if (pending)
+    array_list_delete(pending);
 }

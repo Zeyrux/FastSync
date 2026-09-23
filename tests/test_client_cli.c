@@ -352,7 +352,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.29.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.30.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -362,7 +362,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.29.0"};
+                        "/dst",     "--protocol",   "2.30.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -372,10 +372,10 @@ static void test_parse_args_protocol_accept_current() {
 /* Any --protocol value other than the current PROTOCOL_VERSION must end in
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
-  static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
-                                             "2.18.0", "2.19.0", "2.20.0", "2.21.0", "2.22.0",
-                                             "2.23.0", "2.24.0", "2.25.0", "2.26.0", "2.27.0",
-                                             "2.28.0", "216",    "31",     "abc",    ""};
+  static const char* const bad_versions[] = {
+      "2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0", "2.18.0", "2.19.0",
+      "2.20.0", "2.21.0", "2.22.0", "2.23.0", "2.24.0", "2.25.0", "2.26.0",
+      "2.27.0", "2.28.0", "2.29.0", "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -2323,9 +2323,9 @@ static void test_parse_args_8_bit_output() {
 }
 
 static void test_parse_args_stderr_modes() {
-  static const char* const modes[] = {"errors", "all", "e", "a"};
-  static const LogStderrMode expected[] = {LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_ERRORS,
-                                           LOG_STDERR_ALL};
+  static const char* const modes[] = {"errors", "all", "client", "e", "a", "c"};
+  static const LogStderrMode expected[] = {LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_CLIENT,
+                                           LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_CLIENT};
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
     Config* cfg = config_create();
     char option[32];
@@ -2340,8 +2340,29 @@ static void test_parse_args_stderr_modes() {
   log_set_stderr_mode(LOG_STDERR_ERRORS);
 }
 
+/* rsync's deprecated --msgs2stderr / --no-msgs2stderr spellings map to
+ * --stderr=all and --stderr=client respectively; the client-message channel
+ * that `client` needs now exists (protocol 2.30.0). */
+static void test_parse_args_msgs2stderr_aliases() {
+  Config* cfg = config_create();
+  char* argv_all[] = {"fastsync", "--msgs2stderr", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_all, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(log_get_stderr_mode(), LOG_STDERR_ALL);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_client[] = {"fastsync", "--no-msgs2stderr", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_client, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(log_get_stderr_mode(), LOG_STDERR_CLIENT);
+  config_delete(cfg);
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+}
+
 static void test_parse_args_rejects_unsupported_stderr_modes() {
-  static const char* const modes[] = {"client", "c", "invalid"};
+  static const char* const modes[] = {"invalid", "x", ""};
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
     Config* cfg = config_create();
     char option[32];
@@ -5242,6 +5263,7 @@ void test_client_cli() {
   test_parse_args_ignore_times();
   test_parse_args_8_bit_output();
   test_parse_args_stderr_modes();
+  test_parse_args_msgs2stderr_aliases();
   test_parse_args_rejects_unsupported_stderr_modes();
   test_parse_args_secluded_args();
   test_parse_args_chunk_serialization_long_form();

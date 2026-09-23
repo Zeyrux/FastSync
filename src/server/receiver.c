@@ -277,6 +277,7 @@ static bool status_counts_as_progress(Status status) {
   case STATUS_ABORT:
   case STATUS_CHECK_BATCH:
   case STATUS_DIR_TIMES:
+  case STATUS_CLIENT_MSG:
     return false;
   default:
     return true;
@@ -344,6 +345,25 @@ typedef enum {
 static ReceiverStep receiver_handle_keepalive(ReceiverPendingState* state) {
   if (!send_status(state->fd, STATUS_KEEPALIVE))
     return RECEIVER_STEP_FAIL;
+  return RECEIVER_STEP_NEXT;
+}
+
+/* rsync --stderr=client: a client diagnostic forwarded over the wire.  Read the
+ * bounded string and write it to the server's stderr (respecting the server log
+ * destination).  The body is peer-controlled text, so it is logged verbatim
+ * (log_client_message adds the standard prefix); trailing newlines are stripped
+ * so a message cannot inject a blank line.  A malformed string (over-long or
+ * embedded NUL) is a framing error and tears the connection down. */
+static ReceiverStep receiver_handle_client_msg(ReceiverPendingState* state) {
+  char* message = receive_str(state->fd);
+  if (!message)
+    return RECEIVER_STEP_FAIL;
+  size_t len = strlen(message);
+  while (len > 0 && (message[len - 1] == '\n' || message[len - 1] == '\r'))
+    message[--len] = '\0';
+  if (message[0] != '\0')
+    log_client_message(message);
+  free(message);
   return RECEIVER_STEP_NEXT;
 }
 
@@ -527,6 +547,8 @@ static ReceiverStep receiver_dispatch_status(ReceiverPendingState* state, Status
   switch (status) {
   case STATUS_KEEPALIVE:
     return receiver_handle_keepalive(state);
+  case STATUS_CLIENT_MSG:
+    return receiver_handle_client_msg(state);
   case STATUS_ABORT:
     return receiver_handle_abort(state);
   case STATUS_CHECK:
@@ -610,7 +632,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
          status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK ||
          status == STATUS_SYMLINK || status == STATUS_SPECIAL || status == STATUS_DIR_TIMES ||
-         status == STATUS_DELETE_PLAN) {
+         status == STATUS_DELETE_PLAN || status == STATUS_CLIENT_MSG) {
     ReceiverStep step = receiver_dispatch_status(&state, status);
     if (step == RECEIVER_STEP_FAIL)
       goto fail;
@@ -793,13 +815,14 @@ static void receiver_note_delete_limit(void* context_pointer) {
 
 /* Terminal status for a run.  A capped --delete limit wins (rsync exit 25);
    otherwise any per-entry failure (for example an unprivileged --devices
-   mknod) makes the terminal frame non-OK so the client exits non-zero.  rsync
-   reports 23 here; mapping the client's exact exit code to 23 is a separate,
-   pre-existing concern.  A clean run keeps STATUS_OK. */
+   mknod) makes the terminal frame STATUS_PARTIAL so the client exits 23
+   (rsync's "partial transfer due to error") while still removing the sources
+   it successfully transferred under --remove-source-files.  A fatal stream
+   error keeps STATUS_ERROR (a non-23 exit).  A clean run keeps STATUS_OK. */
 static Status receiver_final_status(bool delete_limit_reached, size_t failed_entries) {
   if (delete_limit_reached)
     return STATUS_DELETE_LIMIT;
-  return failed_entries > 0 ? STATUS_ERROR : STATUS_OK;
+  return failed_entries > 0 ? STATUS_PARTIAL : STATUS_OK;
 }
 
 static bool receiver_send_success_frame(int fd, void* context_pointer) {

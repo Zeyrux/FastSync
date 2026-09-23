@@ -433,12 +433,10 @@ static int set_stderr_mode(const char* value) {
     log_set_stderr_mode(LOG_STDERR_ERRORS);
   else if (strcmp(value, "all") == 0 || strcmp(value, "a") == 0)
     log_set_stderr_mode(LOG_STDERR_ALL);
-  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0) {
-    log_message(LOG_LEVEL_ERROR,
-                "--stderr=client is not supported: FastSync has no client message channel");
-    return -1;
-  } else {
-    log_message(LOG_LEVEL_ERROR, "--stderr must be errors or all");
+  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0)
+    log_set_stderr_mode(LOG_STDERR_CLIENT);
+  else {
+    log_message(LOG_LEVEL_ERROR, "--stderr must be errors, all, or client");
     return -1;
   }
   return 0;
@@ -1353,10 +1351,9 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
     return true;
   }
   /* "--no-msgs2stderr" is the deprecated spelling of --stderr=client (rsync
-   * 3.4.1).  FastSync has no separate client message channel, so the closest
-   * supported mode is the errors-only default. */
+   * 3.4.1); the client-message channel now exists, so it maps to `client`. */
   if (strcmp(arg, "--no-msgs2stderr") == 0)
-    return set_stderr_mode("errors") == 0;
+    return set_stderr_mode("client") == 0;
   /* "--no-motd" is a real rsync option name (client-side daemon MOTD display
    * suppression), not a negation of a "--motd" flag, so it is handled before
    * the generic --no-* negation branch. */

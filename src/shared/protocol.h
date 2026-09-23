@@ -15,6 +15,12 @@
  * this for a rejection and the detail frame stays a small, fixed bound. */
 #define MAX_ERROR_DETAIL_BYTES 4096
 
+/* Hard cap on a client diagnostic forwarded over the STATUS_CLIENT_MSG channel
+ * (protocol 2.30.0, rsync's --stderr=client).  The body is reused from the
+ * bounded-string wire helper and sliced to this many bytes before it is sent,
+ * so a peer can never be made to retain more than this per message. */
+#define MAX_CLIENT_MSG_BYTES 4096
+
 /* Maximum uncompressed file payload accepted by the receiver's whole-file
  * paths.  A single whole file is charged against the per-connection memory
  * reservation (MAX_CONNECTION_MEMORY) and against the server allocation
@@ -240,7 +246,25 @@ enum NET_STATUS {
    * record (see format_stats_send/receive in format.h) and, when the run is a
    * --dry-run with --delete, the would-delete path list.  Appended after
    * STATUS_DELETE_PLAN so no existing status is renumbered. */
-  STATUS_STATS
+  STATUS_STATS,
+  /* Client diagnostic channel (protocol 2.30.0, rsync's --stderr=client /
+   * --no-msgs2stderr).  When the client's --stderr mode is `client`, the
+   * client forwards its own diagnostics over this client->server frame
+   * (STATUS_CLIENT_MSG followed by a bounded length-prefixed string, capped at
+   * MAX_CLIENT_MSG_BYTES) instead of writing them to its local stderr.  The
+   * receiver reads the string and writes it to the server's stderr (respecting
+   * the server log destination).  Appended after STATUS_STATS so no existing
+   * status is renumbered. */
+  STATUS_CLIENT_MSG,
+  /* Receiver-side partial transfer (protocol 2.30.0).  Sent by the receiver as
+   * the terminal status INSTEAD of STATUS_OK when one or more entries failed
+   * per-entry without aborting the stream (currently a --devices mknod
+   * EPERM/EACCES).  The transfer otherwise succeeded and every successfully
+   * stored file was acknowledged, so the sender may still remove
+   * --remove-source-files sources; the sender maps this to rsync's exit code
+   * 23 ("partial transfer due to error"), distinct from a fatal STATUS_ERROR.
+   * Appended after STATUS_CLIENT_MSG so no existing status is renumbered. */
+  STATUS_PARTIAL
 };
 
 void io_set_fds(int read_fd, int write_fd);
@@ -341,6 +365,11 @@ bool receive_status(int file_descriptor, Status* status);
  * length-prefixed string.  Over-long messages are sliced and NULL is treated
  * as "".  Returns false if the status or the string could not be sent. */
 bool send_error_detail(int file_descriptor, const char* message);
+/* Send STATUS_CLIENT_MSG followed by a bounded (<= MAX_CLIENT_MSG_BYTES)
+ * length-prefixed string carrying a client diagnostic.  Over-long messages are
+ * sliced and NULL is treated as "".  Returns false if the status or the string
+ * could not be sent. */
+bool send_client_message(int file_descriptor, const char* message);
 /* Human-readable reason captured from the most recent STATUS_ERROR_DETAIL
  * received on this thread, or "" when the last status was a bare STATUS_ERROR
  * (or no detail was seen).  Thread-local, and valid until the next non-keepalive

@@ -1050,7 +1050,7 @@ static void server_run_mt_receiver(ServerSession* state) {
                   context->failed_entries, context->failed_entries == 1 ? "y" : "ies");
     Status final_status = context->delete_limit_reached
                               ? STATUS_DELETE_LIMIT
-                              : (context->failed_entries > 0 ? STATUS_ERROR : STATUS_OK);
+                              : (context->failed_entries > 0 ? STATUS_PARTIAL : STATUS_OK);
     /* Emit the optional wire-stats record first (protocol 2.25.0), then the
        success/outcome frame, exactly like the single-threaded receiver. */
     if (!receiver_send_stats_frame(state->fd, config, &context->stats, context->would_delete,
