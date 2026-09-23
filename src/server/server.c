@@ -982,11 +982,22 @@ static void server_run_mt_receiver(ServerSession* state) {
   bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
   PipelineContextReceiver* context = state->context;
   if (transfer_ok && !config->dry_run) {
+    /* --delay-updates: receive_thread has finished the whole protocol stream
+       and write_thread has drained its queue, so every staged file is complete.
+       Publish atomically BEFORE the deferred delete commit, matching rsync's
+       --delete-after ordering (all updates land first, then extras are
+       removed). */
+    if (config->delay_updates && config->delay_context &&
+        !delay_updates_publish(config->delay_context, config)) {
+      transfer_ok = false;
+    }
+  }
+  if (transfer_ok && !config->dry_run) {
     /* Commit-style (late) deletion: receive_thread handed the keep-set
        manifest here instead of deleting while write_thread might still be
-       draining, so by now every file is on disk and the whole transfer is
-       known to have succeeded.  Remove the extras before publishing a
-       --delay-updates run; the walker skips the staging directory.  A
+       draining, so by now every file is on disk (and a --delay-updates run has
+       already published above) and the whole transfer is known to have
+       succeeded.  The walker skips the staging directory.  A
        server-contacting --dry-run deletes nothing (no manifest is sent). */
     if (context->deferred_manifest) {
       size_t deleted = 0;
@@ -1026,21 +1037,10 @@ static void server_run_mt_receiver(ServerSession* state) {
       delete_plan_session_destroy(context->deferred_plans);
       context->deferred_plans = NULL;
     }
-  }
-  if (transfer_ok && !config->dry_run) {
-    /* --delay-updates: receive_thread has finished the whole protocol stream
-       (including manifest/delete handling) and write_thread has drained its
-       queue, so every staged file is complete.  Publish atomically before the
-       success/outcome frame so a --remove-source-files sender only learns of
-       files that were actually installed. */
-    if (config->delay_updates && config->delay_context &&
-        !delay_updates_publish(config->delay_context, config)) {
-      transfer_ok = false;
-    }
-    /* P7 Wave D: all writers have joined and the late deletion (and
-       --delay-updates publication) has committed above, so it is finally safe
-       to stamp directory times; a directory's mtime must not be clobbered by
-       its children or by an extra removal. */
+    /* P7 Wave D: all writers have joined and the --delay-updates publication
+       plus the late deletion have committed above, so it is finally safe to
+       stamp directory times; a directory's mtime must not be clobbered by its
+       children or by an extra removal. */
     if (transfer_ok)
       dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
   }

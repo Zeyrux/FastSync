@@ -106,6 +106,15 @@ def seed_backup(_src, rroot, froot):
         _mk(os.path.join(root, "a.txt"), b"OLD-CONTENT\n", _OLD_MTIME)
 
 
+def seed_delay_updates(_src, rroot, froot):
+    """A changed file plus an extra, so --delay-updates (and its implied
+    --delete-after) has both a publication and a deletion to order."""
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "a.txt"), b"OLD-CONTENT\n", _OLD_MTIME)
+        _mk(os.path.join(root, "extra.txt"), b"extra\n", _OLD_MTIME)
+        _mk(os.path.join(root, "extradir", "z.txt"), b"z\n", _OLD_MTIME)
+
+
 def seed_size_only(_src, rroot, froot):
     for root in (rroot, froot):
         _mk(os.path.join(root, "a.txt"), b"XXXXXXXXXXX\n", _OLD_MTIME)
@@ -305,6 +314,14 @@ _CASES = [
     H.Case("delete_commit", "basic", ["-a", "--delete-after"], seed=seed_extras,
            fastsync_flags=["-a", "--delete-commit"], server_args=DELETE,
            ref="FastSync-only --delete-commit == rsync --delete-after"),
+    # #317: --delay-updates stages under a per-run unique name and publishes
+    # every update before the implied --delete-after removes extras.
+    H.Case("delay_updates", "basic", ["-a", "--delay-updates"],
+           seed=seed_delay_updates, ref="--delay-updates stages then publishes"),
+    H.Case("delay_updates_delete", "basic",
+           ["-a", "--delay-updates", "--delete"], seed=seed_delay_updates,
+           server_args=DELETE, ci=True,
+           ref="--delay-updates implies --delete-after (publish before delete)"),
     H.Case("delete_excluded", "filters",
            ["-a", "--delete", "--delete-excluded", "--exclude=*.log"],
            seed=seed_delete_excluded, server_args=DELETE, ref="--delete-excluded"),

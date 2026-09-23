@@ -801,6 +801,7 @@ static bool build_plan_skips(const Config* config, const DeletePlanSession* sess
                              PlanSkips* out) {
   out->protect.base_rules = config->protect_rules;
   out->protect.dir_rules = session->per_dir_rules;
+  out->protect.backup_suffix = delete_backup_suffix(config);
   /* The per-directory plan walk keeps each basis path verbatim (it does not
      convert an absolute under-root path to its root-relative form, unlike the
      whole-tree commit walk). */

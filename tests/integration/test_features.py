@@ -3089,12 +3089,12 @@ class TestDelayUpdates:
             "staging directory left behind after a successful delayed transfer"
 
     @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
-    def test_delay_updates_staging_name_collision_residual(self):
-        """Documented residual (RSYNC_COMPAT.md `--delay-updates` row): FastSync
-        uses a fixed `.fastsync-stage` staging name and wipes a pre-existing tree
-        of that name at the start of a delayed run (crash-leftover cleanup),
-        even without `--delete`; rsync leaves a genuine destination entry of that
-        name untouched.  Pins the divergence that keeps the row Divergent."""
+    def test_delay_updates_staging_name_collision_preserved(self):
+        """rsync parity (RSYNC_COMPAT.md `--delay-updates` row): the receiver
+        stages under a per-run unique name, so a genuine pre-existing
+        destination entry named like the reserved staging prefix (`.fastsync-
+        stage`) is never wiped -- even without `--delete`.  rsync likewise
+        leaves a real destination entry of its own temp name untouched."""
         source = self._make_source("delay_collide_src")
         rdst = os.path.join(TEST_DATA_DIR, "delay_collide_rdst")
         fdst = os.path.join(TEST_DATA_DIR, "delay_collide_fdst")
@@ -3120,8 +3120,11 @@ class TestDelayUpdates:
             result, _ = run_client(source, fdst, flags=["--delay-updates"],
                                    port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
-        assert not os.path.exists(os.path.join(fdst, self.STAGING)), \
-            "FastSync did not wipe the reserved staging name (residual changed)"
+        assert _read_file(os.path.join(fdst, self.STAGING, "keepme.txt")) == b"genuine user data\n", \
+            "FastSync destroyed a genuine destination entry named like the staging prefix"
+        # The per-run staging directory itself is removed after a clean run.
+        leftovers = [n for n in os.listdir(fdst) if n.startswith(self.STAGING + ".")]
+        assert leftovers == [], f"per-run staging directories left behind: {leftovers}"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_delay_updates_incremental_rerun_no_leftovers(self, shared_server, mt):
@@ -3161,10 +3164,11 @@ class TestDelayUpdates:
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_delete_with_delay_updates(self, mt):
-        """--delete runs before publication, so the delete walker must not treat
-        the staging directory as a set of extras: a changed file must still be
-        published after genuine extras are removed.  Uses its own server started
-        with --allow-delete (the shared session server refuses deletion)."""
+        """rsync parity: --delay-updates implies --delete-after, so every staged
+        update is published first and the genuine extras are removed only after
+        that (the delete walker must never treat the staging directory as a set
+        of extras).  Uses its own server started with --allow-delete (the shared
+        session server refuses deletion)."""
         source = os.path.join(TEST_DATA_DIR, "delay_delete_src")
         dest = os.path.join(TEST_DATA_DIR, "delay_delete_dst")
         clean_dir(source)
@@ -3194,6 +3198,65 @@ class TestDelayUpdates:
             assert not os.path.exists(os.path.join(received, "extra.txt")), \
                 "genuine extra file was not deleted"
             assert not os.path.isdir(os.path.join(dest, self.STAGING))
+            assert [n for n in os.listdir(dest) if n.startswith(self.STAGING + ".")] == []
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delay_updates_delete_keeps_backup(self, mt):
+        """The --backup/--delay-updates interplay: the old destination file is
+        moved aside at publication, and that backup survives the implied
+        --delete-after pass (rsync never treats a backup file as an extra)."""
+        source = os.path.join(TEST_DATA_DIR, "delay_bak_del_src")
+        dest = os.path.join(TEST_DATA_DIR, "delay_bak_del_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"NEW")
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(received, exist_ok=True)
+        with open(os.path.join(received, "f.txt"), "wb") as fh:
+            fh.write(b"OLD")
+        os.utime(os.path.join(received, "f.txt"), (1_500_000_000, 1_500_000_000))
+        # A pre-existing backup-looking extra must also be shielded.
+        with open(os.path.join(received, "stale.txt~"), "wb") as fh:
+            fh.write(b"stale backup")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            flags = ["--delete", "--backup", "--delay-updates"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert _read_file(os.path.join(received, "f.txt")) == b"NEW"
+        assert _read_file(os.path.join(received, "f.txt~")) == b"OLD", \
+            "the publication backup was removed by the delete-after pass"
+        assert os.path.exists(os.path.join(received, "stale.txt~")), \
+            "a pre-existing backup-suffixed entry was deleted"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delay_updates_failed_run_leaves_no_staged_files(self, shared_server, mt):
+        """A run that fails before publication installs nothing and removes the
+        per-run staging directory (no staged leftovers)."""
+        source = os.path.join(TEST_DATA_DIR, "delay_fail_src")
+        dest = os.path.join(TEST_DATA_DIR, "delay_fail_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "top.txt"), "wb") as fh:
+            fh.write(b"top\n")
+        os.makedirs(os.path.join(source, "sub"))
+        with open(os.path.join(source, "sub", "deep.txt"), "wb") as fh:
+            fh.write(b"deep\n")
+        # Plant a regular file where the "sub" directory must be created so the
+        # nested publish fails (the top-level file still publishes first).
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(received)
+        with open(os.path.join(received, "sub"), "wb") as fh:
+            fh.write(b"blocker")
+
+        flags = ["--delay-updates"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode != 0, "a blocked nested publish must fail the run"
+        assert not os.path.lexists(os.path.join(received, "sub", "deep.txt")), \
+            "a staged file appeared despite the failed run"
+        assert [n for n in os.listdir(dest) if n.startswith(self.STAGING + ".")] == [], \
+            "the per-run staging directory survived a failed run"
 
     def test_delay_updates_rejects_reserved_backup_dir(self):
         """--backup-dir equal to the internal staging name must be rejected so

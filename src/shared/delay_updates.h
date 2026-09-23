@@ -24,6 +24,7 @@ typedef struct {
    shared with the publish/cleanup phase that runs after the threads join. */
 typedef struct DelayUpdatesContext {
   char* root_directory; /* receive root the staging dir lives under */
+  char* staging_name;   /* per-run unique staging dir basename */
   char* staging_root;   /* root_directory/<staging dir name> */
   mtx_t mutex;
   StagedFileEntry* entries;
@@ -33,7 +34,11 @@ typedef struct DelayUpdatesContext {
   int lock_fd;   /* advisory exclusive flock held on the staging dir, or -1 */
 } DelayUpdatesContext;
 
-/* Name of the private staging subdirectory created under the receive root. */
+/* Reserved prefix for the private staging subdirectory created under the
+   receive root.  The actual directory name is per-run unique (the prefix plus a
+   pid/entropy token) so it can never clobber a genuine destination entry that
+   happens to share the name; the bare prefix is still what a --backup-dir must
+   not collide with. */
 #define DELAY_UPDATES_STAGING_DIR ".fastsync-stage"
 
 /* True when `dir` (ignoring a trailing "/") is the reserved staging directory
