@@ -28,6 +28,8 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->max_queue_bytes = 0;
   context->deferred_manifest = NULL;
   context->deferred_plans = NULL;
+  context->delete_ctx.stats = NULL;
+  context->delete_ctx.deleted_paths = NULL;
   context->delete_limit_reached = false;
   context->failed_entries = 0;
   memset(&context->stats, 0, sizeof(context->stats));
@@ -205,8 +207,9 @@ int receive_thread(void* pipeline_context) {
                        &context->stats,
                        context->would_delete,
                        context->deleted_paths};
-  if (receiver_process_pending((Config*)config, file_descriptor, &sink, &context->deferred_manifest,
-                               &context->deferred_plans) != 0) {
+  if (receiver_process_pending_ctx((Config*)config, file_descriptor, &sink,
+                                   &context->deferred_manifest, &context->deferred_plans,
+                                   &context->delete_ctx) != 0) {
     receiver_thread_fail(context);
     protocol_session_unbind();
     return thrd_error;

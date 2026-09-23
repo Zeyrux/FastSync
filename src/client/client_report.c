@@ -1213,8 +1213,11 @@ static ArrayList* client_msg_queue = NULL; /* owns char* */
 static size_t client_msg_bytes = 0;
 /* True only while a live transfer session exists: before the connection is up
    (or after it drops) the sink declines so log_message falls back to local
-   output, matching rsync's documented fallback. */
-static bool client_msg_active = false;
+   output, matching rsync's documented fallback.  Written by the sender thread
+   (client_messages_activate) and read by scanner worker threads in
+   client_msg_enqueue, so it must be atomic: the queue itself stays guarded by
+   client_msg_mutex, but the flag is polled before taking that lock. */
+static _Atomic bool client_msg_active = false;
 
 static void client_msg_mutex_init(void) {
   mtx_init(&client_msg_mutex, mtx_plain);
@@ -1229,20 +1232,26 @@ void client_messages_install(void) {
   mtx_lock(&client_msg_mutex);
   if (!client_msg_queue)
     client_msg_queue = array_list_create(free);
+  bool ready = client_msg_queue != NULL;
   mtx_unlock(&client_msg_mutex);
-  log_set_client_msg_sink(client_msg_enqueue);
+  /* Only arm the sink once the queue exists; on allocation failure leave the
+     sink uninstalled so log_message keeps writing locally instead of handing
+     messages to a sink that would silently drop them. */
+  if (ready)
+    log_set_client_msg_sink(client_msg_enqueue);
 }
 
 void client_messages_activate(bool active) {
-  client_msg_active = active;
+  atomic_store(&client_msg_active, active);
 }
 
 /* log_message sink: takes ownership (queues) the message when a session is
  * live; returns false otherwise so the caller writes it locally. */
 static bool client_msg_enqueue(const char* message) {
+  bool active = atomic_load(&client_msg_active);
   if (!message || message[0] == '\0')
-    return client_msg_active;
-  if (!client_msg_active)
+    return active;
+  if (!active)
     return false;
   size_t len = strlen(message);
   call_once(&client_msg_mutex_once, client_msg_mutex_init);
@@ -1273,8 +1282,19 @@ void client_flush_client_messages(int fd) {
   call_once(&client_msg_mutex_once, client_msg_mutex_init);
   mtx_lock(&client_msg_mutex);
   ArrayList* pending = client_msg_queue;
-  client_msg_queue = array_list_create(free);
-  client_msg_bytes = 0;
+  if (pending) {
+    ArrayList* fresh = array_list_create(free);
+    if (fresh) {
+      client_msg_queue = fresh;
+    } else {
+      /* No memory for a replacement queue: stop queuing new diagnostics (they
+         fall back to local output) and drain this batch below so nothing is
+         silently dropped. */
+      client_msg_queue = NULL;
+      log_set_client_msg_sink(NULL);
+    }
+    client_msg_bytes = 0;
+  }
   mtx_unlock(&client_msg_mutex);
   if (!pending)
     return;
@@ -1289,7 +1309,7 @@ void client_flush_client_messages(int fd) {
 /* Tear down the sink after a transfer and free anything still queued. */
 void client_messages_end(void) {
   log_set_client_msg_sink(NULL);
-  client_msg_active = false;
+  atomic_store(&client_msg_active, false);
   call_once(&client_msg_mutex_once, client_msg_mutex_init);
   mtx_lock(&client_msg_mutex);
   ArrayList* pending = client_msg_queue;

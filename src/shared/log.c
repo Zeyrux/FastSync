@@ -1,4 +1,5 @@
 #include "log.h"
+#include "utils.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -155,15 +156,21 @@ static void emit_log_line(FILE* console, const char* line) {
 void log_client_message(const char* message) {
   if (!message)
     return;
-  time_t now = time(NULL);
-  struct tm t;
-  if (!localtime_r(&now, &t))
+  /* The body is peer-controlled: escape every non-printable byte (newlines,
+     CR, ANSI ESC, ...) so a hostile client cannot forge log lines or inject
+     terminal control sequences.  output_escape() is the codebase's canonical
+     escaper and leaves printable text untouched. */
+  char* escaped = output_escape(message, log_get_8_bit_output());
+  if (!escaped)
     return;
-  char* line = format_log_line_from_body(LOG_LEVEL_INFO, &t, message);
-  if (!line)
-    return;
-  emit_log_line(stderr, line);
-  free(line);
+  /* Route through the ordinary log level / destination gate (log_message):
+     this respects --log-file, the configured stderr mode and the level
+     threshold instead of always writing to stderr.  The wire body carries no
+     severity, so the forwarded diagnostic is emitted as a warning -- the
+     lowest level the default gate admits, which keeps the peer's messages
+     visible without bypassing --quiet. */
+  log_message(LOG_LEVEL_WARNING, "%s", escaped);
+  free(escaped);
 }
 
 void log_message(LogLevel log_level, const char* format, ...) {
