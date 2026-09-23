@@ -17,10 +17,18 @@
 /* Pre-transfer destination snapshot, reported by the receiver when the wire
  * config carries report_dest_info.  `known` distinguishes "no report was
  * requested/received" from "the destination did not exist" (`existed == false`
- * with `known == true`). */
+ * with `known == true`).
+ *
+ * `target_matches` is meaningful only for a symlink destination (protocol
+ * 2.30.0): the receiver compares its on-disk link target with the incoming
+ * target and reports whether they are equal, so the sender can render rsync's
+ * `cLc........` (target changed) versus `.L..t......` (attributes only) and
+ * suppress an unchanged symlink's line entirely.  It is always false for every
+ * other entry kind. */
 typedef struct {
   bool known;
   bool existed;
+  bool target_matches;
   unsigned long long size;
   long long mtime_sec;
   long long mtime_nsec;
@@ -57,17 +65,24 @@ bool format_dest_state_send(int fd, const OutputDestState* state);
 bool format_dest_state_receive(int fd, OutputDestState* state);
 
 /* End-of-transfer receiver counters reported through STATUS_STATS (protocol
- * 2.25.0, extended in 2.28.0) when the wire config carries report_stats.
- * `would_delete_count` is the number of destination-relative paths the receiver
- * would have deleted in a -n/--dry-run --delete run; that many wire strings
- * immediately follow the fixed record (sent/read by the caller).
+ * 2.25.0, extended in 2.28.0 and 2.30.0) when the wire config carries
+ * report_stats.  `would_delete_count` is the number of destination-relative
+ * paths the receiver would have deleted in a -n/--dry-run --delete run; that
+ * many wire strings immediately follow the fixed record (sent/read by the
+ * caller).
  *
  * Protocol 2.28.0 adds the receiver-observed counters the sender cannot see:
  * `literal_bytes` is the file data the receiver actually stored literally
  * (whole files plus the literal fragments of a delta) and the four `created_*`
  * counters split the destination entries the receiver newly created by type,
  * reproducing rsync's `Number of created files` breakdown and an exact
- * `Literal data` for a delta run. */
+ * `Literal data` for a delta run.
+ *
+ * Protocol 2.30.0 appends the four `deleted_*` counters: the same reg/dir/link/
+ * special split for the entries the receiver ACTUALLY removed, so `--stats` can
+ * render rsync's `Number of deleted files: X (reg: A, dir: B, link: C,
+ * special: D)` parenthetical.  The scalar `deleted_files` stays the authoritative
+ * total (the breakdown is a strict partition of it). */
 typedef struct {
   unsigned long long matched_data;
   unsigned long long deleted_files;
@@ -77,6 +92,10 @@ typedef struct {
   unsigned long long created_dir;
   unsigned long long created_link;
   unsigned long long created_special;
+  unsigned long long deleted_reg;
+  unsigned long long deleted_dir;
+  unsigned long long deleted_link;
+  unsigned long long deleted_special;
 } ReceiverStats;
 
 /* Fixed-width STATUS_STATS counter record.  The status frame and the optional

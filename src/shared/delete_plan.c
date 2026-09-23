@@ -478,9 +478,9 @@ struct DeletePlanSession {
 };
 
 /* Report one path the session truly removed (no-op without an observer). */
-static void notify_deleted(DeletePlanSession* session, const char* rel) {
+static void notify_deleted(DeletePlanSession* session, const char* rel, DeleteEntryType type) {
   if (session && session->observer && rel)
-    session->observer(session->observer_context, rel);
+    session->observer(session->observer_context, rel, type);
 }
 
 /* A removed directory is reported with rsync's trailing slash (`deleting dir/`)
@@ -491,13 +491,13 @@ static void notify_deleted_dir(DeletePlanSession* session, const char* rel) {
   size_t len = strlen(rel);
   char* with_slash = malloc(len + 2);
   if (!with_slash) {
-    session->observer(session->observer_context, rel);
+    session->observer(session->observer_context, rel, DELETE_ENTRY_DIR);
     return;
   }
   memcpy(with_slash, rel, len);
   with_slash[len] = '/';
   with_slash[len + 1] = '\0';
-  session->observer(session->observer_context, with_slash);
+  session->observer(session->observer_context, with_slash, DELETE_ENTRY_DIR);
   free(with_slash);
 }
 
@@ -711,8 +711,8 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
   return errno == ENOTEMPTY || errno == EEXIST;
 }
 
-static bool process_extra_file(int dirfd, const char* name, const char* child_rel, bool force_now,
-                               DeletePlanSession* session) {
+static bool process_extra_file(int dirfd, const char* name, const char* child_rel, mode_t mode,
+                               bool force_now, DeletePlanSession* session) {
   if (session->defer && !force_now) {
     return defer_add(session, child_rel);
   }
@@ -724,7 +724,7 @@ static bool process_extra_file(int dirfd, const char* name, const char* child_re
     session->deleted++;
     session->planned++;
     log_deleted(child_rel);
-    notify_deleted(session, child_rel);
+    notify_deleted(session, child_rel, delete_entry_type_of_mode(mode));
   } else if (errno != ENOENT) {
     return false;
   }
@@ -828,7 +828,8 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
       operation_ok = false;
       continue;
     }
-    if (!process_extra_file(dirfd, entries[i].name, child_rel, force[i] || force_now, session))
+    if (!process_extra_file(dirfd, entries[i].name, child_rel, entries[i].mode,
+                            force[i] || force_now, session))
       operation_ok = false;
     free(child_rel);
   }
@@ -1032,7 +1033,7 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
     session->deleted++;
     session->planned++;
     log_deleted(rel);
-    notify_deleted(session, rel);
+    notify_deleted(session, rel, delete_entry_type_of_mode(st.st_mode));
   } else if (errno != ENOENT) {
     close(parent_fd);
     free(leaf);

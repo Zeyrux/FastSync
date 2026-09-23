@@ -615,14 +615,34 @@ static bool send_file_direct(File* file, int fd, bool use_metadata, int compress
 static bool send_directory_entry(const Client* client, File* file, const Config* config) {
   if (!file || !file_wire_path(file))
     return false;
-  if (!send_status(client->file_descriptor, STATUS_MKDIR) ||
-      !send_wire_str(client->file_descriptor, file_wire_path(file)))
+  int fd = client->file_descriptor;
+  if (!send_status(fd, STATUS_MKDIR))
     return false;
-  if (config->use_metadata && !metadata_send(client->file_descriptor, file->metadata))
+  /* Output parity (protocol 2.30.0): when report_dest_info is negotiated every
+     STATUS_MKDIR body is prefixed with a probe flag (1 = probe only, 0 = a real
+     create), so the receiver knows whether to expect the metadata/xattr block. */
+  if (config->report_dest_info && !send_int(fd, 0))
+    return false;
+  if (!send_wire_str(fd, file_wire_path(file)))
+    return false;
+  if (config->use_metadata && !metadata_send(fd, file->metadata))
     return false;
   /* Directory xattrs/ACLs (-X/-A) ride the same trailing block as regular files
      when the xattr transport was negotiated. */
-  return !config->use_xattrs || xattr_send(client->file_descriptor, file->xattrs);
+  if (config->use_xattrs && !xattr_send(fd, file->xattrs))
+    return false;
+  /* The receiver answers with the directory's pre-transfer destination state
+     BEFORE creating it, so the sender can render rsync's `.d..t......` versus
+     `cd+++++++++` and suppress an unchanged directory. */
+  if (config->report_dest_info) {
+    Status status;
+    if (!receive_status(fd, &status) || status != STATUS_DEST_INFO ||
+        !format_dest_state_receive(fd, &file->dest_state)) {
+      log_message(LOG_LEVEL_ERROR, "Unexpected reply to the directory destination-state report");
+      return false;
+    }
+  }
+  return true;
 }
 
 /* P7 Wave D: transmit every captured source directory's metadata in terminal
@@ -678,7 +698,21 @@ static bool send_symlink_entry(const Client* client, File* file, const Config* c
     return false;
   /* Symlink xattrs/ACLs (-X/-A) ride the same trailing block as regular files
      and directories when the xattr transport was negotiated. */
-  return !config->use_xattrs || xattr_send(fd, file->xattrs);
+  if (config->use_xattrs && !xattr_send(fd, file->xattrs))
+    return false;
+  /* The receiver answers with the symlink's pre-transfer destination state
+     (including whether the on-disk link target already matches) BEFORE creating
+     it, so the sender can render rsync's `cLc........` / `.L..t......` and
+     suppress an unchanged symlink. */
+  if (config->report_dest_info) {
+    Status status;
+    if (!receive_status(fd, &status) || status != STATUS_DEST_INFO ||
+        !format_dest_state_receive(fd, &file->dest_state)) {
+      log_message(LOG_LEVEL_ERROR, "Unexpected reply to the symlink destination-state report");
+      return false;
+    }
+  }
+  return true;
 }
 
 // Send a single file directly via sendfile (non-incremental path).
@@ -869,10 +903,12 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
          feed -i/--out-format its ancestor directory lines here. */
       if (config->itemize_changes || config->out_format != NULL)
         client_change_emit_ancestors(config, chunk->items[i]);
-      if (chunk->items[i]->is_dir)
+      if (chunk->items[i]->is_dir) {
         change_emit_dir_sent(config, chunk->items[i]);
-      else
+        client_change_mark_dir(config, chunk->items[i]);
+      } else {
         change_emit_file_sent(config, chunk->items[i]);
+      }
       if (!chunk->items[i]->is_dir)
         transfer_stats_note_transferred(stats, chunk->items[i]);
     }
@@ -884,6 +920,11 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     if (f == NULL)
       continue;
     transfer_stats_note_entry(stats, f);
+    /* Output parity: probe this entry's ancestor directories' destination state
+       before the entry (or the first child below them) is sent, while the
+       receiver has not yet created them implicitly. */
+    if (!client_change_probe_ancestors(config, f, client->file_descriptor))
+      return -1;
     if (f->is_dir) {
       /* Explicit directory entry (--dirs): a MKDIR frame carrying the
          destination path (and metadata when negotiated).  Directories have no
@@ -892,6 +933,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
         return -1;
       client_change_emit_ancestors(config, f);
       change_emit_dir_sent(config, f);
+      client_change_mark_dir(config, f);
       client_progress_name(config, f);
       continue;
     }
@@ -1137,6 +1179,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
      (and all parallel workers) has been joined before scanner_done was set, so
      the list is complete and race-free; on an early stop the list may be
      incomplete and is deliberately not sent. */
+  client_change_emit_pending_dirs(context->config, client->file_descriptor);
   if (!context->scan_stopped_early &&
       !send_dir_times(client, context->config, context->dir_entries))
     goto send_fail;
@@ -1844,6 +1887,10 @@ static int send_files_finalize(const Config* config, SendFilesState* state) {
       }
     }
   }
+  /* Output parity: report changed directories that had no transferred child
+     before the deferred directory times are applied (so the probe still sees
+     their pre-transfer state). */
+  client_change_emit_pending_dirs(config, client->file_descriptor);
   /* P7 Wave D: every directory has now been traversed (or the scan stopped
      early), so transmit the captured directory times last.  The receiver defers
      applying them until after its own deletion/publication phase. */

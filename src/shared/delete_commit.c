@@ -191,13 +191,13 @@ typedef struct {
   const char* prefix;
 } PrefixedDeleteObserver;
 
-static void prefixed_delete_observer(void* context, const char* rel) {
+static void prefixed_delete_observer(void* context, const char* rel, DeleteEntryType type) {
   PrefixedDeleteObserver* prefixed = context;
   if (!prefixed->inner || !rel)
     return;
   char* joined = path_cat((char*)prefixed->prefix, rel);
   if (joined) {
-    prefixed->inner(prefixed->inner_context, joined);
+    prefixed->inner(prefixed->inner_context, joined, type);
     free(joined);
   }
 }
@@ -359,7 +359,7 @@ static bool delete_missing_args_budgeted_observed(const Config* config,
     if (removed) {
       budget->deleted++;
       if (observer)
-        observer(observer_context, rel);
+        observer(observer_context, rel, delete_entry_type_of_mode(st.st_mode));
       char* escaped = output_escape(rel, log_get_8_bit_output());
       fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);

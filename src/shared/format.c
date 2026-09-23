@@ -62,14 +62,16 @@ bool format_dest_state_send(int fd, const OutputDestState* state) {
   if (!state)
     return false;
   int32_t has_old = state->existed ? 1 : 0;
+  int32_t target_matches = state->target_matches ? 1 : 0;
   uint64_t size = (uint64_t)state->size;
   int64_t mtime = (int64_t)state->mtime_sec;
   int64_t mtime_nsec = state->mtime_nsec;
   uint32_t mode = state->mode;
   int32_t uid = state->uid;
   int32_t gid = state->gid;
-  return send_n_data(fd, &has_old, sizeof(has_old)) && send_n_data(fd, &size, sizeof(size)) &&
-         send_n_data(fd, &mtime, sizeof(mtime)) &&
+  return send_n_data(fd, &has_old, sizeof(has_old)) &&
+         send_n_data(fd, &target_matches, sizeof(target_matches)) &&
+         send_n_data(fd, &size, sizeof(size)) && send_n_data(fd, &mtime, sizeof(mtime)) &&
          send_n_data(fd, &mtime_nsec, sizeof(mtime_nsec)) && send_n_data(fd, &mode, sizeof(mode)) &&
          send_n_data(fd, &uid, sizeof(uid)) && send_n_data(fd, &gid, sizeof(gid));
 }
@@ -78,14 +80,16 @@ bool format_dest_state_receive(int fd, OutputDestState* state) {
   if (!state)
     return false;
   int32_t has_old = 0;
+  int32_t target_matches = 0;
   uint64_t size = 0;
   int64_t mtime = 0;
   int64_t mtime_nsec = 0;
   uint32_t mode = 0;
   int32_t uid = 0;
   int32_t gid = 0;
-  if (!receive_n_data(fd, &has_old, sizeof(has_old)) || !receive_n_data(fd, &size, sizeof(size)) ||
-      !receive_n_data(fd, &mtime, sizeof(mtime)) ||
+  if (!receive_n_data(fd, &has_old, sizeof(has_old)) ||
+      !receive_n_data(fd, &target_matches, sizeof(target_matches)) ||
+      !receive_n_data(fd, &size, sizeof(size)) || !receive_n_data(fd, &mtime, sizeof(mtime)) ||
       !receive_n_data(fd, &mtime_nsec, sizeof(mtime_nsec)) ||
       !receive_n_data(fd, &mode, sizeof(mode)) || !receive_n_data(fd, &uid, sizeof(uid)) ||
       !receive_n_data(fd, &gid, sizeof(gid)))
@@ -93,6 +97,7 @@ bool format_dest_state_receive(int fd, OutputDestState* state) {
   memset(state, 0, sizeof(*state));
   state->known = true;
   state->existed = has_old != 0;
+  state->target_matches = target_matches != 0;
   state->size = size;
   state->mtime_sec = mtime;
   state->mtime_nsec = mtime_nsec;
@@ -105,9 +110,10 @@ bool format_dest_state_receive(int fd, OutputDestState* state) {
 bool format_stats_send(int fd, const ReceiverStats* stats) {
   if (!stats)
     return false;
-  unsigned long long fields[8] = {
+  unsigned long long fields[12] = {
       stats->matched_data, stats->deleted_files, stats->would_delete_count, stats->literal_bytes,
       stats->created_reg,  stats->created_dir,   stats->created_link,       stats->created_special,
+      stats->deleted_reg,  stats->deleted_dir,   stats->deleted_link,       stats->deleted_special,
   };
   return send_n_data(fd, fields, sizeof(fields));
 }
@@ -115,7 +121,7 @@ bool format_stats_send(int fd, const ReceiverStats* stats) {
 bool format_stats_receive(int fd, ReceiverStats* stats) {
   if (!stats)
     return false;
-  unsigned long long fields[8] = {0};
+  unsigned long long fields[12] = {0};
   if (!receive_n_data(fd, fields, sizeof(fields)))
     return false;
   memset(stats, 0, sizeof(*stats));
@@ -127,5 +133,9 @@ bool format_stats_receive(int fd, ReceiverStats* stats) {
   stats->created_dir = fields[5];
   stats->created_link = fields[6];
   stats->created_special = fields[7];
+  stats->deleted_reg = fields[8];
+  stats->deleted_dir = fields[9];
+  stats->deleted_link = fields[10];
+  stats->deleted_special = fields[11];
   return true;
 }

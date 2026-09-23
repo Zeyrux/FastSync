@@ -32,6 +32,17 @@ static bool keep_is_file(const PathIndex* index, const char* rel_path) {
   return path_index_contains(index, rel_path);
 }
 
+/* Classify a removed entry from its st_mode for the per-type delete counters. */
+DeleteEntryType delete_entry_type_of_mode(mode_t mode) {
+  if (S_ISDIR(mode))
+    return DELETE_ENTRY_DIR;
+  if (S_ISLNK(mode))
+    return DELETE_ENTRY_LINK;
+  if (S_ISREG(mode))
+    return DELETE_ENTRY_REG;
+  return DELETE_ENTRY_SPECIAL;
+}
+
 /* True when child_rel is, or lies below, a protected entry.  A prefix "a"
    therefore protects "a" and "a/b/c" but not "ab".  Entries with top_level_only
    set only protect DIRECT children of the receive root (at_root); nested
@@ -126,6 +137,7 @@ bool delete_dir_entries_collect(int dirfd, DeleteDirEntry** out, size_t* count,
       break;
     }
     entries[used].is_dir = S_ISDIR(st.st_mode);
+    entries[used].mode = st.st_mode;
     used++;
   }
   closedir(dir);
@@ -329,10 +341,10 @@ static bool delete_walk_fd(int dirfd, const char* rel_path, const PathIndex* kee
             memcpy(with_slash, child_rel, len);
             with_slash[len] = '/';
             with_slash[len + 1] = '\0';
-            state->observer(state->observer_context, with_slash);
+            state->observer(state->observer_context, with_slash, DELETE_ENTRY_DIR);
             free(with_slash);
           } else {
-            state->observer(state->observer_context, child_rel);
+            state->observer(state->observer_context, child_rel, DELETE_ENTRY_DIR);
           }
         }
       }
@@ -373,7 +385,8 @@ static bool delete_walk_fd(int dirfd, const char* rel_path, const PathIndex* kee
       char* child_rel = path_cat((char*)rel_path, entries[i].name);
       if (child_rel) {
         if (state->observer)
-          state->observer(state->observer_context, child_rel);
+          state->observer(state->observer_context, child_rel,
+                          delete_entry_type_of_mode(entries[i].mode));
         char* escaped_path = output_escape(child_rel, log_get_8_bit_output());
         fprintf(stderr, "  Deleted: %s\n", escaped_path ? escaped_path : "<allocation failed>");
         free(escaped_path);

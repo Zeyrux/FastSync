@@ -11,10 +11,13 @@
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
+#include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code) {
   if (!outcomes)
@@ -101,14 +104,35 @@ static void receiver_tally_deleted(const ReceiverSink* sink, size_t deleted) {
     sink->stats->deleted_files += deleted;
 }
 
-/* Observer for --info=del: record each truly-removed destination-relative path
-   in the ArrayList passed as the observer context, so the terminal STATUS_STATS
-   frame can list it.  A failed append is best-effort (the deletion already
-   happened; output is cosmetic).  Shared by the single-threaded receiver and
-   the -m pipeline's deferred commit. */
-void receiver_record_deleted_path(void* context, const char* rel_path) {
-  ArrayList* paths = context;
-  if (!paths || !rel_path)
+/* Observer for --info=del/--stats: record each truly-removed destination-
+   relative path (when the context carries a path list) and tally it by type
+   (when it carries a stats record), so the terminal STATUS_STATS frame can list
+   the paths and render rsync's per-type `Number of deleted files` breakdown.  A
+   failed append is best-effort (the deletion already happened; output is
+   cosmetic).  Shared by the single-threaded receiver and the -m pipeline's
+   deferred commit. */
+void receiver_record_deleted_path(void* context, const char* rel_path, DeleteEntryType type) {
+  ReceiverDeleteContext* del = context;
+  if (!del || !rel_path)
+    return;
+  if (del->stats) {
+    switch (type) {
+    case DELETE_ENTRY_DIR:
+      del->stats->deleted_dir++;
+      break;
+    case DELETE_ENTRY_LINK:
+      del->stats->deleted_link++;
+      break;
+    case DELETE_ENTRY_SPECIAL:
+      del->stats->deleted_special++;
+      break;
+    default:
+      del->stats->deleted_reg++;
+      break;
+    }
+  }
+  ArrayList* paths = del->deleted_paths;
+  if (!paths)
     return;
   /* Bound the retained list like the keep-set manifest: only MAX_MANIFEST_ENTRIES
      paths are ever transmitted in the terminal STATUS_STATS frame, so recording
@@ -118,6 +142,16 @@ void receiver_record_deleted_path(void* context, const char* rel_path) {
   char* copy = str_dup(rel_path);
   if (copy && !array_list_add(paths, copy))
     free(copy);
+}
+
+/* Install the delete observer (and its context) for one commit when the sink
+   carries a stats record or a path list.  Returns NULL when neither is needed,
+   so the delete engines skip the observer entirely. */
+static DeletePathObserver receiver_delete_observer(const ReceiverSink* sink,
+                                                   ReceiverDeleteContext* del) {
+  del->stats = sink ? sink->stats : NULL;
+  del->deleted_paths = sink ? sink->deleted_paths : NULL;
+  return (del->stats || del->deleted_paths) ? receiver_record_deleted_path : NULL;
 }
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
@@ -328,6 +362,9 @@ typedef struct {
      a successful FINISHED it is either committed here or handed to
      *pending_plans so the -m caller commits after its disk writer drained. */
   DeletePlanSession* plan_session;
+  /* Observer context for the per-directory delete session, which outlives the
+     frame handler; must stay alive until the session commits. */
+  ReceiverDeleteContext delete_ctx;
   bool early_delete;
   bool per_dir_delete;
   bool delete_limit_noted;
@@ -403,9 +440,95 @@ static ReceiverStep receiver_handle_check_batch(ReceiverPendingState* state) {
   return RECEIVER_STEP_NEXT;
 }
 
+/* Probe a destination entry's pre-transfer state for the output-parity
+   dest-info report (protocol 2.30.0).  `wire_path` is the destination-relative
+   path; `incoming_target` is non-NULL only for a symlink probe, in which case
+   the on-disk link target is compared with the target the receiver is about to
+   store (after --munge-links).  The final component is never followed and the
+   parent walk is confined below the receive root.  Returns false only on an
+   allocation/secure-walk failure; a missing entry is reported as existed=false. */
+static bool receiver_probe_dest_state(const Config* config, const char* wire_path,
+                                      const char* incoming_target, OutputDestState* out) {
+  memset(out, 0, sizeof(*out));
+  out->known = true;
+  if (!config || !wire_path || wire_path[0] == '\0')
+    return false;
+  char* full = path_cat(config->receive_root_directory, wire_path);
+  if (!full)
+    return false;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(full, &leaf, false);
+  free(full);
+  if (parent_fd < 0) {
+    /* A missing/unreachable parent means the entry cannot exist yet. */
+    free(leaf);
+    return true;
+  }
+  struct stat st;
+  if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+    out->existed = true;
+    out->size = (unsigned long long)st.st_size;
+    out->mtime_sec = (long long)st.st_mtime;
+#ifdef __linux__
+    out->mtime_nsec = st.st_mtim.tv_nsec;
+#endif
+    out->mode = (uint32_t)st.st_mode;
+    out->uid = (int32_t)st.st_uid;
+    out->gid = (int32_t)st.st_gid;
+    if (incoming_target && S_ISLNK(st.st_mode)) {
+      char target_buf[PATH_MAX];
+      ssize_t n = readlinkat(parent_fd, leaf, target_buf, sizeof(target_buf) - 1);
+      if (n >= 0) {
+        target_buf[n] = '\0';
+        char* expected =
+            config->munge_links ? file_symlink_munge(incoming_target) : str_dup(incoming_target);
+        if (expected) {
+          out->target_matches = strcmp(target_buf, expected) == 0;
+          free(expected);
+        }
+      }
+    }
+  }
+  close(parent_fd);
+  free(leaf);
+  return true;
+}
+
 static ReceiverStep receiver_handle_mkdir(ReceiverPendingState* state) {
-  File* dir = file_receive_directory(state->fd, state->config);
-  if (!dir || !state->sink->store_file(dir, state->sink->context))
+  const Config* config = state->config;
+  int fd = state->fd;
+  if (config->report_dest_info) {
+    int probe = 0;
+    if (!receive_int(fd, &probe) || (probe != 0 && probe != 1))
+      return RECEIVER_STEP_FAIL;
+    if (probe) {
+      /* Probe-only frame: report the destination state and create nothing. */
+      char* path = receive_wire_str(fd);
+      if (!path || path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
+        free(path);
+        send_status(fd, STATUS_ERROR);
+        return RECEIVER_STEP_FAIL;
+      }
+      OutputDestState info;
+      bool ok = receiver_probe_dest_state(config, path, NULL, &info);
+      free(path);
+      if (!ok || !send_status(fd, STATUS_DEST_INFO) || !format_dest_state_send(fd, &info))
+        return RECEIVER_STEP_FAIL;
+      return RECEIVER_STEP_NEXT;
+    }
+  }
+  File* dir = file_receive_directory(fd, config);
+  if (!dir)
+    return RECEIVER_STEP_ERROR;
+  if (config->report_dest_info) {
+    OutputDestState info;
+    bool ok = receiver_probe_dest_state(config, file_wire_path(dir), NULL, &info);
+    if (!ok || !send_status(fd, STATUS_DEST_INFO) || !format_dest_state_send(fd, &info)) {
+      file_destroy(dir);
+      return RECEIVER_STEP_FAIL;
+    }
+  }
+  if (!state->sink->store_file(dir, state->sink->context))
     return RECEIVER_STEP_ERROR;
   return RECEIVER_STEP_NEXT;
 }
@@ -424,8 +547,20 @@ static ReceiverStep receiver_handle_hardlink(ReceiverPendingState* state) {
 }
 
 static ReceiverStep receiver_handle_symlink(ReceiverPendingState* state) {
-  File* sym = file_receive_symlink(state->fd, state->config);
-  if (!sym || !state->sink->store_file(sym, state->sink->context))
+  const Config* config = state->config;
+  File* sym = file_receive_symlink(state->fd, config);
+  if (!sym)
+    return RECEIVER_STEP_ERROR;
+  if (config->report_dest_info) {
+    OutputDestState info;
+    bool ok = receiver_probe_dest_state(config, file_wire_path(sym), sym->symlink_target, &info);
+    if (!ok || !send_status(state->fd, STATUS_DEST_INFO) ||
+        !format_dest_state_send(state->fd, &info)) {
+      file_destroy(sym);
+      return RECEIVER_STEP_FAIL;
+    }
+  }
+  if (!state->sink->store_file(sym, state->sink->context))
     return RECEIVER_STEP_ERROR;
   return RECEIVER_STEP_NEXT;
 }
@@ -468,12 +603,11 @@ static ReceiverStep receiver_handle_manifest(ReceiverPendingState* state) {
        --max-delete-capped commit still succeeds and the transfer proceeds;
        the terminal success frame reports the cap. */
     size_t deleted = 0;
-    DeletePathObserver observer =
-        (config->report_deletes && sink->deleted_paths) ? receiver_record_deleted_path : NULL;
+    ReceiverDeleteContext delctx;
+    DeletePathObserver observer = receiver_delete_observer(sink, &delctx);
     DeleteCommitResult deletion =
         (config->use_delete || config->delete_missing_args)
-            ? manifest_delete_all_observed(config, manifest, &deleted, observer,
-                                           (void*)sink->deleted_paths)
+            ? manifest_delete_all_observed(config, manifest, &deleted, observer, &delctx)
             : DELETE_COMMIT_OK;
     receiver_tally_deleted(sink, deleted);
     delete_manifest_free(manifest);
@@ -516,9 +650,9 @@ static ReceiverStep receiver_handle_delete_plan(ReceiverPendingState* state) {
   }
   if (!state->plan_session) {
     state->plan_session = delete_plan_session_create(config);
-    if (state->plan_session && config->report_deletes && sink->deleted_paths)
+    if (state->plan_session && (sink->stats || sink->deleted_paths))
       delete_plan_session_set_delete_observer(state->plan_session, receiver_record_deleted_path,
-                                              (void*)sink->deleted_paths);
+                                              &state->delete_ctx);
   }
   if (!state->plan_session || delete_plan_session_receive(state->plan_session, config, fd) != 0)
     return RECEIVER_STEP_FAIL;
@@ -623,6 +757,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       .pending_plans = pending_plans,
       .deferred_manifest = NULL,
       .plan_session = NULL,
+      .delete_ctx = {sink ? sink->stats : NULL, sink ? sink->deleted_paths : NULL},
       .early_delete = config_delete_timing_early(config),
       .per_dir_delete = config_delete_timing_per_dir(config),
       .delete_limit_noted = false,
@@ -662,10 +797,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       state.deferred_manifest = NULL;
     } else {
       size_t deleted = 0;
-      DeletePathObserver observer =
-          (config->report_deletes && sink->deleted_paths) ? receiver_record_deleted_path : NULL;
+      DeletePathObserver observer = receiver_delete_observer(sink, &state.delete_ctx);
       DeleteCommitResult deletion = manifest_delete_all_observed(
-          config, state.deferred_manifest, &deleted, observer, (void*)sink->deleted_paths);
+          config, state.deferred_manifest, &deleted, observer, &state.delete_ctx);
       receiver_tally_deleted(sink, deleted);
       delete_manifest_free(state.deferred_manifest);
       state.deferred_manifest = NULL;
@@ -683,9 +817,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
      hands the session to its caller instead, which commits after the disk
      writer drained. */
   if (state.plan_session) {
-    if (config->report_deletes && sink->deleted_paths)
+    if (sink->stats || sink->deleted_paths)
       delete_plan_session_set_delete_observer(state.plan_session, receiver_record_deleted_path,
-                                              (void*)sink->deleted_paths);
+                                              &state.delete_ctx);
     if (state.pending_plans) {
       *state.pending_plans = state.plan_session;
       state.plan_session = NULL;

@@ -55,10 +55,20 @@ typedef struct {
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code);
 void receiver_outcomes_destroy(ReceiverOutcomes* outcomes);
 
-/* DeletePathObserver implementation for --info=del: `context` is an ArrayList*
-   that receives owned copies of every truly-removed destination-relative path.
-   Shared by the single-threaded receiver and the -m pipeline's deferred commit. */
-void receiver_record_deleted_path(void* context, const char* rel_path);
+/* Delete observer context: `deleted_paths` (optional) receives owned copies of
+   every truly-removed destination-relative path for --info=del; `stats`
+   (optional) receives the per-type `Number of deleted files` tallies for
+   --stats.  Both may be NULL, in which case the observer is a no-op. */
+typedef struct {
+  ReceiverStats* stats;
+  struct ArrayList* deleted_paths;
+} ReceiverDeleteContext;
+
+/* DeletePathObserver implementation: records each truly-removed path (when the
+   context carries a path list) and tallies it by type (when it carries a stats
+   record).  Shared by the single-threaded receiver and the -m pipeline's
+   deferred commit. */
+void receiver_record_deleted_path(void* context, const char* rel_path, DeleteEntryType type);
 
 /* Send the terminal success frame.  `final_status` is usually STATUS_OK, or
    STATUS_DELETE_LIMIT when a --max-delete commit was capped. */

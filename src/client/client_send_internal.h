@@ -68,6 +68,14 @@ void client_progress_name(const Config* config, const File* file);
 /* Emit a transferred entry's ancestor directories (as -i/--out-format change
  * lines or --progress name lines) before the entry's own line. */
 void client_change_emit_ancestors(const Config* config, const File* file);
+/* Output parity (protocol 2.30.0): probe each not-yet-known ancestor directory's
+ * pre-transfer destination state before the entry that first triggers it is
+ * sent.  Returns false on a protocol/transport error. */
+bool client_change_probe_ancestors(const Config* config, const File* file, int fd);
+/* Mark a transferred directory entry as already reported, and flush the
+ * itemize lines for changed directories that had no transferred child. */
+void client_change_mark_dir(const Config* config, const File* file);
+void client_change_emit_pending_dirs(const Config* config, int fd);
 void client_progress_uptodate(const Config* config, const File* file);
 void client_progress_prepare(const Config* config, const ArrayList* plan_dirs,
                              unsigned long long plan_non_dir_count);

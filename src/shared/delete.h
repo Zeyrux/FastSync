@@ -5,6 +5,7 @@
 #include "config.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/stat.h>
 
 /* Delete engine.
  *
@@ -66,6 +67,9 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
 typedef struct {
   char* name;
   bool is_dir;
+  /* The entry's full st_mode from the AT_SYMLINK_NOFOLLOW stat, so a delete
+     observer can classify a removed non-directory as reg/link/special. */
+  mode_t mode;
 } DeleteDirEntry;
 /* Collect the entries of the directory open on `dirfd` (excluding "." and ".."),
    stat'ing each with AT_SYMLINK_NOFOLLOW.  On success *out is a malloc'd array of
@@ -99,10 +103,24 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
                                        const FilterRuleList* protect_rules, size_t* deleted_out,
                                        size_t* skipped_out);
 
+/* Entry kind of a removed path, reported to the delete observer so the receiver
+   can build rsync's `--stats` `Number of deleted files` per-type breakdown.  The
+   four categories are a strict partition of every removed entry. */
+typedef enum {
+  DELETE_ENTRY_REG = 0,
+  DELETE_ENTRY_DIR,
+  DELETE_ENTRY_LINK,
+  DELETE_ENTRY_SPECIAL
+} DeleteEntryType;
+
 /* Optional per-deletion observer: called for each destination-relative path
-   actually removed (a file, symlink, or directory), in removal order, so the
-   receiver can stream rsync's `--info=del`/`--info=remove` lines. */
-typedef void (*DeletePathObserver)(void* context, const char* rel_path);
+   actually removed (a file, symlink, or directory) with its entry kind, in
+   removal order, so the receiver can stream rsync's `--info=del`/`--info=remove`
+   lines and tally the per-type `--stats` counters. */
+typedef void (*DeletePathObserver)(void* context, const char* rel_path, DeleteEntryType type);
+
+/* Classify a removed entry from its st_mode for the per-type delete counters. */
+DeleteEntryType delete_entry_type_of_mode(mode_t mode);
 
 /* `delete_extras_limited_observed` is delete_extras_limited with an optional
  * observer; the observer is invoked only for entries truly removed.  When

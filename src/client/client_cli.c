@@ -2807,8 +2807,11 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * need the pre-transfer destination snapshot (new vs modified and which
    * attributes differ), so ask the receiver to report it on every per-file
    * check.  This is a wire field. */
+  bool progress_active =
+      !config->quiet && (config->show_progress || (config->info_level & LOG_INFO_PROGRESS) != 0);
   config->report_dest_info = config->itemize_changes || config->out_format != NULL ||
-                             (config->log_file != NULL && config->log_file_format != NULL);
+                             (config->log_file != NULL && config->log_file_format != NULL) ||
+                             progress_active;
   /* Wire-stats parity: --stats, --progress/-P, an --out-format token that needs
    * a wire counter (%b/%c), or a dry-run --delete need the receiver's
    * end-of-transfer STATUS_STATS report.  This is a wire field (protocol

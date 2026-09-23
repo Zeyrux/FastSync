@@ -17,6 +17,7 @@ Run locally::
     python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity
 """
 import os
+import re
 import shutil
 import sys
 import warnings
@@ -664,6 +665,157 @@ def test_added_and_deleted_between_runs(parity_server_factory):
         ["-a", "--delete", "-i", "--incremental"], server,
         stdout=H.STDOUT_ITEMIZE)
     _run_and_check(case_id, result)
+
+
+def _seed_dest_tree(src, root):
+    """Copy `src`'s tree into `root` (the transfer mirror), preserving symlinks
+    and directory mtimes, so a second differential run starts from an existing
+    destination exactly like a seeded rsync run."""
+    os.makedirs(root, exist_ok=True)
+    for dirpath, dirnames, filenames in os.walk(src):
+        rel = os.path.relpath(dirpath, src)
+        for name in dirnames:
+            s = os.path.join(dirpath, name)
+            d = os.path.join(root, rel, name) if rel != "." else os.path.join(root, name)
+            if os.path.islink(s):
+                continue
+            os.makedirs(d, exist_ok=True)
+        for name in filenames:
+            s = os.path.join(dirpath, name)
+            d = os.path.join(root, rel, name) if rel != "." else os.path.join(root, name)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            if os.path.islink(s):
+                if os.path.lexists(d):
+                    os.remove(d)
+                os.symlink(os.readlink(s), d)
+            else:
+                shutil.copy2(s, d)
+        if rel != ".":
+            os.utime(os.path.join(root, rel), None)
+    os.utime(root, None)
+
+
+# A full rsync itemize code (11 columns) followed by the name.  H._ITEMIZE_RE
+# only matches created (`+`) entries, so the changed-attribute codes this test
+# asserts need their own matcher.
+_ITEMIZE_LINE_RE = re.compile(r"^[<>ch.*][fdLDS].{9} ")
+
+
+def _itemize_dir_link_lines(text):
+    """The itemize lines for directory and symlink entries, excluding the
+    transfer-root `./` line (FastSync emits it unconditionally; a documented
+    residual)."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.rstrip()
+        if not line or not _ITEMIZE_LINE_RE.match(line):
+            continue
+        name = line.rsplit(" ", 1)[-1]
+        if name == "./":
+            continue
+        if name.endswith("/") or " -> " in line:
+            out.append(line)
+    return sorted(out)
+
+
+@requires_rsync
+@parity
+def test_itemize_rerun_dirs_symlinks_matches_rsync(parity_server_factory):
+    """#314: a re-run reports directory/symlink destination state like rsync.
+
+    On an unchanged tree FastSync emits no per-directory `cd+++++++++` (or
+    symlink) lines, and after a changed directory mtime / symlink target it
+    renders rsync's `.d..t......` / `cLc........` instead of `cd`/`cL`."""
+    case_id = "itemize_rerun_dirs_symlinks"
+    src = os.path.join(TEST_DATA_DIR, "parity_itemds_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_itemds_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_itemds_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "sub", "b.txt"), b"nested\n")
+    os.makedirs(os.path.join(src, "emptydir"), exist_ok=True)
+    os.symlink("a.txt", os.path.join(src, "link"))
+    _mk(os.path.join(src, "a.txt"), b"top\n")
+    clean_dir(rdst)
+    clean_dir(fdst)
+    server = parity_server_factory(SUPER)
+    rroot = rdst
+    froot = get_dest_received_dir(fdst, src)
+    _seed_dest_tree(src, rroot)
+    _seed_dest_tree(src, froot)
+
+    # Unchanged re-run: no directory or symlink itemize lines from either tool.
+    rs = H.run_rsync(src, rdst, ["-a", "-i"])
+    fs, _ = H.run_fastsync(src, fdst, ["-a", "-i", "--incremental"], server.port)
+    assert rs.returncode == 0, rs.stderr
+    assert fs.returncode == 0, fs.stderr
+    assert _itemize_dir_link_lines(rs.stdout) == []
+    fast_unchanged = _itemize_dir_link_lines(fs.stdout)
+    assert fast_unchanged == [], f"unchanged re-run itemized dirs/links: {fast_unchanged}"
+
+    # Change the directory mtime and the symlink target, then re-run.
+    _pin(os.path.join(src, "sub"), _OLD_MTIME)
+    os.remove(os.path.join(src, "link"))
+    os.symlink("b.txt", os.path.join(src, "link"))
+    rs = H.run_rsync(src, rdst, ["-a", "-i"])
+    fs, _ = H.run_fastsync(src, fdst, ["-a", "-i", "--incremental"], server.port)
+    assert rs.returncode == 0, rs.stderr
+    assert fs.returncode == 0, fs.stderr
+    expected = _itemize_dir_link_lines(rs.stdout)
+    actual = _itemize_dir_link_lines(fs.stdout)
+    assert actual == expected, f"rsync={rs.stdout!r} fastsync={fs.stdout!r}"
+    assert any(line.endswith(" sub/") and line.startswith(".d..t") for line in actual), actual
+    assert any(line.startswith("cLc") and " -> b.txt" in line for line in actual), actual
+
+
+def _deleted_breakdown_line(text):
+    for line in (text or "").splitlines():
+        if line.startswith("Number of deleted files:"):
+            return " ".join(line.split())
+    return ""
+
+
+@requires_rsync
+@parity
+def test_stats_deleted_breakdown_matches_rsync(parity_server_factory):
+    """#316: `--stats` renders rsync's per-type `Number of deleted files`
+    breakdown for removed regular files, directories, symlinks and a special."""
+    case_id = "stats_deleted_breakdown"
+    src = os.path.join(TEST_DATA_DIR, "parity_delbd_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_delbd_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_delbd_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "keep.txt"), b"keep\n")
+    server = parity_server_factory(DELETE)
+
+    def seed(_src, rroot, froot):
+        for root in (rroot, froot):
+            _mk(os.path.join(root, "extra1.txt"), b"e1\n", _OLD_MTIME)
+            _mk(os.path.join(root, "extradir", "inside.txt"), b"e2\n", _OLD_MTIME)
+            os.makedirs(os.path.join(root, "extradir"), exist_ok=True)
+            link = os.path.join(root, "extralink")
+            if not os.path.lexists(link):
+                os.symlink("keep.txt", link)
+            fifo = os.path.join(root, "extrafifo")
+            if not os.path.exists(fifo):
+                os.mkfifo(fifo)
+
+    def extra(_src, _rroot, _froot, rs, fs):
+        rs_line = _deleted_breakdown_line(rs.stdout)
+        fs_line = _deleted_breakdown_line(fs.stdout)
+        if not rs_line:
+            return ["rsync printed no deleted-files line"]
+        if rs_line != fs_line:
+            return [f"deleted breakdown rsync={rs_line!r} fastsync={fs_line!r}"]
+        if "reg:" not in rs_line or "dir:" not in rs_line or \
+                "link:" not in rs_line or "special:" not in rs_line:
+            return [f"breakdown missing a category: {rs_line!r}"]
+        return []
+
+    result = H.run_differential(
+        src, rdst, fdst, ["-a", "--delete", "--stats"],
+        ["-a", "--delete", "--stats", "--incremental"], server,
+        seed=seed, extra_check=extra)
+    _run_and_check(case_id, result, ref="--stats deleted per-type breakdown")
 
 
 @requires_rsync

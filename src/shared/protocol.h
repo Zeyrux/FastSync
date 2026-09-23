@@ -129,8 +129,13 @@ enum NET_STATUS {
   STATUS_KEEPALIVE,
   STATUS_ABORT,
   STATUS_CHECK_BATCH,
-  /* An explicit directory entry (--dirs): the sender transmits only the path;
-   * the receiver creates the directory below the receive root. */
+  /* An explicit directory entry (--dirs / an empty source directory): the sender
+   * transmits the path and, when metadata/xattrs are negotiated, their blocks;
+   * the receiver creates the directory below the receive root.  Protocol 2.30.0
+   * inserts an int32 probe flag right after the status when report_dest_info is
+   * negotiated: probe=1 is a report-only frame (path only; the receiver answers
+   * STATUS_DEST_INFO and creates nothing), probe=0 is a real create that is
+   * answered with the directory's pre-transfer state before it is created. */
   STATUS_MKDIR,
   /* --append / --append-verify tail resume.  STATUS_APPEND is sent by the
    * receiver after a per-file STATUS_CHECK when the existing destination file
@@ -213,16 +218,22 @@ enum NET_STATUS {
    * limit stopped deletions").  Appended after STATUS_DRY_RUN_TRANSFER so no
    * existing status is renumbered. */
   STATUS_DELETE_LIMIT,
-  /* Destination-state report for output parity (protocol 2.23.0).  When the
-   * wire config carries report_dest_info=true, the receiver answers every
-   * per-file STATUS_CHECK request with STATUS_DEST_INFO FIRST, followed by a
-   * fixed record describing the pre-transfer destination entry
-   * (int32 has_old; uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode;
-   * int32 uid; int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict
-   * follows, so the sender can render rsync-accurate -i/--out-format columns
-   * (new vs modified, and which of size/time/perms/owner/group differ) without
-   * changing the transfer decision itself.  Appended after
-   * STATUS_DELETE_LIMIT so no existing status is renumbered. */
+  /* Destination-state report for output parity (protocol 2.23.0; extended to
+   * directories/symlinks in 2.30.0).  When the wire config carries
+   * report_dest_info=true, the receiver answers every per-file STATUS_CHECK
+   * request with STATUS_DEST_INFO FIRST, followed by a fixed record describing
+   * the pre-transfer destination entry (int32 has_old; int32 target_matches;
+   * uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode; int32 uid;
+   * int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict follows, so the
+   * sender can render rsync-accurate -i/--out-format columns (new vs modified,
+   * and which of size/time/perms/owner/group differ) without changing the
+   * transfer decision itself.  Protocol 2.30.0 also uses this record for
+   * STATUS_MKDIR and STATUS_SYMLINK: the sender consumes it into the entry's
+   * dest_state before emitting its change line, and target_matches reports
+   * whether an existing symlink's on-disk target already equals the incoming
+   * one (so the sender can render `cLc........` vs `.L..t......` and suppress
+   * an unchanged symlink).  Appended after STATUS_DELETE_LIMIT so no existing
+   * status is renumbered. */
   STATUS_DEST_INFO,
   /* Per-directory delete plan (protocol 2.24.0).  The sender of a
    * --delete-during/--delete-delay transfer streams one frame per source
@@ -244,8 +255,10 @@ enum NET_STATUS {
    * config carries report_stats=true, the receiver sends this status once,
    * immediately before its terminal success status, followed by a fixed stats
    * record (see format_stats_send/receive in format.h) and, when the run is a
-   * --dry-run with --delete, the would-delete path list.  Appended after
-   * STATUS_DELETE_PLAN so no existing status is renumbered. */
+   * --dry-run with --delete, the would-delete path list.  Protocol 2.30.0
+   * appends the four deleted_reg/dir/link/special counters to that record, so
+   * --stats can render rsync's `Number of deleted files` per-type breakdown.
+   * Appended after STATUS_DELETE_PLAN so no existing status is renumbered. */
   STATUS_STATS,
   /* Client diagnostic channel (protocol 2.30.0, rsync's --stderr=client /
    * --no-msgs2stderr).  When the client's --stderr mode is `client`, the

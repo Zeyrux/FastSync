@@ -64,6 +64,7 @@ static void test_dest_state_roundtrip() {
   memset(&out, 0, sizeof(out));
   out.known = true;
   out.existed = true;
+  out.target_matches = true;
   out.size = 123456789ULL;
   out.mtime_sec = 1700000000;
   out.mtime_nsec = 123456789;
@@ -76,6 +77,7 @@ static void test_dest_state_roundtrip() {
   EXPECT_TRUE(format_dest_state_receive(fds[1], &in));
   EXPECT_TRUE(in.known);
   EXPECT_TRUE(in.existed);
+  EXPECT_TRUE(in.target_matches);
   EXPECT_TRUE(in.size == out.size);
   EXPECT_TRUE(in.mtime_sec == out.mtime_sec);
   EXPECT_TRUE(in.mtime_nsec == out.mtime_nsec);
@@ -103,6 +105,10 @@ static void test_stats_roundtrip() {
   out.created_dir = 4;
   out.created_link = 2;
   out.created_special = 1;
+  out.deleted_reg = 9;
+  out.deleted_dir = 6;
+  out.deleted_link = 3;
+  out.deleted_special = 2;
   ReceiverStats in;
   memset(&in, 0, sizeof(in));
   EXPECT_TRUE(format_stats_send(fds[0], &out));
@@ -115,6 +121,10 @@ static void test_stats_roundtrip() {
   EXPECT_TRUE(in.created_dir == out.created_dir);
   EXPECT_TRUE(in.created_link == out.created_link);
   EXPECT_TRUE(in.created_special == out.created_special);
+  EXPECT_TRUE(in.deleted_reg == out.deleted_reg);
+  EXPECT_TRUE(in.deleted_dir == out.deleted_dir);
+  EXPECT_TRUE(in.deleted_link == out.deleted_link);
+  EXPECT_TRUE(in.deleted_special == out.deleted_special);
   close(fds[0]);
   close(fds[1]);
 }
