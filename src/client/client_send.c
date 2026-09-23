@@ -877,6 +877,23 @@ static bool source_is_regular_file(const File* file) {
   return stat(file->path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/* True when an over-threshold source will be sent by STREAMING from disk rather
+ * than loaded into memory: either the zero-copy sendfile path (no compression)
+ * or the sender-side streaming compressor (zstd/zlib, when this file is not on
+ * the --skip-compress list).  Otherwise the loader must materialize it. */
+static bool loader_can_stream(const Config* config, const File* file) {
+  if (!config || !file || !file->data || file->data->size <= STREAM_THRESHOLD)
+    return false;
+  if (!config->use_compression)
+    return true;
+  if (!compression_stream_compress_supported(compression_get_algo()) ||
+      config->compression_level <= 0)
+    return false;
+  int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+  return !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
+                                                skip_count);
+}
+
 static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
                                    ArrayList* remove_sources, TransferStats* stats) {
   /* --stderr=client: this is a frame boundary, so forward any diagnostics the
@@ -1423,7 +1440,7 @@ static int load_files_multithreaded(void* pipeline_context) {
     if (!context->config->use_sendfile) {
       for (int i = 0; i < chunk->element_count; i++) {
         File* f = chunk->items[i];
-        if (f->data->size > STREAM_THRESHOLD && !context->config->use_compression)
+        if (loader_can_stream(context->config, f))
           continue;
         if (!file_load_data(f)) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
@@ -1812,7 +1829,7 @@ static bool send_files_run(Config* config, SendFilesState* state) {
       bool load_ok = true;
       for (int i = 0; i < current_chunk->element_count; i++) {
         File* f = current_chunk->items[i];
-        if (f->data->size > STREAM_THRESHOLD && !config->use_compression)
+        if (loader_can_stream(config, f))
           continue;
         if (!file_load_data(f)) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");

@@ -38,6 +38,27 @@ static atomic_ullong io_bytes_read = 0;
 
 static unsigned long long global_bwlimit(void);
 
+/* Runtime whole-file receive bound (see protocol.h).  Resolved once; an
+ * override can only LOWER the ceiling, never raise it above the protocol
+ * constant, so the wire/security bound is unchanged.  A parse failure or a
+ * non-positive value leaves the default in place. */
+unsigned long long protocol_whole_file_receive_limit(void) {
+  static atomic_ullong cached = 0;
+  unsigned long long value = atomic_load_explicit(&cached, memory_order_relaxed);
+  if (value != 0)
+    return value;
+  value = MAX_RECEIVE_WHOLE_FILE_SIZE;
+  const char* env = getenv("FASTSYNC_MAX_WHOLE_FILE_SIZE");
+  if (env && env[0] != '\0') {
+    char* end = NULL;
+    unsigned long long parsed = strtoull(env, &end, 10);
+    if (end && *end == '\0' && parsed > 0 && parsed < value)
+      value = parsed;
+  }
+  atomic_store_explicit(&cached, value, memory_order_relaxed);
+  return value;
+}
+
 /* ------------------------------------------------------------------------- *
  * Transport vtable implementations.
  *
@@ -769,17 +790,11 @@ bool protocol_send_data(ProtocolSession* session, const Data* data) {
   return true;
 }
 
-Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long maximum_size) {
+Data* protocol_receive_data_alloc(ProtocolSession* session, unsigned long long size) {
   if (!session)
     return NULL;
-  unsigned long long size = 0;
-  if (!protocol_receive_n_data(session, &size, sizeof(unsigned long long)))
+  if (size > MAX_DATA_PAYLOAD_SIZE)
     return NULL;
-  if (size > MAX_DATA_PAYLOAD_SIZE || size > maximum_size) {
-    log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
-                (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
-    return NULL;
-  }
   if (size > SIZE_MAX)
     return NULL;
   size_t allocation_size = size == 0 ? 1 : (size_t)size;
@@ -794,12 +809,6 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
     protocol_release_memory_for_session(session, allocation_size);
     return NULL;
   }
-  if (!protocol_receive_n_data(session, data, (size_t)size)) {
-    free(data);
-    protocol_release_memory_for_session(session, allocation_size);
-    return NULL;
-  }
-  log_debug_message(LOG_DEBUG_PROTO, "Received %llu data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     protocol_release_memory_for_session(session, allocation_size);
@@ -808,6 +817,32 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
   result->protocol_charge = allocation_size;
   result->owner = session;
   return result;
+}
+
+Data* protocol_receive_data_body(ProtocolSession* session, unsigned long long size) {
+  Data* result = protocol_receive_data_alloc(session, size);
+  if (!result)
+    return NULL;
+  if (!protocol_receive_n_data(session, result->data, (size_t)size)) {
+    data_destroy(result);
+    return NULL;
+  }
+  log_debug_message(LOG_DEBUG_PROTO, "Received %llu data", size);
+  return result;
+}
+
+Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long maximum_size) {
+  if (!session)
+    return NULL;
+  unsigned long long size = 0;
+  if (!protocol_receive_n_data(session, &size, sizeof(unsigned long long)))
+    return NULL;
+  if (size > MAX_DATA_PAYLOAD_SIZE || size > maximum_size) {
+    log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
+                (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
+    return NULL;
+  }
+  return protocol_receive_data_body(session, size);
 }
 
 bool protocol_send_int(ProtocolSession* session, int data) {
@@ -1113,6 +1148,12 @@ Data* receive_data(int fd) {
 }
 Data* receive_data_limited(int fd, unsigned long long maximum_size) {
   return protocol_receive_data_limited(legacy_session(fd, -1), maximum_size);
+}
+Data* receive_data_body(int fd, unsigned long long size) {
+  return protocol_receive_data_body(legacy_session(fd, -1), size);
+}
+Data* receive_data_alloc(int fd, unsigned long long size) {
+  return protocol_receive_data_alloc(legacy_session(fd, -1), size);
 }
 bool send_int(int fd, int data) {
   return protocol_send_int(legacy_session(-1, fd), data);

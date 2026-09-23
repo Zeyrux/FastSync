@@ -206,9 +206,9 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `--chunk-serialization`. |
 | `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--ignore-existing` | Skip files that already exist on the receiver; like rsync it does not apply to directories or symlinks. |
-| `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`; a basis MISS above the 256 MiB whole-file payload bound is refused — see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
-| `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination (same basis-size caveat; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
-| `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win; same basis-size caveat; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
+| `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`; a basis of any size is supported, streamed in bounded chunks — see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
+| `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination (the copy is streamed, so a basis of any size works; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
+| `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win; a basis of any size works; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)) |
 | `--verify-basis` | FastSync-only: require a basis hit (`--compare-dest`/`--copy-dest`/`--link-dest`) to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync) |
 | `--delete` | Delete files on receiver not present in source (default timing: delete-during, matching rsync, so destination space is freed progressively). Scoped to the synchronized directories, so `--files-from` subsets are safe |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
@@ -300,6 +300,7 @@ transfer is never aborted.
 | `FASTSYNC_SOURCE_DIR` | — | Source directory fallback |
 | `FASTSYNC_DEST_DIR` | — | Destination directory fallback |
 | `FASTSYNC_SAVE_TO_DISK` | `false` | Disk persistence fallback |
+| `FASTSYNC_MAX_WHOLE_FILE_SIZE` | `268435456` | Receiver-only test hook: a byte count that lowers the whole-file streaming bound. Payloads above it are streamed through a bounded buffer. Values are clamped to the 256 MiB protocol ceiling, so it can only lower, never raise, the bound. |
 
 ## Implementation Details
 
@@ -580,9 +581,9 @@ remote SSH argv is already built injection-safe.
 | `--files-from <file>` | Read the source file list from FILE (paths relative to the source root). |
 | `-0, --from0` | Treat entries in `--files-from` files as NUL-delimited instead of newline-delimited. |
 | `--delay-updates` | Put updated files into place only at the end of the transfer (the fixed `.fastsync-stage` staging name diverges from rsync; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
-| `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`; a basis MISS above the 256 MiB whole-file payload bound is refused — see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
-| `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination (same basis-size caveat; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
-| `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win; same basis-size caveat; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
+| `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`; a basis of any size is supported, streamed in bounded chunks — see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
+| `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination (the copy is streamed, so a basis of any size works; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
+| `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win; a basis of any size works; see [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)). |
 | `--verify-basis` | FastSync-only: require a basis hit to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync). |
 | `--preallocate` | Allocate destination file space up front (fail-fast on a full disk). |
 | `--append` | Resume a shorter destination by appending only its tail (prefix not verified; requires `--incremental`). |

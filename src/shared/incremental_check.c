@@ -44,16 +44,26 @@ bool receive_file_xattrs(File* file, int fd, const Config* config) {
   return true;
 }
 
+static bool receive_file_payload_into(File* file, int fd, const Config* config,
+                                      const char* dest_path, unsigned long long expected_size);
+
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
-                                void* old_data, unsigned long long old_size, bool* failed) {
-  if (!old_data) {
-    free(old_data); /* defensive: old_data is always non-NULL today */
+                                void* old_data, unsigned long long old_size,
+                                unsigned long long expected_size, int basis_fd, bool* failed) {
+  if (!old_data && basis_fd < 0) {
+    free(old_data); /* defensive: a basis source is always provided today */
     *failed = true;
     return NULL;
   }
 
-  DeltaSignature* sig = delta_signature_create_seeded(old_data, old_size, config->delta_block_size,
-                                                      (uint32_t)config->checksum_seed);
+  /* The basis is either an in-memory snapshot (the destination file, bounded) or
+   * a confined descriptor (a --fuzzy sibling, possibly larger than memory) that
+   * is signed/applied in bounded chunks. */
+  DeltaSignature* sig =
+      old_data ? delta_signature_create_seeded(old_data, old_size, config->delta_block_size,
+                                               (uint32_t)config->checksum_seed)
+               : delta_signature_create_fd_seeded(basis_fd, old_size, config->delta_block_size,
+                                                  (uint32_t)config->checksum_seed);
   if (!sig) {
     free(old_data);
     *failed = true;
@@ -130,7 +140,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     }
 
     uint64_t new_size = delta->new_file_size;
-    if (new_size > MAX_RECEIVE_WHOLE_FILE_SIZE || new_size > SIZE_MAX) {
+    if (new_size > SIZE_MAX) {
       delta_destroy(delta);
       free(old_data);
       delta_signature_destroy(sig);
@@ -149,19 +159,57 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       else if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
         literal += delta->instructions[k].literal.length;
     }
-    void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
-    delta_destroy(delta);
 
-    if (!new_data) {
-      free(old_data);
-      delta_signature_destroy(sig);
-      *failed = true;
-      return NULL;
+    /* A reconstructed file above the streaming bound is written into a spool
+       temp file through delta_apply_to_fd; a smaller one keeps the historical
+       in-memory reconstruction. */
+    void* new_data = NULL;
+    char* spool = NULL;
+    if (new_size > protocol_whole_file_receive_limit()) {
+      char* dest_path = path_cat(config->receive_root_directory, check_path);
+      int spool_fd = dest_path ? file_spool_for_payload(dest_path, &spool) : -1;
+      free(dest_path);
+      if (spool_fd < 0) {
+        delta_destroy(delta);
+        free(old_data);
+        delta_signature_destroy(sig);
+        send_status(fd, STATUS_ERROR);
+        *failed = true;
+        return NULL;
+      }
+      bool applied = delta_apply_to_fd(old_data, basis_fd, old_size, delta,
+                                       config->delta_block_size, spool_fd);
+      if (close(spool_fd) != 0)
+        applied = false;
+      delta_destroy(delta);
+      if (!applied) {
+        unlink(spool);
+        free(spool);
+        free(old_data);
+        delta_signature_destroy(sig);
+        send_status(fd, STATUS_ERROR);
+        *failed = true;
+        return NULL;
+      }
+    } else {
+      new_data = old_data ? delta_apply(old_data, old_size, delta, config->delta_block_size)
+                          : delta_apply_fd(basis_fd, old_size, delta, config->delta_block_size);
+      delta_destroy(delta);
+      if (!new_data) {
+        free(old_data);
+        delta_signature_destroy(sig);
+        *failed = true;
+        return NULL;
+      }
     }
 
     File* file = file_create(check_path);
     if (!file) {
       free(new_data);
+      if (spool) {
+        unlink(spool);
+        free(spool);
+      }
       free(old_data);
       delta_signature_destroy(sig);
       *failed = true;
@@ -176,6 +224,10 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       if (!meta_ok) {
         file_destroy(file);
         free(new_data);
+        if (spool) {
+          unlink(spool);
+          free(spool);
+        }
         free(old_data);
         delta_signature_destroy(sig);
         *failed = true;
@@ -185,23 +237,45 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     if (!receive_file_xattrs(file, fd, config)) {
       file_destroy(file);
       free(new_data);
+      if (spool) {
+        unlink(spool);
+        free(spool);
+      }
       free(old_data);
       delta_signature_destroy(sig);
       *failed = true;
       return NULL;
     }
 
-    Data* replacement = data_create(new_data, (size_t)new_size);
-    if (replacement == NULL) {
-      file_destroy(file);
-      free(old_data);
-      delta_signature_destroy(sig);
-      send_status(fd, STATUS_ERROR);
-      *failed = true;
-      return NULL;
+    if (spool) {
+      Data* reserved = data_create_reserve((size_t)new_size);
+      if (reserved == NULL) {
+        unlink(spool);
+        free(spool);
+        file_destroy(file);
+        free(old_data);
+        delta_signature_destroy(sig);
+        send_status(fd, STATUS_ERROR);
+        *failed = true;
+        return NULL;
+      }
+      data_destroy(file->data);
+      file->data = reserved;
+      file->basis_copy = spool;
+      file->data_spool = true;
+    } else {
+      Data* replacement = data_create(new_data, (size_t)new_size);
+      if (replacement == NULL) {
+        file_destroy(file);
+        free(old_data);
+        delta_signature_destroy(sig);
+        send_status(fd, STATUS_ERROR);
+        *failed = true;
+        return NULL;
+      }
+      data_destroy(file->data);
+      file->data = replacement;
     }
-    data_destroy(file->data);
-    file->data = replacement;
 
     free(old_data);
     delta_signature_destroy(sig);
@@ -233,44 +307,19 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       return NULL;
     }
 
-    Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
-    if (file_data == NULL) {
+    char* dest_path = path_cat(config->receive_root_directory, check_path);
+    if (!dest_path) {
       file_destroy(file);
       *failed = true;
       return NULL;
     }
-
-    if (config->use_compression &&
-        !compression_should_skip_with_suffixes(
-            file->path, config->skip_compress_suffixes,
-            config->skip_compress_set ? config->skip_compress_count : -1)) {
-      Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
-      ProtocolSession* owner = file_data->owner;
-      data_destroy(file_data);
-      if (uncompressed == NULL) {
-        file_destroy(file);
-        *failed = true;
-        return NULL;
-      }
-      if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
-        data_destroy(uncompressed);
-        file_destroy(file);
-        send_status(fd, STATUS_ERROR);
-        *failed = true;
-        return NULL;
-      }
-      if (uncompressed->size > MAX_FILE_DATA_SIZE) {
-        data_destroy(uncompressed);
-        file_destroy(file);
-        send_status(fd, STATUS_ERROR);
-        *failed = true;
-        return NULL;
-      }
-      file_data = uncompressed;
+    bool payload_ok = receive_file_payload_into(file, fd, config, dest_path, expected_size);
+    free(dest_path);
+    if (!payload_ok) {
+      file_destroy(file);
+      *failed = true;
+      return NULL;
     }
-
-    data_destroy(file->data);
-    file->data = file_data;
     return file;
   }
 
@@ -640,28 +689,29 @@ static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandid
   return strcmp(cand->name, best->name) < 0;
 }
 
-/* Search the destination directory that will contain `check_path` for a
- * similar regular file usable as a --fuzzy delta basis and return its full
- * content in a malloc'd (protocol_alloc) buffer.  Returns NULL (with *out_size
- * = 0) when no candidate qualifies, which means the caller performs the normal
- * whole-file transfer. */
-static void* fuzzy_basis_find_and_load(const Config* config, const char* check_path,
-                                       unsigned long long check_size, time_t check_mtime,
-                                       long check_mtime_nsec, unsigned long long* out_size) {
+/* Search the destination directory that will contain `check_path` for a similar
+ * regular file usable as a --fuzzy delta basis and return an open, confined
+ * read descriptor to it (with *out_size set).  Returns -1 (with *out_size 0)
+ * when no candidate qualifies, which means the caller performs the normal
+ * whole-file transfer.  The basis is signed/applied by streaming its descriptor,
+ * so no whole-basis buffer is ever needed and its size is not capped. */
+static int fuzzy_basis_find_and_open(const Config* config, const char* check_path,
+                                     unsigned long long check_size, time_t check_mtime,
+                                     long check_mtime_nsec, unsigned long long* out_size) {
   *out_size = 0;
   if (!config || !config->receive_root_directory || !config->fuzzy || !config->use_delta ||
-      !check_path || check_size > MAX_RECEIVE_WHOLE_FILE_SIZE)
-    return NULL;
+      !check_path)
+    return -1;
 
   char* full_path = path_cat(config->receive_root_directory, check_path);
   if (!full_path)
-    return NULL;
+    return -1;
   char* leaf = NULL;
   int dir_fd = file_open_secure_parent(full_path, &leaf, false);
   if (dir_fd < 0 || !leaf) {
     free(leaf);
     free(full_path);
-    return NULL;
+    return -1;
   }
   size_t target_len = strlen(leaf);
   /* A target basename longer than FUZZY_NAME_LIMIT can never pass the name gate
@@ -670,7 +720,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     close(dir_fd);
     free(leaf);
     free(full_path);
-    return NULL;
+    return -1;
   }
 
   int scanfd = dup(dir_fd);
@@ -678,7 +728,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     close(dir_fd);
     free(leaf);
     free(full_path);
-    return NULL;
+    return -1;
   }
   DIR* dir = fdopendir(scanfd);
   if (!dir) {
@@ -686,7 +736,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     close(dir_fd);
     free(leaf);
     free(full_path);
-    return NULL;
+    return -1;
   }
 
   /* The weighted-distance scratch row is allocated once per scan (not once per
@@ -697,7 +747,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     close(dir_fd);
     free(leaf);
     free(full_path);
-    return NULL;
+    return -1;
   }
   int fname_suf_len = 0;
   const char* fname_suf = fuzzy_find_suffix(leaf, (int)target_len, &fname_suf_len);
@@ -727,7 +777,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode))
       continue;
     unsigned long long cand_size = (unsigned long long)st.st_size;
-    if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE)
+    if (cand_size == 0)
       continue;
     long cand_nsec = 0;
 #ifdef __linux__
@@ -771,7 +821,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
   if (exact.name[0])
     best = exact;
 
-  void* basis = NULL;
+  int basis_fd = -1;
   if (best.name[0]) {
     /* O_NONBLOCK: a name raced to a FIFO between the fstatat gate and this open
        would otherwise block the receive thread forever on open(2); with it the
@@ -781,29 +831,55 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (fd >= 0) {
       struct stat st;
       if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-          (unsigned long long)st.st_size == best.size && best.size <= SIZE_MAX) {
-        basis = protocol_alloc((size_t)best.size);
-        if (basis) {
-          size_t got = 0;
-          while (got < (size_t)best.size) {
-            ssize_t n = read(fd, (char*)basis + got, (size_t)best.size - got);
-            if (n <= 0) {
-              free(basis);
-              basis = NULL;
-              break;
-            }
-            got += (size_t)n;
-          }
-        }
+          (unsigned long long)st.st_size == best.size) {
+        basis_fd = fd;
+      } else {
+        close(fd);
       }
-      close(fd);
     }
   }
   close(dir_fd);
   free(full_path);
-  if (basis)
+  if (basis_fd >= 0)
     *out_size = best.size;
-  return basis;
+  return basis_fd;
+}
+
+/* Receive one whole-file data frame into `file`.  A payload at or below the
+ * receiver's streaming bound keeps the historical charged whole-buffer path; a
+ * larger one is streamed into a spool temp file (decompressing incrementally)
+ * and installed through the File's basis_copy field.  `expected_size` is the
+ * logical size from the check frame (0 when unknown, e.g. the non-incremental
+ * path). */
+static bool receive_file_payload_into(File* file, int fd, const Config* config,
+                                      const char* dest_path, unsigned long long expected_size) {
+  bool compress =
+      config->use_compression && !compression_should_skip_with_suffixes(
+                                     file->path, config->skip_compress_suffixes,
+                                     config->skip_compress_set ? config->skip_compress_count : -1);
+  Data* buffer = NULL;
+  char* spool = NULL;
+  unsigned long long size = 0;
+  if (!file_receive_payload(fd, compress, expected_size, dest_path,
+                            protocol_whole_file_receive_limit(), &buffer, &spool, &size)) {
+    return false;
+  }
+  if (spool) {
+    Data* reserved = data_create_reserve((size_t)size);
+    if (!reserved) {
+      unlink(spool);
+      free(spool);
+      return false;
+    }
+    data_destroy(file->data);
+    file->data = reserved;
+    file->basis_copy = spool;
+    file->data_spool = true;
+  } else {
+    data_destroy(file->data);
+    file->data = buffer;
+  }
+  return true;
 }
 
 /* Read the remainder of a full-file transfer after the receiver has already
@@ -811,7 +887,8 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
  * data frame, and return an owned File.  Shared by the plain full-transfer path
  * and the --append-verify prefix-mismatch fallback (a clean full transfer
  * instead of a corrupt prefix+tail blend). */
-static File* receive_full_file(int fd, const Config* config, const char* path) {
+static File* receive_full_file(int fd, const Config* config, const char* path,
+                               unsigned long long expected_size) {
   File* file = file_create(path);
   if (!file)
     return NULL;
@@ -827,36 +904,17 @@ static File* receive_full_file(int fd, const Config* config, const char* path) {
     file_destroy(file);
     return NULL;
   }
-  Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
-  if (file_data == NULL) {
+  char* dest_path = path_cat(config->receive_root_directory, path);
+  if (!dest_path) {
     file_destroy(file);
     return NULL;
   }
-  if (config->use_compression &&
-      !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
-                                             config->skip_compress_set ? config->skip_compress_count
-                                                                       : -1)) {
-    Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
-    ProtocolSession* owner = file_data->owner;
-    data_destroy(file_data);
-    if (uncompressed == NULL) {
-      file_destroy(file);
-      return NULL;
-    }
-    if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
-      data_destroy(uncompressed);
-      file_destroy(file);
-      return NULL;
-    }
-    if (uncompressed->size > MAX_FILE_DATA_SIZE) {
-      data_destroy(uncompressed);
-      file_destroy(file);
-      return NULL;
-    }
-    file_data = uncompressed;
+  bool ok = receive_file_payload_into(file, fd, config, dest_path, expected_size);
+  free(dest_path);
+  if (!ok) {
+    file_destroy(file);
+    return NULL;
   }
-  data_destroy(file->data);
-  file->data = file_data;
   return file;
 }
 
@@ -974,13 +1032,12 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
       return INCREMENTAL_ERROR;
   }
 
-  /* A basis-configured run may materialize a file larger than the whole-file
-     payload bound: a basis hit is streamed from the basis path (bounded
-     buffers), so the check size is not itself an allocation.  Every other
-     path (delta/append/full) still applies MAX_RECEIVE_WHOLE_FILE_SIZE, and a
-     miss simply falls through to the normal transfer with its own bound. */
-  if (!config_has_basis(config) && state->check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
-    send_error_detail(fd, "check size exceeds receiver limit");
+  /* No file-size refusal: a whole-file payload larger than the historical
+     whole-file bound is streamed through a bounded buffer (see
+     file_receive_payload).  Only a size that cannot be represented on this
+     platform is rejected. */
+  if (state->check_size > SIZE_MAX) {
+    send_error_detail(fd, "check size is not representable");
     return INCREMENTAL_ERROR;
   }
 
@@ -1411,7 +1468,7 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
       close(state->old_fd);
       state->old_fd = -1;
     }
-    *out_file = receive_full_file(fd, config, check_path);
+    *out_file = receive_full_file(fd, config, check_path, check_size);
     return INCREMENTAL_FILE;
   }
 
@@ -1516,8 +1573,9 @@ static IncrementalCheckOutcome incremental_check_try_delta(IncrementalCheckState
                                                            bool try_delta, File** out_file) {
   if (try_delta && state->old_data != NULL) {
     bool delta_failed = false;
-    File* delta_file = receive_delta_file(state->fd, state->config, state->check_path,
-                                          state->old_data, state->old_size, &delta_failed);
+    File* delta_file =
+        receive_delta_file(state->fd, state->config, state->check_path, state->old_data,
+                           state->old_size, state->check_size, -1, &delta_failed);
     state->old_data = NULL; /* receive_delta_file consumes the snapshot on every path */
     if (delta_file) {
       *out_file = delta_file;
@@ -1540,14 +1598,14 @@ static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState
   if (!config->fuzzy || !config->use_delta)
     return INCREMENTAL_CONTINUE;
   unsigned long long fuzzy_size = 0;
-  void* fuzzy_basis = fuzzy_basis_find_and_load(config, state->check_path, state->check_size,
-                                                (time_t)state->check_mtime,
-                                                (long)state->check_mtime_nsec, &fuzzy_size);
-  if (fuzzy_basis != NULL) {
+  int fuzzy_fd = fuzzy_basis_find_and_open(config, state->check_path, state->check_size,
+                                           (time_t)state->check_mtime,
+                                           (long)state->check_mtime_nsec, &fuzzy_size);
+  if (fuzzy_fd >= 0) {
     bool fuzzy_failed = false;
-    File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, fuzzy_basis,
-                                          fuzzy_size, &fuzzy_failed);
-    fuzzy_basis = NULL; /* receive_delta_file consumes the buffer on every path */
+    File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, NULL, fuzzy_size,
+                                          state->check_size, fuzzy_fd, &fuzzy_failed);
+    close(fuzzy_fd);
     if (fuzzy_file) {
       *out_file = fuzzy_file;
       return INCREMENTAL_FILE;
@@ -1555,7 +1613,6 @@ static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState
     if (fuzzy_failed)
       return INCREMENTAL_ERROR;
   }
-  free(fuzzy_basis);
   return INCREMENTAL_CONTINUE;
 }
 
@@ -1567,7 +1624,7 @@ static File* incremental_check_receive_full(IncrementalCheckState* state) {
     close(state->old_fd);
     state->old_fd = -1;
   }
-  return receive_full_file(state->fd, state->config, state->check_path);
+  return receive_full_file(state->fd, state->config, state->check_path, state->check_size);
 }
 
 /* Core implementation.  `would_transfer` (may be NULL) is set true only on the

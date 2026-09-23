@@ -34,7 +34,7 @@ class ServerManager:
         self._proc = None
         self._port = None
 
-    def start(self, extra_args=None):
+    def start(self, extra_args=None, env=None):
         self.stop()
         self._port = _find_free_port()
         # Plain TCP is intentionally explicit in the server; integration tests
@@ -42,7 +42,11 @@ class ServerManager:
         cmd = SERVER_CMD + ["-p", str(self._port), "--allow-unauthenticated"]
         if extra_args:
             cmd += extra_args
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc_env = dict(os.environ)
+        if env:
+            proc_env.update(env)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      env=proc_env)
         _wait_for_port(self._port, timeout=5)
 
     def stop(self):

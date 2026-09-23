@@ -1,10 +1,12 @@
 #include "delta.h"
 #include "log.h"
 #include "protocol.h"
+#include <errno.h>
 #include <stdint.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define XXH_STATIC_LINKING_ONLY
 #define XXH_IMPLEMENTATION
@@ -79,6 +81,64 @@ DeltaSignature* delta_signature_create_seeded(const void* old_file_data, uint64_
     sig->blocks[i].xxhash = delta_xxhash32_seeded(data + offset, len, seed);
   }
 
+  return sig;
+}
+
+/* Bounded read of exactly `len` bytes at `off`; retries on EINTR. */
+static bool pread_all(int fd, void* buf, size_t len, uint64_t off) {
+  uint8_t* p = buf;
+  size_t done = 0;
+  while (done < len) {
+    ssize_t n = pread(fd, p + done, len - done, (off_t)(off + done));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return false;
+    done += (size_t)n;
+  }
+  return true;
+}
+
+DeltaSignature* delta_signature_create_fd_seeded(int fd, uint64_t old_file_size,
+                                                 uint32_t block_size, uint32_t seed) {
+  if (fd < 0 || old_file_size == 0 || block_size == 0 || block_size > DELTA_BLOCK_SIZE_MAX ||
+      old_file_size > UINT32_MAX * (uint64_t)block_size)
+    return NULL;
+  uint32_t block_count = (uint32_t)((old_file_size + block_size - 1) / block_size);
+  /* Bound the signature's own memory (block_count * sizeof(DeltaBlockSig)). */
+  if (block_count == 0 || block_count > MAX_DELTA_BLOCKS)
+    return NULL;
+  DeltaSignature* sig = protocol_alloc(sizeof(DeltaSignature));
+  if (!sig)
+    return NULL;
+  sig->file_size = old_file_size;
+  sig->block_size = block_size;
+  sig->block_count = block_count;
+  sig->blocks = protocol_alloc((size_t)block_count * sizeof(DeltaBlockSig));
+  if (!sig->blocks) {
+    free(sig);
+    return NULL;
+  }
+  uint8_t* block = malloc(block_size);
+  if (!block) {
+    free(sig->blocks);
+    free(sig);
+    return NULL;
+  }
+  for (uint32_t i = 0; i < block_count; i++) {
+    uint64_t offset = (uint64_t)i * block_size;
+    uint32_t len =
+        (uint32_t)((old_file_size - offset < block_size) ? (old_file_size - offset) : block_size);
+    if (!pread_all(fd, block, len, offset)) {
+      free(block);
+      free(sig->blocks);
+      free(sig);
+      return NULL;
+    }
+    sig->blocks[i].adler32 = delta_adler32(block, len);
+    sig->blocks[i].xxhash = delta_xxhash32_seeded(block, len, seed);
+  }
+  free(block);
   return sig;
 }
 
@@ -685,6 +745,130 @@ void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
   }
 
   return output;
+}
+
+void* delta_apply_fd(int src_fd, uint64_t old_size, const Delta* delta, uint32_t block_size) {
+  if (!delta || block_size == 0 || block_size > DELTA_BLOCK_SIZE_MAX ||
+      (delta->instruction_count > 0 && !delta->instructions) || delta->new_file_size == 0 ||
+      delta->new_file_size > SIZE_MAX)
+    return NULL;
+
+  void* output = protocol_alloc((size_t)delta->new_file_size);
+  if (!output)
+    return NULL;
+
+  uint8_t* out = (uint8_t*)output;
+  uint64_t out_pos = 0;
+
+  for (uint32_t i = 0; i < delta->instruction_count; i++) {
+    if (delta->instructions[i].type == DELTA_INSTR_BLOCK_MATCH) {
+      uint64_t src_offset = (uint64_t)delta->instructions[i].match.block_index * block_size;
+      if (src_offset > UINT64_MAX - delta->instructions[i].match.block_offset) {
+        free(output);
+        return NULL;
+      }
+      src_offset += delta->instructions[i].match.block_offset;
+      uint32_t len = delta->instructions[i].match.length;
+
+      if (src_offset > old_size || (uint64_t)len > old_size - src_offset ||
+          out_pos > delta->new_file_size || (uint64_t)len > delta->new_file_size - out_pos) {
+        free(output);
+        return NULL;
+      }
+      if (!pread_all(src_fd, out + out_pos, len, src_offset)) {
+        free(output);
+        return NULL;
+      }
+      out_pos += len;
+    } else if (delta->instructions[i].type == DELTA_INSTR_LITERAL) {
+      uint32_t len = delta->instructions[i].literal.length;
+      if (out_pos > delta->new_file_size || (uint64_t)len > delta->new_file_size - out_pos) {
+        free(output);
+        return NULL;
+      }
+      memcpy(out + out_pos, delta->instructions[i].literal.data, len);
+      out_pos += len;
+    } else {
+      free(output);
+      return NULL;
+    }
+  }
+
+  if (out_pos != delta->new_file_size) {
+    free(output);
+    return NULL;
+  }
+  return output;
+}
+
+bool delta_apply_to_fd(const void* old_data, int src_fd, uint64_t old_size, const Delta* delta,
+                       uint32_t block_size, int dst_fd) {
+  if (!delta || (old_data == NULL && src_fd < 0) || block_size == 0 ||
+      block_size > DELTA_BLOCK_SIZE_MAX || (delta->instruction_count > 0 && !delta->instructions))
+    return false;
+  const int chunk = 1 << 20;
+  uint8_t* buf = malloc((size_t)chunk);
+  if (!buf)
+    return false;
+  uint64_t out_pos = 0;
+  bool ok = true;
+  for (uint32_t i = 0; i < delta->instruction_count && ok; i++) {
+    uint64_t src_offset = 0;
+    uint64_t len = 0;
+    const uint8_t* lit = NULL;
+    if (delta->instructions[i].type == DELTA_INSTR_BLOCK_MATCH) {
+      src_offset = (uint64_t)delta->instructions[i].match.block_index * block_size;
+      if (src_offset > UINT64_MAX - delta->instructions[i].match.block_offset ||
+          src_offset + delta->instructions[i].match.block_offset > old_size) {
+        ok = false;
+        break;
+      }
+      src_offset += delta->instructions[i].match.block_offset;
+      len = delta->instructions[i].match.length;
+      if (len > old_size - src_offset) {
+        ok = false;
+        break;
+      }
+    } else if (delta->instructions[i].type == DELTA_INSTR_LITERAL) {
+      lit = delta->instructions[i].literal.data;
+      len = delta->instructions[i].literal.length;
+    } else {
+      ok = false;
+      break;
+    }
+    if (out_pos > delta->new_file_size || len > delta->new_file_size - out_pos) {
+      ok = false;
+      break;
+    }
+    uint64_t done = 0;
+    while (ok && done < len) {
+      size_t want = (len - done) < (uint64_t)chunk ? (size_t)(len - done) : (size_t)chunk;
+      if (lit) {
+        memcpy(buf, lit + done, want);
+      } else if (old_data) {
+        memcpy(buf, (const uint8_t*)old_data + src_offset + done, want);
+      } else if (!pread_all(src_fd, buf, want, src_offset + done)) {
+        ok = false;
+        break;
+      }
+      const uint8_t* p = buf;
+      size_t written = 0;
+      while (written < want) {
+        ssize_t n = write(dst_fd, p + written, want - written);
+        if (n < 0 && errno == EINTR)
+          continue;
+        if (n <= 0) {
+          ok = false;
+          break;
+        }
+        written += (size_t)n;
+      }
+      done += want;
+    }
+    out_pos += len;
+  }
+  free(buf);
+  return ok && out_pos == delta->new_file_size;
 }
 
 void delta_destroy(Delta* delta) {

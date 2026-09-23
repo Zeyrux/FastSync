@@ -177,6 +177,24 @@ bool file_copy_basis_stream_attrs(const char* path, const char* basis_path,
                                   const FileMetadata* metadata, FileAttrPolicy policy, bool update,
                                   bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                   const char* temp_dir);
+/* Receive one length-prefixed whole-file data frame, streaming the payload
+ * through a bounded buffer when it (or its known logical size) exceeds
+ * `stream_limit`.  On success exactly one of *out_buffer / *out_spool is set:
+ *   - *out_buffer: the historical charged whole-buffer Data (caller destroys);
+ *   - *out_spool: an owned temp path holding the payload, installed through the
+ *     File's basis_copy field with File.data_spool set so file_destroy unlinks
+ *     it.  The destination policy/metadata/atomic-store handling is then the
+ *     existing bounded-buffer basis install (file_copy_basis_stream_attrs).
+ * `expected_size` (0 = unknown) is the logical size from the check frame;
+ * `dest_path` locates the spool next to the destination; `compress` selects
+ * incremental decompression.  Returns false on any framing/I/O/size error. */
+bool file_receive_payload(int fd, bool compress, unsigned long long expected_size,
+                          const char* dest_path, unsigned long long stream_limit, Data** out_buffer,
+                          char** out_spool, unsigned long long* out_size);
+/* Create a confined spool temp file next to `dest_path`; returns an open write
+ * fd and an owned absolute path (to be installed via File.basis_copy with
+ * File.data_spool set, and unlinked by file_destroy). */
+int file_spool_for_payload(const char* dest_path, char** out_spool_path);
 /* Protocol 2.28.0 receiver-stat variants: like the two above but additionally
  * report through `dirs_created` (when non-NULL) how many parent directories the
  * confined secure walk had to create that lie strictly below `count_floor` (a
