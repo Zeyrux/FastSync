@@ -1011,11 +1011,9 @@ static void server_run_mt_receiver(ServerSession* state) {
        --delete-during already applied its plans on the receive thread. */
     if (context->deferred_plans) {
       /* Defence in depth (the enclosing block already excludes dry-run): a
-         -n run never commits a deletion. */
-      ReceiverDeleteContext delctx = {&context->stats, context->deleted_paths};
-      if (delctx.stats || delctx.deleted_paths)
-        delete_plan_session_set_delete_observer(context->deferred_plans,
-                                                receiver_record_deleted_path, &delctx);
+         -n run never commits a deletion.  The session's observer context was
+         installed by receive_thread from context->delete_ctx, which outlives
+         both threads, so no stack context is needed here. */
       DeleteCommitResult deletion =
           config->dry_run ? DELETE_COMMIT_OK
                           : delete_plan_session_commit(context->deferred_plans, config);

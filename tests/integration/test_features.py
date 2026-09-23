@@ -2893,6 +2893,37 @@ class TestItemizeChanges:
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-i", "--dry-run"])
         assert result.returncode == 0, f"dry-run -i failed: {result.stderr[:200]}"
 
+    def test_chunk_serialization_probes_ancestor_dir_state(self, shared_server):
+        """#314: --chunk-serialization + -i must probe ancestor directory state
+        so a pre-existing directory with a changed mtime itemizes as an
+        attribute change (`.d..t......`) instead of being rendered as created
+        (`cd+++++++++`)."""
+        source = os.path.join(TEST_DATA_DIR, "itemize_chunk_serial_src")
+        dest = os.path.join(TEST_DATA_DIR, "itemize_chunk_serial_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        subdir = os.path.join(source, "sub")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "file.txt"), "wb") as fh:
+            fh.write(b"payload\n")
+
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+
+        # Change only the source directory's mtime; its contents stay identical
+        # so only the directory's time attribute differs on the rerun.
+        os.utime(subdir, (1_000_000_000, 1_000_000_000))
+
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "-i", "--chunk-serialization"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"chunk-serialization -i failed: {result.stderr[:200]}"
+        dir_lines = [line for line in result.stdout.splitlines() if line.endswith(" sub/")]
+        assert dir_lines == [".d..t...... sub/"], (
+            f"expected an attribute-change dir line, got {dir_lines!r}; "
+            f"full stdout={result.stdout!r}"
+        )
+
     def test_changed_file_on_second_incremental_run_prints_exactly_one_line(self, shared_server):
         """A changed file itemizes exactly once on an incremental rerun while
         unchanged files print nothing (no double emission)."""

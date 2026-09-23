@@ -46,6 +46,11 @@ typedef struct PipelineContextReceiver {
      committing while the disk writer may still be draining; server.c commits it
      after both threads joined.  NULL for every other timing. */
   DeletePlanSession* deferred_plans;
+  /* Observer context for `deferred_plans`.  It must outlive the receive thread
+     (the session is committed by server.c after both threads join), so it lives
+     here rather than on receiver_process_pending()'s stack; receive_thread
+     installs it on the session. */
+  ReceiverDeleteContext delete_ctx;
   /* Set by server.c when the deferred delete commit hit the --max-delete
      budget; the terminal success frame then carries STATUS_DELETE_LIMIT
      (rsync exit 25) while the transfer itself still succeeds. */

@@ -341,7 +341,13 @@ static bool receiver_note_status(const struct timespec* session_start,
 }
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink) {
-  return receiver_process_pending(config, file_descriptor, sink, NULL, NULL);
+  return receiver_process_pending_ctx(config, file_descriptor, sink, NULL, NULL, NULL);
+}
+
+int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
+                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
+  return receiver_process_pending_ctx(config, file_descriptor, sink, pending_manifest,
+                                      pending_plans, NULL);
 }
 
 /* Per-connection state threaded through the status handlers below.  The parked
@@ -363,8 +369,10 @@ typedef struct {
      *pending_plans so the -m caller commits after its disk writer drained. */
   DeletePlanSession* plan_session;
   /* Observer context for the per-directory delete session, which outlives the
-     frame handler; must stay alive until the session commits. */
-  ReceiverDeleteContext delete_ctx;
+     frame handler; must stay alive until the session commits.  For a session
+     handed to the caller (pending_plans) this points at a caller-owned
+     long-lived context; otherwise it points at an internal stack context. */
+  ReceiverDeleteContext* delete_ctx;
   bool early_delete;
   bool per_dir_delete;
   bool delete_limit_noted;
@@ -386,18 +394,16 @@ static ReceiverStep receiver_handle_keepalive(ReceiverPendingState* state) {
 }
 
 /* rsync --stderr=client: a client diagnostic forwarded over the wire.  Read the
- * bounded string and write it to the server's stderr (respecting the server log
- * destination).  The body is peer-controlled text, so it is logged verbatim
- * (log_client_message adds the standard prefix); trailing newlines are stripped
- * so a message cannot inject a blank line.  A malformed string (over-long or
- * embedded NUL) is a framing error and tears the connection down. */
+ * bounded string and log it through the normal destination/level gate.  The
+ * body is peer-controlled text: log_client_message() escapes every
+ * non-printable byte (newlines, CR, ANSI ESC, ...) before writing, so a hostile
+ * client cannot forge log lines or inject terminal control sequences.  A
+ * malformed string (over-long or embedded NUL) is a framing error and tears the
+ * connection down. */
 static ReceiverStep receiver_handle_client_msg(ReceiverPendingState* state) {
   char* message = receive_str(state->fd);
   if (!message)
     return RECEIVER_STEP_FAIL;
-  size_t len = strlen(message);
-  while (len > 0 && (message[len - 1] == '\n' || message[len - 1] == '\r'))
-    message[--len] = '\0';
   if (message[0] != '\0')
     log_client_message(message);
   free(message);
@@ -652,7 +658,7 @@ static ReceiverStep receiver_handle_delete_plan(ReceiverPendingState* state) {
     state->plan_session = delete_plan_session_create(config);
     if (state->plan_session && (sink->stats || sink->deleted_paths))
       delete_plan_session_set_delete_observer(state->plan_session, receiver_record_deleted_path,
-                                              &state->delete_ctx);
+                                              state->delete_ctx);
   }
   if (!state->plan_session || delete_plan_session_receive(state->plan_session, config, fd) != 0)
     return RECEIVER_STEP_FAIL;
@@ -735,8 +741,10 @@ static void receiver_drop_pending(ReceiverPendingState* state) {
    delete-during plan mode (no manifest at all).  See the per-frame handlers
    above for how the -m receiver defers that commit until its disk writer has
    drained. */
-int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
+int receiver_process_pending_ctx(Config* config, int file_descriptor, const ReceiverSink* sink,
+                                 DeleteManifest** pending_manifest,
+                                 DeletePlanSession** pending_plans,
+                                 ReceiverDeleteContext* observer_ctx) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return -1;
@@ -749,6 +757,13 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   last_progress = session_start;
   if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor, sink))
     return -1;
+  /* A per-directory delete session handed to the caller outlives this stack
+     frame, so its observer context must be caller-owned (observer_ctx); only
+     the default inline-commit case may use the stack context. */
+  ReceiverDeleteContext local_ctx;
+  ReceiverDeleteContext* delete_ctx = observer_ctx ? observer_ctx : &local_ctx;
+  delete_ctx->stats = sink ? sink->stats : NULL;
+  delete_ctx->deleted_paths = sink ? sink->deleted_paths : NULL;
   ReceiverPendingState state = {
       .config = config,
       .fd = file_descriptor,
@@ -757,7 +772,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       .pending_plans = pending_plans,
       .deferred_manifest = NULL,
       .plan_session = NULL,
-      .delete_ctx = {sink ? sink->stats : NULL, sink ? sink->deleted_paths : NULL},
+      .delete_ctx = delete_ctx,
       .early_delete = config_delete_timing_early(config),
       .per_dir_delete = config_delete_timing_per_dir(config),
       .delete_limit_noted = false,
@@ -797,9 +812,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       state.deferred_manifest = NULL;
     } else {
       size_t deleted = 0;
-      DeletePathObserver observer = receiver_delete_observer(sink, &state.delete_ctx);
+      DeletePathObserver observer = receiver_delete_observer(sink, state.delete_ctx);
       DeleteCommitResult deletion = manifest_delete_all_observed(
-          config, state.deferred_manifest, &deleted, observer, &state.delete_ctx);
+          config, state.deferred_manifest, &deleted, observer, state.delete_ctx);
       receiver_tally_deleted(sink, deleted);
       delete_manifest_free(state.deferred_manifest);
       state.deferred_manifest = NULL;
@@ -819,7 +834,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   if (state.plan_session) {
     if (sink->stats || sink->deleted_paths)
       delete_plan_session_set_delete_observer(state.plan_session, receiver_record_deleted_path,
-                                              &state.delete_ctx);
+                                              state.delete_ctx);
     if (state.pending_plans) {
       *state.pending_plans = state.plan_session;
       state.plan_session = NULL;

@@ -255,8 +255,18 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
     *delete_limit_out = false;
   if (partial_out)
     *partial_out = false;
+  /* --stderr=client: the receiver consumes frames until it reads
+     STATUS_FINISHED, after which it no longer reads.  Flush every diagnostic
+     queued during the transfer here -- the last frame boundary at which the
+     peer is still reading -- so nothing is stranded in the queue. */
+  client_flush_client_messages(client->file_descriptor);
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     return false;
+  /* Past STATUS_FINISHED the receiver has stopped reading, so any diagnostic
+     logged from here on (notably the STATUS_PARTIAL warning below) can no
+     longer be forwarded.  Deactivate the channel so those messages fall back
+     to local output instead of being queued for a closed peer and lost. */
+  client_messages_activate(false);
   /* The receiver emits its optional wire-stats frame (protocol 2.25.0) FIRST,
      then any per-file --remove-source-files acks, then the terminal status. */
   Status status;
@@ -899,6 +909,13 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       if (chunk->items[i] == NULL)
         continue;
       transfer_stats_note_entry(stats, chunk->items[i]);
+      /* Output parity: probe each entry's ancestor directories' destination
+         state before emitting its itemize line, exactly as the non-serialized
+         loop does.  Without this, dest_state.known stays false and -i/-P
+         renders an existing dir/symlink as created instead of `.d..t...` (or
+         suppressing it). */
+      if (!client_change_probe_ancestors(config, chunk->items[i], client->file_descriptor))
+        return -1;
       /* The chunk-serialization path emits no --progress name lines, so only
          feed -i/--out-format its ancestor directory lines here. */
       if (config->itemize_changes || config->out_format != NULL)

@@ -309,6 +309,48 @@ static void test_log_set_file_null_before_fclose(void) {
   EXPECT_TRUE(true);
 }
 
+/* The server's client-message channel logs a peer-controlled body: it must be
+ * escaped so an interior newline/CR/ANSI escape cannot forge a log line or
+ * move the terminal cursor.  With the default stderr mode a forwarded message
+ * is emitted as a warning on stdout. */
+static void test_log_client_message_sanitized(void) {
+  int pipe_fds[2];
+  EXPECT_EQ_INT(pipe(pipe_fds), 0);
+  /* Drain anything earlier tests buffered on stdout before redirecting, so the
+     capture holds only this test's single log line. */
+  fflush(stdout);
+  int saved_stdout = dup(STDOUT_FILENO);
+  EXPECT_TRUE(saved_stdout >= 0);
+  EXPECT_TRUE(dup2(pipe_fds[1], STDOUT_FILENO) >= 0);
+  close(pipe_fds[1]);
+
+  set_log_level(LOG_LEVEL_WARNING);
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+  log_client_message("forged\n2026-01-01 [ERROR]: fake\x1b[31mred");
+  fflush(stdout);
+
+  EXPECT_TRUE(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+  close(saved_stdout);
+  char output[512] = {0};
+  ssize_t length = read(pipe_fds[0], output, sizeof(output) - 1);
+  close(pipe_fds[0]);
+  EXPECT_TRUE(length > 0);
+  /* The interior newline became an escaped octal, so the body stays on one
+     physical line: exactly one '\n' (the log terminator) is present. */
+  int newlines = 0;
+  for (ssize_t i = 0; i < length; i++) {
+    if (output[i] == '\n')
+      newlines++;
+  }
+  EXPECT_EQ_INT(newlines, 1);
+  /* The ESC introducer is escaped too, so no raw ANSI sequence reaches the
+     terminal. */
+  EXPECT_TRUE(strchr(output, '\x1b') == NULL);
+  EXPECT_TRUE(strstr(output, "forged") != NULL);
+  EXPECT_TRUE(strstr(output, "fake") != NULL);
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+}
+
 void test_log() {
   test_log_message_debug();
   test_log_message_info();
@@ -320,6 +362,7 @@ void test_log() {
   test_log_filtering();
   test_log_stderr_mode_all();
   test_log_stderr_mode_client();
+  test_log_client_message_sanitized();
   test_log_message_formats();
   test_log_debug_enabled_matches_gate();
   test_log_concurrent_no_torn_lines();

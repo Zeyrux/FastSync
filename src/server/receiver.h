@@ -93,6 +93,17 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    for either to keep the default behaviour (delete before the success frame). */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
                              DeleteManifest** pending_manifest, DeletePlanSession** pending_plans);
+/* receiver_process_pending() with an explicit observer context for a
+   per-directory delete session that is handed to the caller via
+   `pending_plans`.  The session outlives this call (the -m pipeline commits it
+   after joining its disk writer), so its observer context must too: pass a
+   long-lived object such as PipelineContextReceiver.delete_ctx.  When
+   `delete_ctx` is NULL an internal stack context is used, which is only safe
+   when the session is committed before returning (the default behaviour). */
+int receiver_process_pending_ctx(Config* config, int file_descriptor, const ReceiverSink* sink,
+                                 DeleteManifest** pending_manifest,
+                                 DeletePlanSession** pending_plans,
+                                 ReceiverDeleteContext* delete_ctx);
 int receiver_receive_files(Config* config, int file_descriptor);
 
 /* ---- Connection time bounds (anti-slowloris) ----

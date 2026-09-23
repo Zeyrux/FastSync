@@ -495,6 +495,7 @@ int send_dry_run_remote(Config* config) {
   protocol_session_bind(&session);
 
   int ret = 1;
+  bool partial = false;
   time_t dry_start = time(NULL);
   ReceiverStats dry_stats;
   memset(&dry_stats, 0, sizeof(dry_stats));
@@ -653,8 +654,14 @@ int send_dry_run_remote(Config* config) {
     if (!receive_status(client->file_descriptor, &status))
       goto dry_fail;
   }
-  if (status != STATUS_OK)
+  /* A per-entry receiver failure is rsync's PARTIAL transfer (exit 23), not a
+     hard failure: a dry run transfers nothing, but keep the verdict consistent
+     with the normal path instead of treating it as a protocol error. */
+  if (status == STATUS_PARTIAL) {
+    partial = true;
+  } else if (status != STATUS_OK) {
     goto dry_fail;
+  }
   if (!config->quiet) {
     if (config->human_readable)
       printf("Total: %d files, %s\n", file_count,
@@ -672,7 +679,7 @@ int send_dry_run_remote(Config* config) {
     dry_transfer.literal_data = total_bytes;
     report_transfer_stats(config, &dry_transfer, dry_start, &dry_stats);
   }
-  ret = io_error ? 1 : 0;
+  ret = io_error ? 1 : (partial ? 23 : 0);
 
 dry_fail:
   if (dry_manifest)
