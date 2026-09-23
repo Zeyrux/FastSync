@@ -73,6 +73,8 @@ File* scanner_build_dir_file(const char* path, const struct stat* stats,
                              const ScannerOptions* options);
 char* child_rel_path(const char* parent_rel, const char* name);
 char* scanner_prefix_send_path(const char* prefix, const char* rel);
+char* scanner_dest_rel_path(const ScannerOptions* options, const char* fs_path, const char* rel,
+                            bool relative_mode);
 bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* base,
                             const FilterNode* node, const char* rel, const char* leaf, bool is_dir,
                             bool per_dir_filters, bool exclude_filter_files, bool* protect_out);
@@ -92,7 +94,8 @@ void scanner_record_size_skipped(DirectoryScanner* scanner, const char* fs_path)
 bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_path, const char* rel,
                                bool relative_mode);
 FilterRuleList* read_dir_filters(const ScannerOptions* options, const char* dir_path,
-                                 const char* rel, bool* any_exists, char* err, size_t err_size);
+                                 const char* rel, bool relative_mode, bool* any_exists, char* err,
+                                 size_t err_size);
 int open_directory_filter_context(DirectoryScanner* scanner, const FilterNode* inherited);
 int scanner_inspect_entry(const ScannerOptions* options, const char* containing_dir,
                           const char* link_rel, const char* name, ScannerEntry* entry);

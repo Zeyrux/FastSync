@@ -100,6 +100,11 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
 void filter_rule_free(FilterRule* rule);
 /* Deep-copy a rule (owned pattern/owner).  Returns NULL on allocation failure. */
 FilterRule* filter_rule_clone(const FilterRule* rule);
+/* Replace a rule's owner directory (owned copy of `owner`, "" for the transfer
+ * root).  Returns false on allocation failure, leaving the rule unchanged.
+ * Used to re-express a mirrored per-directory rule in the receiver's
+ * destination-relative coordinate system. */
+bool filter_rule_set_owner(FilterRule* rule, const char* owner);
 
 FilterRuleList* filter_rule_list_create(void);
 /* Append a fully-parsed rule (takes ownership). Returns false on OOM. */

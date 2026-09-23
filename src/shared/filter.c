@@ -11,8 +11,6 @@
 /* Write a diagnostic message into the caller's optional buffer. */
 #define filter_set_error utils_set_error
 
-static bool set_rule_owner(FilterRule* rule, const char* owner);
-
 /* ---- Ordered rule lists ---- */
 
 void filter_rule_free(FilterRule* rule) {
@@ -93,7 +91,7 @@ static bool filter_list_add_exclude_self(FilterRuleList* list, const char* name)
   rule->action = FILTER_ACTION_EXCLUDE;
   rule->sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
   rule->pattern = str_dup(base);
-  if (!rule->pattern || !set_rule_owner(rule, "")) {
+  if (!rule->pattern || !filter_rule_set_owner(rule, "")) {
     filter_rule_free(rule);
     return false;
   }
@@ -116,10 +114,22 @@ bool filter_rule_list_add_dir_merge_ex(FilterRuleList* list, const char* name, b
   if (!list || !name || name[0] == '\0')
     return false;
   for (int i = 0; i < list->dir_merge_count; i++) {
-    if (strcmp(list->dir_merges[i].name, name) == 0)
+    if (strcmp(list->dir_merges[i].name, name) == 0) {
+      /* rsync keeps the first registration (first-wins), but the 'e' modifier
+         is a list side effect, not a registration field: honor it on the
+         duplicate path too, adding the implicit exclude-self rule at most
+         once. */
+      if (exclude_self && !list->dir_merges[i].exclude_self) {
+        if (!filter_list_add_exclude_self(list, name))
+          return false;
+        list->dir_merges[i].exclude_self = true;
+      }
       return true;
+    }
   }
   if (list->dir_merge_count == list->dir_merge_capacity) {
+    if (list->dir_merge_capacity > INT_MAX / 2)
+      return false;
     int new_cap = list->dir_merge_capacity > 0 ? list->dir_merge_capacity * 2 : 4;
     FilterDirMerge* grown = realloc(list->dir_merges, (size_t)new_cap * sizeof(*grown));
     if (!grown)
@@ -145,7 +155,9 @@ bool filter_rule_list_add_dir_merge_ex(FilterRuleList* list, const char* name, b
   return true;
 }
 
-static bool set_rule_owner(FilterRule* rule, const char* owner) {
+bool filter_rule_set_owner(FilterRule* rule, const char* owner) {
+  if (!rule)
+    return false;
   char* dup = str_dup(owner ? owner : "");
   if (!dup)
     return false;
@@ -596,7 +608,7 @@ static bool filter_list_append_cvs(FilterRuleList* list, unsigned sides) {
     }
     memcpy(rule->pattern, CVS_DEFAULTS[i].pattern, plen);
     rule->pattern[plen] = '\0';
-    if (!set_rule_owner(rule, "")) {
+    if (!filter_rule_set_owner(rule, "")) {
       filter_rule_free(rule);
       return false;
     }
@@ -647,7 +659,12 @@ static bool filter_merge_read(FilterRuleList* list, FILE* fp, const char* displa
                               const FilterDirMerge* spec, const FilterParseOptions* opts,
                               const char* base_dir, const char* owner_rel, int depth, char* err,
                               size_t err_size) {
-  int rules_before = list->count;
+  /* Lowest list index this read is responsible for.  A "clear"/"!" inside the
+   * file resets list->count to 0 (freeing the caller's earlier rules too), so
+   * the base must follow it down: otherwise post-clear rules sit below the
+   * original count and never receive an owner (nor no-inherit) and are missed
+   * by the rollback. */
+  int floor = list->count;
   char* line = NULL;
   size_t cap = 0;
   bool ok = true;
@@ -687,6 +704,8 @@ static bool filter_merge_read(FilterRuleList* list, FILE* fp, const char* displa
         token[tlen] = '\0';
         if (!filter_merge_append_token(list, token, spec, opts, base_dir, depth, err, err_size))
           ok = false;
+        if (list->count < floor)
+          floor = list->count; /* a "clear" reset the list below this read's base */
         free(token);
       }
     } else {
@@ -697,27 +716,28 @@ static bool filter_merge_read(FilterRuleList* list, FILE* fp, const char* displa
         continue;
       if (!filter_merge_append_token(list, lp, spec, opts, base_dir, depth, err, err_size))
         ok = false;
+      if (list->count < floor)
+        floor = list->count; /* a "clear" reset the list below this read's base */
     }
   }
   free(line);
   if (!ok) {
-    /* Drop the rules this read appended (a "clear" inside the file may have
-     * freed earlier rules too; clamp like filter_file_rollback). */
-    int first = rules_before < list->count ? rules_before : list->count;
-    for (int i = first; i < list->count; i++)
+    /* Drop every live rule this read is responsible for.  After a "clear" that
+     * base is 0, so the post-clear rules are freed too instead of leaking. */
+    for (int i = floor; i < list->count; i++)
       filter_rule_free(list->items[i]);
-    list->count = first;
+    list->count = floor;
     return false;
   }
-  for (int i = rules_before; i < list->count; i++) {
+  for (int i = floor; i < list->count; i++) {
     FilterRule* rule = list->items[i];
     if (spec->no_inherit)
       rule->no_inherit = true;
-    if (owner_rel && !set_rule_owner(rule, owner_rel)) {
+    if (owner_rel && !filter_rule_set_owner(rule, owner_rel)) {
       filter_set_error(err, err_size, "memory allocation failed");
-      for (int j = rules_before; j < list->count; j++)
+      for (int j = floor; j < list->count; j++)
         filter_rule_free(list->items[j]);
-      list->count = rules_before;
+      list->count = floor;
       return false;
     }
   }
@@ -912,11 +932,10 @@ FilterRuleList* filter_base_build(const char* const* rule_texts, int rule_count,
 /* Undo the rules and dir-merge registrations that one merge file appended,
  * leaving the caller's earlier content intact.  A "clear" rule inside the file
  * frees every rule, including the caller's; clamp to the surviving count so
- * those already-freed rules are never resurrected and freed a second time. */
-/* Undo the rules and dir-merge registrations that one merge file appended,
- * leaving the caller's earlier content intact.  A "clear" rule inside the file
- * frees every rule, including the caller's; clamp to the surviving count so
- * those already-freed rules are never resurrected and freed a second time. */
+ * those already-freed rules are never resurrected and freed a second time.
+ * (filter_merge_read() has already rolled its own range back by the time this
+ * runs, so on a post-clear failure `list->count` is below `rules_before` and
+ * this is a no-op for the rules.) */
 static void filter_file_rollback(FilterRuleList* list, int rules_before, int dir_merges_before) {
   int first = rules_before < list->count ? rules_before : list->count;
   for (int i = first; i < list->count; i++)
@@ -1016,11 +1035,16 @@ static FilterAction rule_matches(const FilterRule* rule, const char* rel_path, c
     return FILTER_ACTION_NONE;
   if (!(rule->sides & side))
     return FILTER_ACTION_NONE;
-  /* A rule applies only to entries below its owner directory. */
+  /* A rule applies only to entries below its owner directory.  The receive
+   * root's destination-relative coordinate may be written as "." (the
+   * synced-directory sentinel), which is the same scope as the empty owner. */
+  const char* owner = rule->owner;
+  if (owner && strcmp(owner, ".") == 0)
+    owner = "";
   const char* rel2 = rel_path;
-  if (rule->owner && rule->owner[0] != '\0') {
-    size_t owner_len = strlen(rule->owner);
-    if (strncmp(rule->owner, rel_path, owner_len) != 0)
+  if (owner && owner[0] != '\0') {
+    size_t owner_len = strlen(owner);
+    if (strncmp(owner, rel_path, owner_len) != 0)
       return FILTER_ACTION_NONE;
     if (rel_path[owner_len] != '/')
       return FILTER_ACTION_NONE;
@@ -1078,10 +1102,14 @@ FilterAction filter_dir_rules_apply_side(const FilterRuleList* dir_rules, const 
   for (;;) {
     for (int i = 0; i < dir_rules->count; i++) {
       const FilterRule* rule = dir_rules->items[i];
-      size_t rule_owner_len = rule && rule->owner ? strlen(rule->owner) : 0;
+      const char* rule_owner = rule && rule->owner ? rule->owner : "";
+      /* "." is the receive root's coordinate (see rule_matches). */
+      if (strcmp(rule_owner, ".") == 0)
+        rule_owner = "";
+      size_t rule_owner_len = strlen(rule_owner);
       if (rule_owner_len != owner_len)
         continue;
-      if (owner_len != 0 && memcmp(rule->owner, rel_path, owner_len) != 0)
+      if (owner_len != 0 && memcmp(rule_owner, rel_path, owner_len) != 0)
         continue;
       FilterAction action = rule_matches(rule, rel_path, leaf, is_dir, FILTER_SIDE_RECEIVER);
       if (action != FILTER_ACTION_NONE)
