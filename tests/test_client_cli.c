@@ -2977,6 +2977,48 @@ static void test_parse_args_delay_updates() {
   config_delete(cfg);
 }
 
+/* rsync parity: --delay-updates implies --delete-after when --delete is
+   active (all updates publish first, then extras are removed).  An explicit
+   other timing is overridden; without --delete no timing is set. */
+static void test_parse_args_delay_updates_implies_delete_after() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delay-updates", "--delete", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_during);
+  EXPECT_FALSE(cfg->delete_delay);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* An explicit conflicting timing is normalized to delete-after. */
+  cfg = config_create();
+  char* argv_before[] = {"fastsync", "--delay-updates", "--delete-before", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_before, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_before);
+  config_delete(cfg);
+
+  /* Without --delete there is no deletion, so no timing is selected. */
+  cfg = config_create();
+  char* argv_alone[] = {"fastsync", "--delay-updates", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_alone, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->use_delete);
+  EXPECT_FALSE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_during);
+  EXPECT_FALSE(cfg->delete_delay);
+  config_delete(cfg);
+}
+
 /* rsync rejects --delay-updates with --inplace; FastSync must too. */
 static void test_validate_config_delay_updates_rejects_inplace() {
   Config* cfg = valid_client_config();
@@ -5312,6 +5354,7 @@ void test_client_cli() {
   test_parse_args_checksum_seed();
   test_parse_args_temp_dir();
   test_parse_args_delay_updates();
+  test_parse_args_delay_updates_implies_delete_after();
   test_validate_config_delay_updates_rejects_inplace();
   test_validate_config_delay_updates_rejects_reserved_backup_dir();
   test_parse_args_files_from();

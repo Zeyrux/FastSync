@@ -39,10 +39,29 @@ FilterAction delete_protect_verdict(const DeleteProtectRules* protect, const cha
                                     const char* leaf, bool is_dir) {
   if (!protect)
     return FILTER_ACTION_NONE;
+  /* rsync protects its own --backup files from the delete pass: a name ending
+     in the backup suffix is never an extra.  Checked before the filter rules so
+     an explicit exclude cannot be bypassed (the suffix is always a shield). */
+  if (protect->backup_suffix && protect->backup_suffix[0] != '\0') {
+    size_t name_len = strlen(leaf);
+    size_t suffix_len = strlen(protect->backup_suffix);
+    if (name_len > suffix_len &&
+        strcmp(leaf + (name_len - suffix_len), protect->backup_suffix) == 0)
+      return FILTER_ACTION_PROTECT;
+  }
   FilterAction action = filter_dir_rules_apply_side(protect->dir_rules, rel_path, leaf, is_dir);
   if (action != FILTER_ACTION_NONE)
     return action;
   return filter_rules_apply_side(protect->base_rules, rel_path, leaf, is_dir, FILTER_SIDE_RECEIVER);
+}
+
+const char* delete_backup_suffix(const Config* config) {
+  if (!config || !config->backup || config->ignore_existing)
+    return NULL;
+  const char* suffix = config->suffix ? config->suffix : "~";
+  if (!suffix[0] || strchr(suffix, '/'))
+    return NULL;
+  return suffix;
 }
 
 /* Classify a removed entry from its st_mode for the per-type delete counters. */
@@ -631,7 +650,13 @@ bool delete_skips_build(const Config* config, const ArrayList* protected_paths,
   }
   int idx = 0;
   if (config->delay_updates) {
-    out->entries[idx].prefix = DELAY_UPDATES_STAGING_DIR;
+    /* Protect this transfer's actual (per-run unique) staging directory.  The
+       runtime name is only known to the receiver-side context; fall back to the
+       reserved prefix for a context that was never created (e.g. a dry run). */
+    const char* staging_name = (config->delay_context && config->delay_context->staging_name)
+                                   ? config->delay_context->staging_name
+                                   : DELAY_UPDATES_STAGING_DIR;
+    out->entries[idx].prefix = staging_name;
     out->entries[idx].top_level_only = true;
     idx++;
   }

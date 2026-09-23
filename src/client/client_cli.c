@@ -2626,6 +2626,17 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   bool debug_enabled = verbose || config->debug_level != 0;
   set_log_level(config->quiet ? LOG_LEVEL_ERROR
                               : (debug_enabled ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  /* rsync parity: --delay-updates implies --delete-after.  Every staged file is
+     published first and only then are extras removed.  Normalize onto the
+     existing delete_after wire bool (no new wire field), overriding any other
+     explicit timing exactly as rsync does; without --delete there is no
+     deletion, so no timing is set (and the wire config stays valid). */
+  if (config->delay_updates && config->use_delete) {
+    config->delete_before = false;
+    config->delete_during = false;
+    config->delete_delay = false;
+    config->delete_after = true;
+  }
   /* rsync's plain --delete defaults to delete-during (--del): each directory's
      extras are removed as that directory is processed, so space is freed
      progressively and a tight destination never has to hold the whole old+new

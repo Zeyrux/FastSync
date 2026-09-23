@@ -8,12 +8,48 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
+/* Process-wide counter so two staging contexts created in the same process (or
+   within the same clock tick) can never pick the same name. */
+static unsigned long long delay_updates_next_sequence(void) {
+  static atomic_ullong sequence;
+  return atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+}
+
+/* Build the per-run staging directory basename: the reserved prefix plus the
+   pid and an entropy token.  A fixed name could collide with a genuine
+   destination entry; the token makes such a collision vanishingly unlikely and,
+   if it ever happens, prepare() refuses to touch the existing directory. */
+static char* delay_updates_make_staging_name(void) {
+  unsigned long long entropy = 0;
+  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    ssize_t got = read(fd, &entropy, sizeof(entropy));
+    close(fd);
+    if (got != (ssize_t)sizeof(entropy))
+      entropy = 0;
+  }
+  if (entropy == 0)
+    entropy = ((unsigned long long)time(NULL) << 20) ^ ((unsigned long long)getpid() << 8) ^
+              delay_updates_next_sequence();
+  int length = snprintf(NULL, 0, DELAY_UPDATES_STAGING_DIR ".%ld.%llx", (long)getpid(), entropy);
+  if (length < 0)
+    return NULL;
+  char* name = malloc((size_t)length + 1);
+  if (!name)
+    return NULL;
+  snprintf(name, (size_t)length + 1, DELAY_UPDATES_STAGING_DIR ".%ld.%llx", (long)getpid(),
+           entropy);
+  return name;
+}
 
 DelayUpdatesContext* delay_updates_context_create(const char* root_directory) {
   if (!root_directory)
@@ -26,8 +62,15 @@ DelayUpdatesContext* delay_updates_context_create(const char* root_directory) {
     free(context);
     return NULL;
   }
-  context->staging_root = path_cat(root_directory, DELAY_UPDATES_STAGING_DIR);
+  context->staging_name = delay_updates_make_staging_name();
+  if (!context->staging_name) {
+    free(context->root_directory);
+    free(context);
+    return NULL;
+  }
+  context->staging_root = path_cat(root_directory, context->staging_name);
   if (!context->staging_root) {
+    free(context->staging_name);
     free(context->root_directory);
     free(context);
     return NULL;
@@ -39,6 +82,7 @@ DelayUpdatesContext* delay_updates_context_create(const char* root_directory) {
   context->lock_fd = -1;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success) {
     free(context->staging_root);
+    free(context->staging_name);
     free(context->root_directory);
     free(context);
     return NULL;
@@ -54,6 +98,7 @@ void delay_updates_context_destroy(DelayUpdatesContext* context) {
     close(context->lock_fd);
   context->lock_fd = -1;
   free(context->staging_root);
+  free(context->staging_name);
   free(context->root_directory);
   for (size_t i = 0; i < context->count; i++) {
     free(context->entries[i].staged_path);
@@ -125,48 +170,81 @@ bool delay_updates_prepare(DelayUpdatesContext* context) {
     return false;
   if (context->prepared)
     return true;
-  int fd = file_open_private_dir(context->staging_root);
-  if (fd < 0) {
+  /* Create the per-run staging directory with O_EXCL semantics.  The name is
+     unique to this transfer, so if the path already exists it is NOT ours:
+     either a genuine destination entry that happens to share the name or a
+     leftover from another session.  Refuse rather than wipe it -- the old
+     fixed-name design could destroy a real destination entry.  A crash
+     leftover is never reused (the next run picks a fresh name). */
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(context->staging_root, &leaf, true);
+  if (parent_fd < 0) {
     int saved_errno = errno;
     char* escaped = output_escape(context->staging_root, false);
     log_message(LOG_LEVEL_ERROR, "could not create --delay-updates staging directory '%s': %s",
                 escaped ? escaped : "<allocation failed>", strerror(saved_errno));
     free(escaped);
+    free(leaf);
     return false;
   }
-  /* Hold an exclusive advisory lock on the staging directory for the whole
-     transfer.  The staging directory name is fixed, so two simultaneous
-     delayed transfers to the same destination root would otherwise share it
-     and destroy each other's staged files.  The lock makes the second session
-     fail cleanly instead of corrupting the first.  The lock is released when
-     the context (and its file descriptor) is destroyed. */
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd >= 0) {
+    close(fd);
+    close(parent_fd);
+    char* escaped = output_escape(context->staging_root, false);
+    log_message(LOG_LEVEL_ERROR,
+                "--delay-updates staging directory '%s' already exists and is not owned by this "
+                "transfer; refusing to overwrite it",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    free(leaf);
+    return false;
+  }
+  if (errno != ENOENT) {
+    int saved_errno = errno;
+    close(parent_fd);
+    char* escaped = output_escape(context->staging_root, false);
+    log_message(LOG_LEVEL_ERROR, "could not open --delay-updates staging directory '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(saved_errno));
+    free(escaped);
+    free(leaf);
+    return false;
+  }
+  if (mkdirat(parent_fd, leaf, 0700) != 0) {
+    int saved_errno = errno;
+    close(parent_fd);
+    char* escaped = output_escape(context->staging_root, false);
+    log_message(LOG_LEVEL_ERROR, "could not create --delay-updates staging directory '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(saved_errno));
+    free(escaped);
+    free(leaf);
+    return false;
+  }
+  fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  close(parent_fd);
+  free(leaf);
+  if (fd < 0) {
+    int saved_errno = errno;
+    char* escaped = output_escape(context->staging_root, false);
+    log_message(LOG_LEVEL_ERROR, "could not open --delay-updates staging directory '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(saved_errno));
+    free(escaped);
+    return false;
+  }
+  /* Keep the exclusive advisory lock as defense in depth: the unique name
+     already prevents two sessions from sharing a staging directory, but the
+     lock also catches an improbable same-name collision that raced between the
+     existence check above and the open. */
   if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
     int saved_errno = errno;
     close(fd);
-    if (saved_errno == EWOULDBLOCK || saved_errno == EAGAIN) {
-      char* escaped = output_escape(context->staging_root, false);
-      log_message(LOG_LEVEL_ERROR,
-                  "another --delay-updates transfer to '%s' is already in progress; refusing to "
-                  "share the staging directory",
-                  escaped ? escaped : "<allocation failed>");
-      free(escaped);
-    } else {
-      log_message(LOG_LEVEL_ERROR, "could not lock --delay-updates staging directory '%s': %s",
-                  context->staging_root, strerror(saved_errno));
-    }
+    char* escaped = output_escape(context->staging_root, false);
+    log_message(LOG_LEVEL_ERROR, "could not lock --delay-updates staging directory '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(saved_errno));
+    free(escaped);
     return false;
   }
   context->lock_fd = fd;
-  /* Only now, with exclusive ownership, wipe leftovers from an interrupted
-     earlier transfer; this can never race with a live session. */
-  bool ok = delay_wipe_dir_fd(fd);
-  if (!ok) {
-    log_message(LOG_LEVEL_ERROR, "could not clear stale --delay-updates staging files under '%s'",
-                context->staging_root);
-    close(context->lock_fd);
-    context->lock_fd = -1;
-    return false;
-  }
   context->prepared = true;
   return true;
 }
@@ -264,12 +342,16 @@ static bool delay_publish_entry(DelayUpdatesContext* context, const Config* conf
                                 const StagedFileEntry* entry) {
   if (!delay_publish_backup(context, config, entry))
     return false;
-  /* --force: an incoming regular file/symlink may replace a destination
-     DIRECTORY (possibly non-empty).  The immediate-install path handles this in
-     file_receive; a --delay-updates run stages elsewhere and only discovers the
-     blocking directory here, so clear it before the rename (rsync's
-     "could not make way for new regular file" without --force). */
-  if (config && config->force_delete && file_directory_exists_secure(entry->final_path)) {
+  /* An incoming regular file/symlink may replace a destination DIRECTORY that
+     blocks it.  rsync removes the blocker recursively when --delete or --force
+     is active (its generator's "make way" deletion), and a --delay-updates run
+     stages elsewhere so it only discovers the blocker here.  FastSync's
+     immediate-install path clears it too; without --delete/--force a non-empty
+     blocker fails the run (rsync's "could not make way for new regular file").
+     use_delete is gated by the server --allow-delete policy, so a client can
+     never use this to bypass deletion authorization. */
+  if (config && (config->force_delete || config->use_delete) &&
+      file_directory_exists_secure(entry->final_path)) {
     if (!file_remove_tree_secure(entry->final_path)) {
       char* escaped = output_escape(entry->final_path, false);
       log_message(LOG_LEVEL_ERROR, "could not remove destination directory blocking '%s': %s",
