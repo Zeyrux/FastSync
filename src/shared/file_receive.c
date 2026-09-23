@@ -58,36 +58,41 @@ File* file_receive(const Config* config, int file_descriptor) {
     file_destroy(file);
     return NULL;
   }
-  Data* file_data = receive_data_limited(file_descriptor, MAX_RECEIVE_WHOLE_FILE_SIZE);
-  if (file_data == NULL) {
+  bool compress =
+      config->use_compression && !compression_should_skip_with_suffixes(
+                                     file->path, config->skip_compress_suffixes,
+                                     config->skip_compress_set ? config->skip_compress_count : -1);
+  char* dest_path = path_cat(config->receive_root_directory, file->path);
+  if (!dest_path) {
     file_destroy(file);
     return NULL;
   }
-  if (config->use_compression &&
-      !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
-                                             config->skip_compress_set ? config->skip_compress_count
-                                                                       : -1)) {
-    Data* file_data_uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
-    ProtocolSession* owner = file_data->owner;
-    data_destroy(file_data);
-    if (file_data_uncompressed == NULL) {
-      file_destroy(file);
-      return NULL;
-    }
-    if (!data_charge_session(file_data_uncompressed, owner, file_data_uncompressed->size)) {
-      data_destroy(file_data_uncompressed);
-      file_destroy(file);
-      return NULL;
-    }
-    if (file_data_uncompressed->size > MAX_FILE_DATA_SIZE) {
-      data_destroy(file_data_uncompressed);
-      file_destroy(file);
-      return NULL;
-    }
-    file_data = file_data_uncompressed;
+  Data* buffer = NULL;
+  char* spool = NULL;
+  unsigned long long size = 0;
+  bool ok = file_receive_payload(file_descriptor, compress, 0, dest_path,
+                                 protocol_whole_file_receive_limit(), &buffer, &spool, &size);
+  free(dest_path);
+  if (!ok) {
+    file_destroy(file);
+    return NULL;
   }
-  data_destroy(file->data);
-  file->data = file_data;
+  if (spool) {
+    Data* reserved = data_create_reserve((size_t)size);
+    if (!reserved) {
+      unlink(spool);
+      free(spool);
+      file_destroy(file);
+      return NULL;
+    }
+    data_destroy(file->data);
+    file->data = reserved;
+    file->basis_copy = spool;
+    file->data_spool = true;
+  } else {
+    data_destroy(file->data);
+    file->data = buffer;
+  }
   return file;
 }
 

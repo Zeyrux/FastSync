@@ -61,6 +61,13 @@ DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_f
  * identical to the unseeded function. */
 DeltaSignature* delta_signature_create_seeded(const void* old_file_data, uint64_t old_file_size,
                                               uint32_t block_size, uint32_t seed);
+/* Streaming equivalent of delta_signature_create_seeded: reads the basis blocks
+ * from `fd` in bounded chunks, so an arbitrarily large basis can be signed
+ * without materializing it.  The signature itself is bounded (MAX_DELTA_BLOCKS
+ * entries); an over-large basis returns NULL and the caller falls back to a
+ * whole-file transfer. */
+DeltaSignature* delta_signature_create_fd_seeded(int fd, uint64_t old_file_size,
+                                                 uint32_t block_size, uint32_t seed);
 Data* delta_signature_serialize(const DeltaSignature* sig);
 DeltaSignature* delta_signature_deserialize(const Data* data);
 void delta_signature_destroy(DeltaSignature* sig);
@@ -75,6 +82,15 @@ Delta* delta_compute_seeded(const void* new_file_data, uint64_t new_file_size,
 Data* delta_serialize(const Delta* delta);
 Delta* delta_deserialize(const Data* data);
 void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta, uint32_t block_size);
+/* Streaming equivalent of delta_apply: matched blocks are read from `src_fd` as
+ * they are emitted, so the basis never has to be resident. */
+void* delta_apply_fd(int src_fd, uint64_t old_size, const Delta* delta, uint32_t block_size);
+/* Fully streamed reconstruction: matched blocks come from `old_data` (when
+ * non-NULL) or are read from `src_fd`, and the reconstructed bytes are written
+ * straight to `dst_fd` in bounded chunks, so a reconstructed file larger than
+ * memory is never materialized. */
+bool delta_apply_to_fd(const void* old_data, int src_fd, uint64_t old_size, const Delta* delta,
+                       uint32_t block_size, int dst_fd);
 void delta_destroy(Delta* delta);
 
 bool delta_should_attempt(uint64_t old_size, uint64_t new_size, uint64_t max_file_size);

@@ -16,6 +16,8 @@
 
 #include "data.h"
 #include "checksum.h"
+#include "chunk.h"
+#include "compression.h"
 #include "delta.h"
 #include "file.h"
 #include "file_store.h"
@@ -209,6 +211,7 @@ File* file_create(const char* path) {
   file->dir_time_only = false;
   file->basis_link = NULL;
   file->basis_copy = NULL;
+  file->data_spool = false;
   file->link_group = 0;
   file->link_first = false;
   file->hardlink_target = NULL;
@@ -238,8 +241,11 @@ void file_destroy(void* item) {
   file->send_path = NULL;
   free(file->basis_link);
   file->basis_link = NULL;
+  if (file->data_spool && file->basis_copy)
+    unlink(file->basis_copy);
   free(file->basis_copy);
   file->basis_copy = NULL;
+  file->data_spool = false;
   free(file->hardlink_target);
   file->hardlink_target = NULL;
   free(file->symlink_target);
@@ -379,6 +385,261 @@ size_t file_content_to_buffer(File* file) {
   }
   fclose(file_pointer);
   return bytes_read;
+}
+
+/* ---- Streamed whole-file payload receive ----
+ *
+ * A whole-file data frame is a uint64 length followed by that many bytes.  When
+ * the logical payload is at or below the receiver's streaming bound the
+ * historical charged whole-buffer path is kept (decompressing in one shot for
+ * `-z`).  Above the bound the frame is read in bounded chunks and written into
+ * a spool temp file next to the destination, decompressing incrementally for
+ * zstd/zlib (lz4's block format cannot be streamed and keeps the buffered path).
+ * The spool is then installed by the existing bounded-buffer basis-copy path
+ * (file_copy_basis_stream_attrs), so the atomic temp+rename store, --partial/
+ * --partial-dir, --delay-updates, --preallocate and metadata/xattr application
+ * are all reused unchanged.  Only bounded buffers (64 KiB read chunk + the
+ * decompressor's 256 KiB output window) are ever live. */
+
+#define FILE_PAYLOAD_READ_CHUNK (64 * 1024)
+#define FILE_PAYLOAD_PEEK_MAX 32
+
+/* Create a confined spool temp file in the destination's directory.  Returns an
+ * open write fd and an owned absolute path, or -1 (errno set).  The parent walk
+ * creates missing directories exactly as a normal store would. */
+static int file_spool_create(const char* dest_path, char** out_spool_path) {
+  *out_spool_path = NULL;
+  char* leaf = NULL;
+  int dirfd = file_open_secure_parent(dest_path, &leaf, true);
+  free(leaf);
+  if (dirfd < 0)
+    return -1;
+  char name[64];
+  for (unsigned int i = 0; i < 100; i++) {
+    snprintf(name, sizeof(name), ".fastsync-spool.%ld.%llu", (long)getpid(), next_temp_sequence());
+    int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+      if (errno != EEXIST)
+        break;
+      continue;
+    }
+    char* copy = str_dup(dest_path);
+    char* dir = copy ? dirname(copy) : NULL;
+    size_t need = dir ? strlen(dir) + 1 + strlen(name) + 1 : 0;
+    char* full = need ? malloc(need) : NULL;
+    if (!full) {
+      free(copy);
+      close(fd);
+      unlinkat(dirfd, name, 0);
+      close(dirfd);
+      return -1;
+    }
+    snprintf(full, need, "%s/%s", dir, name);
+    free(copy);
+    close(dirfd);
+    *out_spool_path = full;
+    return fd;
+  }
+  close(dirfd);
+  return -1;
+}
+
+int file_spool_for_payload(const char* dest_path, char** out_spool_path) {
+  return file_spool_create(dest_path, out_spool_path);
+}
+
+bool file_receive_payload(int fd, bool compress, unsigned long long expected_size,
+                          const char* dest_path, unsigned long long stream_limit, Data** out_buffer,
+                          char** out_spool, unsigned long long* out_size) {
+  if (out_buffer)
+    *out_buffer = NULL;
+  if (out_spool)
+    *out_spool = NULL;
+  if (out_size)
+    *out_size = 0;
+  if (!out_buffer || !out_spool || !out_size || !dest_path)
+    return false;
+
+  unsigned long long frame_size = 0;
+  if (!receive_n_data(fd, &frame_size, sizeof(frame_size)))
+    return false;
+  /* A frame larger than MAX_DATA_PAYLOAD_SIZE is allowed only on the streamed
+     path, which never materializes it; the buffered path's
+     receive_data_alloc/body enforces the historical bound itself.  Only a size
+     unrepresentable on this platform is rejected here. */
+  if (frame_size > SIZE_MAX) {
+    log_message(LOG_LEVEL_ERROR, "Data size %llu is not representable", frame_size);
+    return false;
+  }
+
+  unsigned char prefix[FILE_PAYLOAD_PEEK_MAX];
+  size_t prefix_len = 0;
+  bool stream;
+  if (expected_size != 0) {
+    /* The check frame already told us the logical size: no need to peek. */
+    stream = expected_size > stream_limit;
+  } else if (!compress) {
+    stream = frame_size > stream_limit;
+  } else {
+    /* Non-incremental compressed frame with unknown logical size: peek the
+       header to decide, so a small compressed frame that expands past the bound
+       still streams instead of allocating the whole logical image. */
+    size_t want = frame_size < sizeof(prefix) ? (size_t)frame_size : sizeof(prefix);
+    if (want > 0 && !receive_n_data(fd, prefix, want))
+      return false;
+    prefix_len = want;
+    unsigned long long logical = compression_peek_frame_content_size(prefix, prefix_len);
+    stream = logical != 0 ? logical > stream_limit : frame_size > stream_limit;
+  }
+
+  if (!stream) {
+    Data* frame;
+    if (prefix_len > 0) {
+      frame = receive_data_alloc(fd, frame_size);
+      if (!frame)
+        return false;
+      memcpy(frame->data, prefix, prefix_len);
+      if (frame_size > prefix_len &&
+          !receive_n_data(fd, (char*)frame->data + prefix_len, (size_t)(frame_size - prefix_len))) {
+        data_destroy(frame);
+        return false;
+      }
+    } else {
+      frame = receive_data_body(fd, frame_size);
+      if (!frame)
+        return false;
+    }
+    if (compress) {
+      unsigned long long bound =
+          expected_size != 0 ? expected_size : (unsigned long long)MAX_RECEIVE_WHOLE_FILE_SIZE;
+      Data* uncompressed = data_decompress_limited(frame, (size_t)bound);
+      ProtocolSession* owner = frame->owner;
+      data_destroy(frame);
+      if (!uncompressed)
+        return false;
+      if (expected_size != 0 && uncompressed->size != expected_size) {
+        data_destroy(uncompressed);
+        return false;
+      }
+      if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
+        data_destroy(uncompressed);
+        return false;
+      }
+      *out_buffer = uncompressed;
+      *out_size = uncompressed->size;
+      return true;
+    }
+    *out_buffer = frame;
+    *out_size = frame->size;
+    return true;
+  }
+
+  /* Streamed path. */
+  int spool_fd = file_spool_create(dest_path, out_spool);
+  if (spool_fd < 0)
+    return false;
+
+  CompressionStreamDecompressor* dec = NULL;
+  size_t header_len = 0;
+  unsigned long long learned_size = expected_size;
+  if (compress) {
+    unsigned char hdr[1 + 4];
+    size_t hdr_have = 0;
+    if (prefix_len >= 1) {
+      hdr[0] = prefix[0];
+      hdr_have = 1;
+    } else {
+      if (!receive_n_data(fd, hdr, 1))
+        goto stream_fail;
+      hdr_have = 1;
+    }
+    CompressionAlgo algo = (CompressionAlgo)hdr[0];
+    if (!compression_algo_valid((int)algo) || algo == COMPRESSION_ALGO_LZ4)
+      goto stream_fail;
+    header_len = (algo == COMPRESSION_ALGO_ZLIB || algo == COMPRESSION_ALGO_ZLIBX) ? 5 : 1;
+    while (hdr_have < header_len) {
+      size_t need = header_len - hdr_have;
+      if (prefix_len > hdr_have) {
+        size_t avail = prefix_len - hdr_have;
+        size_t take = avail < need ? avail : need;
+        memcpy(hdr + hdr_have, prefix + hdr_have, take);
+        hdr_have += take;
+      } else {
+        if (!receive_n_data(fd, hdr + hdr_have, need))
+          goto stream_fail;
+        hdr_have = header_len;
+      }
+    }
+    if (header_len == 5) {
+      uint32_t raw = 0;
+      for (int i = 0; i < 4; i++)
+        raw |= (uint32_t)hdr[1 + i] << (8 * i);
+      if (expected_size != 0 && raw != expected_size)
+        goto stream_fail;
+      if (learned_size == 0)
+        learned_size = raw;
+    }
+    dec = compression_stream_decompressor_create(algo, learned_size);
+    if (!dec)
+      goto stream_fail;
+  }
+
+  if (frame_size < header_len)
+    goto stream_fail;
+  {
+    unsigned long long body_remaining = frame_size - header_len;
+    if (prefix_len > header_len) {
+      size_t avail = prefix_len - header_len;
+      if (compress) {
+        bool done = false;
+        if (!compression_stream_decompressor_feed(dec, prefix + header_len, avail, spool_fd, &done))
+          goto stream_fail;
+      } else if (!write_all(spool_fd, prefix + header_len, avail)) {
+        goto stream_fail;
+      }
+      body_remaining -= avail;
+    }
+    unsigned char buf[FILE_PAYLOAD_READ_CHUNK];
+    while (body_remaining > 0) {
+      size_t want = body_remaining < sizeof(buf) ? (size_t)body_remaining : (size_t)sizeof(buf);
+      if (!receive_n_data(fd, buf, want))
+        goto stream_fail;
+      if (compress) {
+        bool done = false;
+        if (!compression_stream_decompressor_feed(dec, buf, want, spool_fd, &done))
+          goto stream_fail;
+      } else if (!write_all(spool_fd, buf, want)) {
+        goto stream_fail;
+      }
+      body_remaining -= want;
+    }
+  }
+
+  {
+    unsigned long long total = compress ? compression_stream_decompressor_total(dec) : frame_size;
+    if (learned_size != 0 && total != learned_size)
+      goto stream_fail;
+    *out_size = total;
+  }
+  if (dec)
+    compression_stream_decompressor_destroy(dec);
+  if (close(spool_fd) != 0) {
+    spool_fd = -1;
+    goto stream_fail;
+  }
+  return true;
+
+stream_fail:
+  if (dec)
+    compression_stream_decompressor_destroy(dec);
+  if (spool_fd >= 0)
+    close(spool_fd);
+  if (*out_spool) {
+    unlink(*out_spool);
+    free(*out_spool);
+    *out_spool = NULL;
+  }
+  return false;
 }
 
 /* ---- Secure filesystem primitives ---- */

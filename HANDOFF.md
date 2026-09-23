@@ -235,7 +235,9 @@
      and symlink/empty-dir quick-check feedback.
    - **`--delete-before` phase-0 keep-set** (rsync fixes the file list before
      the data pass; FastSync keeps its pre-scan snapshot race).
-   - **>256 MiB single-file streaming** (B4, the general whole-file limit).
+   - ~~**>256 MiB single-file streaming** (B4, the general whole-file limit).~~
+     Closed by #318: the whole-file payload, the basis read/verify and the fuzzy
+     basis are streamed through bounded buffers (lz4/append remain buffered).
    - **Wire native-size framing:** lengths are native `size_t` and the protocol
      assumes homogeneous word size/endianness — document or move to fixed-width
      framing.

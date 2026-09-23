@@ -32,6 +32,16 @@
 /* Maximum allowed data payload size for receive_data (whole-file bound) */
 #define MAX_DATA_PAYLOAD_SIZE MAX_RECEIVE_WHOLE_FILE_SIZE
 
+/* Runtime whole-file receive bound.  It defaults to MAX_RECEIVE_WHOLE_FILE_SIZE
+ * and exists so the test suite can lower the ceiling (via the
+ * FASTSYNC_MAX_WHOLE_FILE_SIZE environment variable, a byte count) and exercise
+ * the streaming path with a small, fast transfer.  A payload at or below the
+ * bound keeps the historical whole-buffer path; a larger one is streamed
+ * through a bounded buffer.  The value is resolved once per process and never
+ * exceeds the compile-time ceiling, so a malicious environment cannot raise it
+ * beyond the protocol limit. */
+unsigned long long protocol_whole_file_receive_limit(void);
+
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
 /* Files larger than this are not kept fully in memory while loading: the
@@ -370,6 +380,15 @@ char* receive_str_redacted(int file_descriptor);
 bool send_data(int file_descriptor, const Data* data);
 Data* receive_data(int file_descriptor);
 Data* receive_data_limited(int file_descriptor, unsigned long long maximum_size);
+/* Read exactly `size` bytes as a charged Data body.  The length-prefixed
+ * receive_data_limited() reads the header itself; this variant is for callers
+ * that must inspect the declared size (and possibly stream the body instead)
+ * before allocating.  `size` must already be within MAX_DATA_PAYLOAD_SIZE. */
+Data* receive_data_body(int file_descriptor, unsigned long long size);
+/* Allocate (and charge) a `size`-byte Data body without reading it; the caller
+ * fills `result->data` itself.  Used when a frame's leading bytes must be
+ * inspected before the rest of the body is read. */
+Data* receive_data_alloc(int file_descriptor, unsigned long long size);
 bool send_int(int file_descriptor, int data);
 bool receive_int(int file_descriptor, int* data);
 bool send_status(int file_descriptor, Status status);

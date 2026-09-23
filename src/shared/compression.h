@@ -81,6 +81,54 @@ Data* data_compress_with_threads(Data* data_to_compress, int compression_level,
 Data* data_decompress(Data* compressed_data);
 bool compression_should_skip_with_suffixes(const char* path, char* const* suffixes, int count);
 
+/* Streaming decompression for a payload too large to hold in memory.  The
+ * caller consumes the frame's leading codec byte (and, for lz4/zlib/zlibx, the
+ * 4-byte little-endian raw-size prefix) and then feeds the remaining frame
+ * bytes in bounded chunks; decompressed output is written straight to `out_fd`
+ * so neither the compressed nor the decompressed image is ever materialized.
+ * Only zstd (the default), zlib/zlibx and none support streaming; lz4's block
+ * format is one-shot, so its stream decompressor reports failure and the caller
+ * falls back (the whole-buffer path keeps its existing bound). */
+typedef struct CompressionStreamDecompressor CompressionStreamDecompressor;
+
+CompressionStreamDecompressor*
+compression_stream_decompressor_create(CompressionAlgo algo, unsigned long long expected_out);
+/* Feed one chunk.  Returns false on a malformed frame, an I/O error, or when the
+ * total output would exceed `expected_out` (when non-zero).  *done is set once
+ * the frame end has been reached. */
+bool compression_stream_decompressor_feed(CompressionStreamDecompressor* d, const void* in,
+                                          size_t in_len, int out_fd, bool* done);
+unsigned long long compression_stream_decompressor_total(const CompressionStreamDecompressor* d);
+void compression_stream_decompressor_destroy(CompressionStreamDecompressor* d);
+
+/* Peek the logical (decompressed) size from the leading bytes of a compressed
+ * frame (codec byte + header), returning 0 when it cannot be determined from
+ * the supplied prefix.  Used to decide whether a frame must take the streaming
+ * path before its body is read. */
+unsigned long long compression_peek_frame_content_size(const void* buf, size_t len);
+
+/* Streaming compression (sender side).  Compresses a source in bounded chunks
+ * into `out_fd` as one self-describing frame (codec byte, the lz4/zlib raw-size
+ * prefix, then the codec stream), so a whole file can be compressed without
+ * materializing it in memory.  zstd/zlib/zlibx/none are supported; lz4's block
+ * format is one-shot, so its create() returns NULL and the caller keeps the
+ * buffered path.  `raw_size` is the known source length (used for the zlib
+ * prefix and, for zstd, the frame content-size field). */
+typedef struct CompressionStreamCompressor CompressionStreamCompressor;
+
+/* True when `algo` can be stream-compressed (zstd/zlib/zlibx; lz4's block format
+ * is one-shot).  Used by the sender to decide whether an over-threshold source
+ * may stay unloaded. */
+bool compression_stream_compress_supported(CompressionAlgo algo);
+CompressionStreamCompressor* compression_stream_compressor_create(CompressionAlgo algo, int level,
+                                                                  int threads);
+bool compression_stream_compressor_begin(CompressionStreamCompressor* c,
+                                         unsigned long long raw_size, int out_fd);
+bool compression_stream_compressor_feed(CompressionStreamCompressor* c, const void* in,
+                                        size_t in_len, int out_fd);
+bool compression_stream_compressor_finish(CompressionStreamCompressor* c, int out_fd);
+void compression_stream_compressor_destroy(CompressionStreamCompressor* c);
+
 /* Release the calling thread's cached zstd contexts (compressor, decompressor
  * and scratch buffer).  The cache is thread-local and is also released
  * automatically when a worker thread exits (via a C11 tss destructor) and for
