@@ -11,7 +11,22 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <threads.h>
 #include <unistd.h>
+
+/* Discards everything written to `fd` until EOF, so a sender that regresses to
+ * emitting an over-budget frame does not block forever on a full socket. */
+typedef struct {
+  int fd;
+} DrainArg;
+
+static int drain_fd_thread(void* arg) {
+  DrainArg* drain = arg;
+  char buffer[8192];
+  while (read(drain->fd, buffer, sizeof(buffer)) > 0)
+    ;
+  return 0;
+}
 
 /* Send one STATUS_DELETE_PLAN body (the leading status is consumed by the
  * caller/receiver entry point) describing `dir` with no kept children. */
@@ -366,6 +381,95 @@ static void test_filter_dir_rules_receive_bounds(void) {
   close(p[1]);
 }
 
+/* The per-directory rule sender enforces exactly the receiver's limits: an
+ * over-long pattern and an over-budget owner+pattern total are rejected locally
+ * with a clear error instead of emitting a frame the peer would abort the
+ * transfer on.  A valid block still round-trips. */
+static void test_filter_dir_rules_send_bounds(void) {
+  int p[2];
+
+  /* An over-long pattern is rejected before anything is written. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    EXPECT_NOT_NULL(list);
+    FilterRule* rule = calloc(1, sizeof(FilterRule));
+    EXPECT_NOT_NULL(rule);
+    rule->action = FILTER_ACTION_EXCLUDE;
+    rule->sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
+    rule->owner = str_dup("sub");
+    rule->pattern = malloc(MAX_PROTECT_PATTERN_LEN + 2);
+    EXPECT_NOT_NULL(rule->owner);
+    EXPECT_NOT_NULL(rule->pattern);
+    memset(rule->pattern, 'a', MAX_PROTECT_PATTERN_LEN + 1);
+    rule->pattern[MAX_PROTECT_PATTERN_LEN + 1] = '\0';
+    EXPECT_TRUE(filter_rule_list_add(list, rule));
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    EXPECT_FALSE(delete_filter_dir_rules_send(p[1], list));
+    close(p[0]);
+    close(p[1]);
+    filter_rule_list_free(list);
+  }
+
+  /* A cumulative owner+pattern total over MAX_FILTER_BYTES is rejected. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    EXPECT_NOT_NULL(list);
+    int per = MAX_PROTECT_PATTERN_LEN;
+    int need = MAX_FILTER_BYTES / per + 1;
+    EXPECT_TRUE(need < MAX_FILTER_RULES);
+    for (int i = 0; i < need; i++) {
+      FilterRule* rule = calloc(1, sizeof(FilterRule));
+      EXPECT_NOT_NULL(rule);
+      rule->action = FILTER_ACTION_EXCLUDE;
+      rule->sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
+      rule->owner = str_dup("");
+      rule->pattern = malloc((size_t)per + 1);
+      EXPECT_NOT_NULL(rule->owner);
+      EXPECT_NOT_NULL(rule->pattern);
+      memset(rule->pattern, 'b', (size_t)per);
+      rule->pattern[per] = '\0';
+      EXPECT_TRUE(filter_rule_list_add(list, rule));
+    }
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    DrainArg drain = {p[0]};
+    thrd_t drainer;
+    EXPECT_EQ_INT(thrd_create(&drainer, drain_fd_thread, &drain), thrd_success);
+    bool sent = delete_filter_dir_rules_send(p[1], list);
+    close(p[1]);
+    thrd_join(drainer, NULL);
+    EXPECT_FALSE(sent);
+    close(p[0]);
+    filter_rule_list_free(list);
+  }
+
+  /* A valid block still round-trips through send -> receive. */
+  {
+    FilterRuleList* list = filter_rule_list_create();
+    EXPECT_NOT_NULL(list);
+    FilterRule* rule = calloc(1, sizeof(FilterRule));
+    EXPECT_NOT_NULL(rule);
+    rule->action = FILTER_ACTION_EXCLUDE;
+    rule->sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
+    rule->owner = str_dup("sub");
+    rule->pattern = str_dup("*.log");
+    EXPECT_NOT_NULL(rule->owner);
+    EXPECT_NOT_NULL(rule->pattern);
+    EXPECT_TRUE(filter_rule_list_add(list, rule));
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    EXPECT_TRUE(delete_filter_dir_rules_send(p[1], list));
+    FilterRuleList* out = NULL;
+    EXPECT_TRUE(delete_filter_dir_rules_receive(p[0], &out));
+    EXPECT_NOT_NULL(out);
+    EXPECT_EQ_INT(out->count, 1);
+    EXPECT_EQ_STR(out->items[0]->owner, "sub");
+    EXPECT_EQ_STR(out->items[0]->pattern, "*.log");
+    filter_rule_list_free(out);
+    close(p[0]);
+    close(p[1]);
+    filter_rule_list_free(list);
+  }
+}
+
 void test_delete_plan(void) {
   test_delete_delay_refilled_dir_removed_recursively();
   test_delete_delay_removed_file_counted();
@@ -373,4 +477,5 @@ void test_delete_plan(void) {
   test_delete_delay_actual_removal_charges_budget();
   test_config_only_frame_applies_missing_args();
   test_filter_dir_rules_receive_bounds();
+  test_filter_dir_rules_send_bounds();
 }

@@ -443,17 +443,16 @@ void scanner_record_size_skipped(DirectoryScanner* scanner, const char* fs_path)
   scanner_record_protected(scanner, fs_path, scanner->options.size_skipped_paths);
 }
 
-/* Record a directory the scan synchronized.  `fs_path` is its absolute path and
-   `rel` its path relative to the transfer root ("" for the root); the stored
-   form matches the wire layout (the bare relative path in -R+--files-from, else
-   the source path with a leading '/' removed, with "." for the receive root).
-   Returns false on allocation failure. */
-bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_path, const char* rel,
-                               bool relative_mode) {
-  if (!options->synced_dirs && !options->plan_dirs)
-    return true;
-  if (!file_list_dir_in_scope(options->file_list, rel))
-    return true;
+/* The destination-relative coordinate the receiver's delete walkers match
+   against for an entry at `fs_path` (with `rel` its path relative to the
+   transfer root, "" for the root): `relative_prefix + rel` under -R+--relative,
+   the bare relative path under -R+--files-from, else the source path with a
+   leading '/' removed, with "." for the receive root.  Shared by the
+   synchronized-directory sink and the mirrored per-directory rule owners so
+   both live in the same coordinate system.  Returns an owned string, or NULL on
+   allocation failure. */
+char* scanner_dest_rel_path(const ScannerOptions* options, const char* fs_path, const char* rel,
+                            bool relative_mode) {
   char* prefixed = NULL;
   const char* dest;
   if (relative_mode) {
@@ -461,7 +460,7 @@ bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_pat
   } else if (options->relative_prefix) {
     prefixed = scanner_prefix_send_path(options->relative_prefix, rel);
     if (!prefixed)
-      return false;
+      return NULL;
     dest = prefixed;
   } else {
     dest = fs_path;
@@ -470,6 +469,24 @@ bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_pat
     dest++;
   if (dest[0] == '\0')
     dest = ".";
+  char* out = str_dup(dest);
+  free(prefixed);
+  return out;
+}
+
+/* Record a directory the scan synchronized.  `fs_path` is its absolute path and
+   `rel` its path relative to the transfer root ("" for the root); the stored
+   form matches the wire layout (see scanner_dest_rel_path).  Returns false on
+   allocation failure. */
+bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_path, const char* rel,
+                               bool relative_mode) {
+  if (!options->synced_dirs && !options->plan_dirs)
+    return true;
+  if (!file_list_dir_in_scope(options->file_list, rel))
+    return true;
+  char* dest = scanner_dest_rel_path(options, fs_path, rel, relative_mode);
+  if (!dest)
+    return false;
   bool ok = true;
   if (options->synced_dirs)
     ok = excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
@@ -478,7 +495,7 @@ bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_pat
      than deleted as an extra; the receive root (".") is implicit. */
   if (ok && options->plan_dirs && strcmp(dest, ".") != 0)
     ok = excluded_sink_append(options->plan_dirs, options->excluded_mutex, dest);
-  free(prefixed);
+  free(dest);
   return ok;
 }
 
@@ -487,7 +504,8 @@ bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_pat
  * fresh list.  Returns NULL on allocation/parse failure (message in `err`);
  * returns an empty list (and *any_exists=false) when no file exists. */
 FilterRuleList* read_dir_filters(const ScannerOptions* options, const char* dir_path,
-                                 const char* rel, bool* any_exists, char* err, size_t err_size) {
+                                 const char* rel, bool relative_mode, bool* any_exists, char* err,
+                                 size_t err_size) {
   if (err && err_size > 0)
     err[0] = '\0';
   const FilterRuleList* base = options->base_filters;
@@ -519,22 +537,31 @@ FilterRuleList* read_dir_filters(const ScannerOptions* options, const char* dir_
     }
   }
   /* Mirror the directory's rules into the delete-carrier sink so the receiver
-   * can reconstruct its per-directory protect/risk set. */
+   * can reconstruct its per-directory protect/risk set.  The mirrored rules
+   * carry the destination-relative owner coordinate (not the transfer-root-
+   * relative one the sender's own evaluation uses) so the receiver's delete
+   * walkers, which match against receive-root-relative paths, find them. */
   if (options->per_dir_rules && own->count > 0) {
+    char* owner = scanner_dest_rel_path(options, dir_path, rel, relative_mode);
+    if (!owner)
+      goto fail;
     mtx_t* mtx = options->excluded_mutex;
     if (mtx)
       mtx_lock(mtx);
     for (int i = 0; i < own->count; i++) {
       FilterRule* copy = filter_rule_clone(own->items[i]);
-      if (!copy || !filter_rule_list_add(options->per_dir_rules, copy)) {
+      if (!copy || !filter_rule_set_owner(copy, owner) ||
+          !filter_rule_list_add(options->per_dir_rules, copy)) {
         filter_rule_free(copy);
         if (mtx)
           mtx_unlock(mtx);
+        free(owner);
         goto fail;
       }
     }
     if (mtx)
       mtx_unlock(mtx);
+    free(owner);
   }
   return own;
 fail:
@@ -552,7 +579,7 @@ int open_directory_filter_context(DirectoryScanner* scanner, const FilterNode* i
   bool any_exists = false;
   FilterRuleList* own = read_dir_filters(&scanner->options, scanner->current_path,
                                          scanner->current_rel ? scanner->current_rel : "",
-                                         &any_exists, err, sizeof(err));
+                                         scanner->relative_mode, &any_exists, err, sizeof(err));
   if (!own) {
     /* read_dir_filters() leaves `err` set on a parse/allocation failure even
        when an earlier merge file in the same directory existed (any_exists true);

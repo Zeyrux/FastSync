@@ -589,8 +589,9 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   {
     char err[256];
     bool any_exists = false;
-    FilterRuleList* own =
-        read_dir_filters(options, root_directory, "", &any_exists, err, sizeof(err));
+    FilterRuleList* own = read_dir_filters(options, root_directory, "",
+                                           options->relative && options->file_list != NULL,
+                                           &any_exists, err, sizeof(err));
     if (!own) {
       /* A parse/allocation failure must fail the scan even when an earlier
          merge file in the same directory existed (see the sequential scanner). */

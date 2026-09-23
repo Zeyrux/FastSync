@@ -334,7 +334,10 @@ static const char* filter_dir_rule_owner(const FilterRule* rule) {
  * order = the sender's traversal/rule order).  Rules of one directory are
  * appended to the sink contiguously, so runs reproduce the compilation order.
  * Bounded by MAX_FILTER_RULES / MAX_FILTER_BYTES and MAX_PROTECT_PATTERN_LEN so
- * the peer never sees a frame it would reject. */
+ * the peer never sees a frame it would reject.  The sender enforces exactly the
+ * receiver's limits (including the cumulative owner+pattern byte budget) and
+ * fails with a clear local error instead of emitting a frame that would abort
+ * the transfer with STATUS_ERROR. */
 bool delete_filter_dir_rules_send(int fd, const FilterRuleList* rules) {
   int count = rules ? rules->count : 0;
   if (count < 0 || count > MAX_FILTER_RULES) {
@@ -342,13 +345,31 @@ bool delete_filter_dir_rules_send(int fd, const FilterRuleList* rules) {
                 MAX_FILTER_RULES);
     return false;
   }
+  size_t bytes = 0;
   for (int i = 0; i < count; i++) {
     const FilterRule* rule = rules->items[i];
+    const char* owner = filter_dir_rule_owner(rule);
+    size_t owner_len = strlen(owner);
     size_t pattern_len = rule && rule->pattern ? strlen(rule->pattern) : 0;
-    if (!rule || !rule->pattern || pattern_len == 0 || pattern_len > MAX_PROTECT_PATTERN_LEN) {
+    if (!rule || !rule->pattern || pattern_len == 0) {
       log_message(LOG_LEVEL_ERROR, "invalid per-directory filter pattern");
       return false;
     }
+    if (pattern_len > MAX_PROTECT_PATTERN_LEN) {
+      log_message(LOG_LEVEL_ERROR,
+                  "per-directory filter pattern exceeds %d bytes (use a shorter pattern)",
+                  MAX_PROTECT_PATTERN_LEN);
+      return false;
+    }
+    if (!(owner_len == 0 || (owner[0] != '/' && !has_path_traversal(owner)))) {
+      log_message(LOG_LEVEL_ERROR, "invalid per-directory filter owner directory");
+      return false;
+    }
+    if (owner_len + pattern_len > MAX_FILTER_BYTES - bytes) {
+      log_message(LOG_LEVEL_ERROR, "per-directory filter rules exceed %d bytes", MAX_FILTER_BYTES);
+      return false;
+    }
+    bytes += owner_len + pattern_len;
   }
   int groups = 0;
   for (int i = 0; i < count;) {

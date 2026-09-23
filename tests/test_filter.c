@@ -258,6 +258,59 @@ static void test_filter_list_accepts_supported_rules_and_modifiers() {
   }
 }
 
+/* A "clear"/"!" inside a merge file resets the list to empty.  Rules read after
+ * it must still be owned by the merge file's directory (and marked no-inherit
+ * when the dir-merge says so).  The base index must follow the clear down: when
+ * it was captured before the clear, post-clear rules sat below it and were left
+ * globally owned by "" (and unmarked). */
+static void test_filter_merge_clear_then_owner() {
+  char tmpl[] = "/tmp/fastsync_filter_clear_XXXXXX";
+  EXPECT_TRUE(mkdtemp(tmpl) != NULL);
+  char path[512];
+  snprintf(path, sizeof(path), "%s/.rsync-filter", tmpl);
+  FILE* fp = fopen(path, "w");
+  EXPECT_NOT_NULL(fp);
+  fputs("- *.tmp\n!\nP *.log\n", fp);
+  fclose(fp);
+
+  FilterRuleList* list = filter_rule_list_create();
+  EXPECT_NOT_NULL(list);
+  char err[256] = "";
+  /* A pre-existing rule that the in-file clear must discard. */
+  EXPECT_TRUE(filter_rule_list_parse_append(list, "- keep.txt", NULL, NULL, err, sizeof(err)));
+  EXPECT_EQ_INT(list->count, 1);
+
+  FilterDirMerge spec = {.name = ".rsync-filter", .no_inherit = true};
+  bool exists = false;
+  EXPECT_TRUE(filter_dir_merge_append(list, tmpl, &spec, "sub", NULL, &exists, err, sizeof(err)));
+  EXPECT_TRUE(exists);
+  /* Only the post-clear rule survives, owned by "sub" and no-inherit. */
+  EXPECT_EQ_INT(list->count, 1);
+  EXPECT_EQ_STR(list->items[0]->pattern, "*.log");
+  EXPECT_EQ_STR(list->items[0]->owner, "sub");
+  EXPECT_TRUE(list->items[0]->no_inherit);
+  filter_rule_list_free(list);
+
+  /* A parse failure after the clear must roll the list back to the post-clear
+   * base (empty here), freeing the post-clear rule rather than retaining it. */
+  fp = fopen(path, "w");
+  EXPECT_NOT_NULL(fp);
+  fputs("- *.tmp\n!\nP *.log\n-e bogus\n", fp);
+  fclose(fp);
+  list = filter_rule_list_create();
+  EXPECT_NOT_NULL(list);
+  EXPECT_TRUE(filter_rule_list_parse_append(list, "- keep.txt", NULL, NULL, err, sizeof(err)));
+  EXPECT_EQ_INT(list->count, 1);
+  exists = false;
+  EXPECT_FALSE(filter_dir_merge_append(list, tmpl, &spec, "sub", NULL, &exists, err, sizeof(err)));
+  EXPECT_TRUE(exists);
+  EXPECT_EQ_INT(list->count, 0);
+  filter_rule_list_free(list);
+
+  unlink(path);
+  rmdir(tmpl);
+}
+
 static void test_filter_list_merge_file_still_supported() {
   char tmpl[] = "/tmp/fastsync_filter_XXXXXX";
   EXPECT_TRUE(mkdtemp(tmpl) != NULL);
@@ -430,6 +483,7 @@ void test_filter() {
   test_filter_list_accepts_merge_modifiers();
   test_filter_list_accepts_supported_rules_and_modifiers();
   test_filter_list_merge_file_still_supported();
+  test_filter_merge_clear_then_owner();
   test_filter_rule_parse_rejects_unsupported_and_keeps_supported();
   test_filter_rules_apply_supported_modifiers();
   test_filter_dir_rules_chain();

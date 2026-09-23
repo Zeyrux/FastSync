@@ -154,6 +154,33 @@ def seed_perdir_exclude(_src, rroot, froot):
         _mk(os.path.join(root, "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
 
 
+def seed_perdir_subdir_protect(_src, rroot, froot):
+    """A SUBDIRECTORY-owned `.rsync-filter` (its owner is not the transfer root):
+    the receiver must re-derive the `P` rules in the destination-relative
+    coordinate system, otherwise the destination-only nested extras are wrongly
+    deleted (silent data loss).  A root-level extra is included so a too-broad
+    rule would over-protect.  The file is seeded on both destinations because
+    rsync's receiver reads the per-directory file locally for delete-during."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, "sub", ".rsync-filter"), b"P nested.log\nP extra.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "sub", "nested.log"), b"dest-only protected\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "extra.log"), b"dest-only protected 2\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+        _mk(os.path.join(root, "root_extra.txt"), b"root dest-only deleted\n", _OLD_MTIME)
+
+
+def seed_perdir_subdir_exclude(_src, rroot, froot):
+    """A SUBDIRECTORY-owned unqualified exclude (`-`): dual-sided, so it protects
+    the matching destination-only nested extra under plain --delete and is opted
+    back in by --delete-excluded."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, "sub", ".rsync-filter"), b"- nested.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "sub", "nested.log"), b"dest-only excluded\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+
+
 def _seed_rules(content):
     def seed(_src, _rroot, _froot):
         _mk(os.path.join(_src, ".rules"), content)
@@ -336,6 +363,37 @@ _CASES = [
            ["-a", "-F", "--delete", "--delete-excluded"],
            seed=seed_perdir_exclude, server_args=DELETE, ci=True,
            ref="-F per-directory exclude under --delete-excluded is at risk"),
+    # #316: a rule owned by a SUBDIRECTORY (not the transfer root) must be
+    # re-expressed in the receiver's destination-relative coordinate system, or
+    # the dest-only extras it protects are silently deleted.
+    H.Case("filter_perdir_subdir_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under the default --delete timing"),
+    H.Case("filter_perdir_subdir_protect_during", "filters",
+           ["-a", "-F", "--delete-during"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under --delete-during"),
+    H.Case("filter_perdir_subdir_protect_delay", "filters",
+           ["-a", "-F", "--delete-delay"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under --delete-delay"),
+    H.Case("filter_perdir_subdir_protect_before", "filters",
+           ["-a", "-F", "--delete-before"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under the whole-tree --delete-before commit"),
+    H.Case("filter_perdir_subdir_protect_after", "filters",
+           ["-a", "-F", "--delete-after"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under the whole-tree --delete-after commit"),
+    H.Case("filter_perdir_subdir_exclude_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_subdir_exclude, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned exclude protects its destination mirror"),
+    H.Case("filter_perdir_subdir_exclude_deleted", "filters",
+           ["-a", "-F", "--delete", "--delete-excluded"],
+           seed=seed_perdir_subdir_exclude, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned exclude under --delete-excluded is at risk"),
     # Merge-file modifiers (#315): e/n/w/- semantics match rsync 3.4.1.
     H.Case("dir_merge_e", "filters", ["-a", "--filter=:e .rules"],
            seed=_seed_rules(b"- *.log\n"), ci=True,
