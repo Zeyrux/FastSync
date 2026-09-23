@@ -15,7 +15,11 @@
 #endif
 
 typedef enum { LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARNING, LOG_LEVEL_ERROR } LogLevel;
-typedef enum { LOG_STDERR_ERRORS, LOG_STDERR_ALL } LogStderrMode;
+/* --stderr=MODE destinations.  ERRORS keeps errors on stderr and everything
+ * else on stdout; ALL sends every message to stderr; CLIENT routes the client's
+ * own diagnostics over the protocol stream to the peer's stderr (rsync's
+ * --stderr=client / --no-msgs2stderr). */
+typedef enum { LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_CLIENT } LogStderrMode;
 
 typedef enum {
   LOG_DEBUG_IO = 1u << 0,
@@ -86,5 +90,20 @@ void log_set_8_bit_output(bool enabled);
 bool log_get_8_bit_output(void);
 void log_set_stderr_mode(LogStderrMode mode);
 LogStderrMode log_get_stderr_mode(void);
+/* Write a message a peer forwarded over the client-message channel to this
+ * process's stderr (and log file), with the standard log prefix.  Used by the
+ * server side of rsync's --stderr=client. */
+void log_client_message(const char* message);
+
+/* Sink for LOG_STDERR_CLIENT.  log_message() passes the un-prefixed message
+ * body to the installed sink; a `true` return means the sink took ownership
+ * (e.g. queued it for protocol transmission) and the message must NOT also be
+ * written locally.  A `false` return (or a NULL sink) makes log_message fall
+ * back to the normal local destination, so a diagnostic emitted before the peer
+ * connection exists is never lost (rsync's documented fallback).  The sink may
+ * be called from any thread and must be tolerant of that. */
+typedef bool (*LogClientMsgSink)(const char* message);
+void log_set_client_msg_sink(LogClientMsgSink sink);
+LogClientMsgSink log_get_client_msg_sink(void);
 
 #endif

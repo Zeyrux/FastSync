@@ -3,8 +3,10 @@
 
 #include "array_list.h"
 #include "config.h"
+#include "filter.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/stat.h>
 
 /* Delete engine.
  *
@@ -27,6 +29,24 @@ typedef enum {
      possible, mirroring the delete pass). */
   DELETE_WALK_ERROR
 } DeleteWalkResult;
+
+/* Receiver-side delete-protection rules for one walk.  `base_rules` is the
+ * command-line rule set the config frame carried (owner "" rules); `dir_rules`
+ * is the received per-directory rule set (rules carrying their owner directory
+ * and no-inherit flag).  Either may be NULL. */
+typedef struct {
+  const FilterRuleList* base_rules;
+  const FilterRuleList* dir_rules;
+} DeleteProtectRules;
+
+/* rsync's first-match-wins receiver verdict for one candidate extra: the
+ * per-directory chain is evaluated first (the containing directory's rules,
+ * then each ancestor's, then the receive root's), then the base rules.  Returns
+ * FILTER_ACTION_PROTECT when the entry is shielded by a receiver-side exclude,
+ * FILTER_ACTION_RISK when an include explicitly leaves it at risk, or
+ * FILTER_ACTION_NONE when no rule matched. */
+FilterAction delete_protect_verdict(const DeleteProtectRules* protect, const char* rel_path,
+                                    const char* leaf, bool is_dir);
 
 /* One protected entry for the delete walker.  When top_level_only is true the
    prefix is skipped only as a DIRECT child of dest_root (the --delay-updates
@@ -66,6 +86,9 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
 typedef struct {
   char* name;
   bool is_dir;
+  /* The entry's full st_mode from the AT_SYMLINK_NOFOLLOW stat, so a delete
+     observer can classify a removed non-directory as reg/link/special. */
+  mode_t mode;
 } DeleteDirEntry;
 /* Collect the entries of the directory open on `dirfd` (excluding "." and ".."),
    stat'ing each with AT_SYMLINK_NOFOLLOW.  On success *out is a malloc'd array of
@@ -96,24 +119,38 @@ int delete_dir_entry_cmp_asc(const void* a, const void* b);
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,
-                                       const FilterRuleList* protect_rules, size_t* deleted_out,
+                                       const DeleteProtectRules* protect, size_t* deleted_out,
                                        size_t* skipped_out);
 
+/* Entry kind of a removed path, reported to the delete observer so the receiver
+   can build rsync's `--stats` `Number of deleted files` per-type breakdown.  The
+   four categories are a strict partition of every removed entry. */
+typedef enum {
+  DELETE_ENTRY_REG = 0,
+  DELETE_ENTRY_DIR,
+  DELETE_ENTRY_LINK,
+  DELETE_ENTRY_SPECIAL
+} DeleteEntryType;
+
 /* Optional per-deletion observer: called for each destination-relative path
-   actually removed (a file, symlink, or directory), in removal order, so the
-   receiver can stream rsync's `--info=del`/`--info=remove` lines. */
-typedef void (*DeletePathObserver)(void* context, const char* rel_path);
+   actually removed (a file, symlink, or directory) with its entry kind, in
+   removal order, so the receiver can stream rsync's `--info=del`/`--info=remove`
+   lines and tally the per-type `--stats` counters. */
+typedef void (*DeletePathObserver)(void* context, const char* rel_path, DeleteEntryType type);
+
+/* Classify a removed entry from its st_mode for the per-type delete counters. */
+DeleteEntryType delete_entry_type_of_mode(mode_t mode);
 
 /* `delete_extras_limited_observed` is delete_extras_limited with an optional
  * observer; the observer is invoked only for entries truly removed.  When
- * `protect_rules` is non-NULL its receiver-side verdict is evaluated for every
+ * `protect` is non-NULL its receiver-side verdict is evaluated for every
  * candidate extra: a first-match PROTECT leaves the entry (and, for a
  * directory, its whole subtree) in place, while RISK/NONE fall through to the
  * ordinary skip-prefix/keep-set logic. */
 DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
                                                 const ArrayList* synced_dirs, size_t max_delete,
                                                 const DeleteSkipEntry* skips, int skip_count,
-                                                const FilterRuleList* protect_rules,
+                                                const DeleteProtectRules* protect,
                                                 size_t* deleted_out, size_t* skipped_out,
                                                 DeletePathObserver observer,
                                                 void* observer_context);
@@ -124,7 +161,7 @@ DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const Arr
    strings appended to `out` and receives their count in *count_out. */
 bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
                         const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
-                        const FilterRuleList* protect_rules, ArrayList* out, size_t* count_out);
+                        const DeleteProtectRules* protect, ArrayList* out, size_t* count_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
 
 /* Build the delete walk's skip-prefix set from the config's --delay-updates

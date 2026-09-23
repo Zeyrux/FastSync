@@ -203,9 +203,9 @@ class TestDeviceSpecial:
                                    flags=["--devices"], port=port)
         finally:
             out, err = _stop_captured_server(server)
-        assert result.returncode != 0, (
-            f"a failed device mknod must be a transfer error like rsync (got exit 0): "
-            f"{(out + err)[:300]}"
+        assert result.returncode == 23, (
+            f"a failed device mknod must exit 23 (rsync partial transfer), got "
+            f"{result.returncode}: {(out + err)[:300]}"
         )
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         assert not os.path.lexists(os.path.join(received, "chardev")), (
@@ -213,6 +213,38 @@ class TestDeviceSpecial:
         )
         assert "cannot create device" in (out + err), (
             f"receiver did not log the device creation error: out={out!r} err={err!r}"
+        )
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
+    def test_devices_nonroot_partial_removes_transferred_sources(self):
+        """rsync parity for a partial receiver run under --remove-source-files:
+        the successfully transferred regular source is still removed, the
+        un-creatable device source is kept, and the client exits 23 (verified
+        against rsync 3.4.1: it removes ok.txt/ok2.txt, keeps the device, and
+        exits 23)."""
+        if os.geteuid() != 0 or shutil.which("setpriv") is None:
+            pytest.skip("requires root + setpriv to run the receiver unprivileged")
+        self._setup()
+        os.mknod(os.path.join(DEVICE_SOURCE, "chardev"), stat.S_IFCHR | 0o666,
+                 os.makedev(1, 3))
+        os.makedirs(DEVICE_DEST, exist_ok=True)
+        os.chmod(DEVICE_DEST, 0o777)
+        server, port = _start_captured_server(
+            prefix=["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"])
+        try:
+            result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                                   flags=["--devices", "--remove-source-files"], port=port)
+        finally:
+            out, err = _stop_captured_server(server)
+        assert result.returncode == 23, (
+            f"a partial receiver run must exit 23, got {result.returncode}: "
+            f"{(out + err)[:300]}"
+        )
+        assert not os.path.exists(os.path.join(DEVICE_SOURCE, "plain.txt")), (
+            "a successfully transferred source must be removed even on a partial run"
+        )
+        assert os.path.exists(os.path.join(DEVICE_SOURCE, "chardev")), (
+            "the source device that failed to materialize must be kept"
         )
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
@@ -332,6 +364,57 @@ def setup_test_data():
     # modules, so never rmtree it here.
     shutil.rmtree(SOURCE_DIR, ignore_errors=True)
     shutil.rmtree(DEST_DIR, ignore_errors=True)
+
+
+class TestClientStderrChannel:
+    """--stderr=client: the client's own diagnostics go to the peer's stderr."""
+
+    @pytest.mark.ci
+    def test_client_diagnostic_reaches_server_stderr(self):
+        """A client-side warning emitted during the transfer is forwarded over
+        the STATUS_CLIENT_MSG channel and printed on the server's stderr, not the
+        client's.  A dangling symlink under -L is the deterministic trigger."""
+        source = os.path.join(TEST_DATA_DIR, "client_msg_src")
+        dest = os.path.join(TEST_DATA_DIR, "client_msg_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "plain.txt"), "wb") as f:
+            f.write(b"payload\n")
+        os.symlink("no-such-referent", os.path.join(source, "dangling"))
+        server, port = _start_captured_server()
+        try:
+            result, _ = run_client(source, dest, flags=["-L", "--stderr=client"],
+                                   port=port)
+        finally:
+            out, err = _stop_captured_server(server)
+        assert "symlink has no referent" in (out + err), (
+            f"client diagnostic did not reach the server stderr: out={out!r} err={err!r}"
+        )
+        assert "symlink has no referent" not in (result.stderr or ""), (
+            f"client diagnostic must not also be written locally: {result.stderr!r}"
+        )
+
+    @pytest.mark.ci
+    def test_no_msgs2stderr_alias_uses_client_channel(self):
+        """--no-msgs2stderr is rsync's spelling of --stderr=client and now
+        forwards the client's diagnostics to the server too."""
+        source = os.path.join(TEST_DATA_DIR, "client_msg_alias_src")
+        dest = os.path.join(TEST_DATA_DIR, "client_msg_alias_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "plain.txt"), "wb") as f:
+            f.write(b"payload\n")
+        os.symlink("no-such-referent", os.path.join(source, "dangling"))
+        server, port = _start_captured_server()
+        try:
+            result, _ = run_client(source, dest, flags=["-L", "--no-msgs2stderr"],
+                                   port=port)
+        finally:
+            out, err = _stop_captured_server(server)
+        assert "symlink has no referent" in (out + err), (
+            f"--no-msgs2stderr did not route to the server: out={out!r} err={err!r}"
+        )
+        assert "symlink has no referent" not in (result.stderr or "")
 
 
 class TestDryRun:
@@ -2809,6 +2892,37 @@ class TestItemizeChanges:
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-i", "--dry-run"])
         assert result.returncode == 0, f"dry-run -i failed: {result.stderr[:200]}"
+
+    def test_chunk_serialization_probes_ancestor_dir_state(self, shared_server):
+        """#314: --chunk-serialization + -i must probe ancestor directory state
+        so a pre-existing directory with a changed mtime itemizes as an
+        attribute change (`.d..t......`) instead of being rendered as created
+        (`cd+++++++++`)."""
+        source = os.path.join(TEST_DATA_DIR, "itemize_chunk_serial_src")
+        dest = os.path.join(TEST_DATA_DIR, "itemize_chunk_serial_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        subdir = os.path.join(source, "sub")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "file.txt"), "wb") as fh:
+            fh.write(b"payload\n")
+
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+
+        # Change only the source directory's mtime; its contents stay identical
+        # so only the directory's time attribute differs on the rerun.
+        os.utime(subdir, (1_000_000_000, 1_000_000_000))
+
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "-i", "--chunk-serialization"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"chunk-serialization -i failed: {result.stderr[:200]}"
+        dir_lines = [line for line in result.stdout.splitlines() if line.endswith(" sub/")]
+        assert dir_lines == [".d..t...... sub/"], (
+            f"expected an attribute-change dir line, got {dir_lines!r}; "
+            f"full stdout={result.stdout!r}"
+        )
 
     def test_changed_file_on_second_incremental_run_prints_exactly_one_line(self, shared_server):
         """A changed file itemizes exactly once on an incremental rerun while

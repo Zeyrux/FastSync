@@ -674,9 +674,9 @@ remote SSH argv is already built injection-safe.
 | `--outbuf=MODE` | stdout/stderr buffering: `N` (none/unbuffered), `L` (line-buffered), or `B` (block-buffered, default). |
 | `--log-file <path>` | Write log output to a file. |
 | `--log-file-format=FORMAT` | Per-file log-line format (requires `--log-file`). |
-| `--stderr=MODE` | Route logging to stderr: `errors` or `all`. |
+| `--stderr=MODE` | Route logging: `errors` (default), `all`, or `client` (forward the client's diagnostics to the server's stderr over the client-message channel). |
 | `--msgs2stderr` | Route all messages to stderr (deprecated spelling of `--stderr=all`). |
-| `--no-msgs2stderr` | Select errors-only stderr (deprecated spelling; the default). |
+| `--no-msgs2stderr` | Forward the client's diagnostics to the server (deprecated spelling of `--stderr=client`). |
 | `-V`, `--version` | Print the FastSync protocol version. |
 | `--help` | Print command usage. |
 
@@ -832,7 +832,7 @@ before the module list, before authentication, and the connecting peer address
 
 ## Protocol and Security
 
-FastSync protocol version `2.29.0` is shared by the client and server. The
+FastSync protocol version `2.30.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
 manifests, keep-alives, abort handling, per-file remove-source results, and

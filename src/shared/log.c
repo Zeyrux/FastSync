@@ -1,4 +1,5 @@
 #include "log.h"
+#include "utils.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -16,6 +17,7 @@ static bool info_flags_explicit = false;
 static FILE* log_fp = NULL;
 static _Thread_local bool eight_bit_output;
 static LogStderrMode stderr_mode = LOG_STDERR_ERRORS;
+static LogClientMsgSink client_msg_sink = NULL;
 
 /* Serializes access to log_fp and makes each emitted line atomic: the
  * timestamp prefix, formatted body, and trailing newline are written as one
@@ -77,6 +79,51 @@ LogStderrMode log_get_stderr_mode(void) {
   return stderr_mode;
 }
 
+void log_set_client_msg_sink(LogClientMsgSink sink) {
+  client_msg_sink = sink;
+}
+
+LogClientMsgSink log_get_client_msg_sink(void) {
+  return client_msg_sink;
+}
+
+/* Format just the message body (no prefix/newline) into a freshly allocated
+ * buffer.  Shared by log_message (which may hand the body to a client-message
+ * sink) and log_client_message.  Returns NULL on allocation/format failure. */
+static char* format_log_body(const char* format, va_list args) {
+  va_list copy;
+  va_copy(copy, args);
+  int body_len = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  if (body_len < 0)
+    return NULL;
+  char* body = malloc((size_t)body_len + 1);
+  if (!body)
+    return NULL;
+  vsnprintf(body, (size_t)body_len + 1, format, args);
+  return body;
+}
+
+/* Assemble a complete log line (prefix + body + newline) from an already
+ * formatted body.  Returns NULL on allocation failure. */
+static char* format_log_line_from_body(LogLevel log_level, const struct tm* t, const char* body) {
+  char prefix[64];
+  int prefix_len = snprintf(
+      prefix, sizeof(prefix), "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900,
+      t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, log_level_strings[log_level]);
+  if (prefix_len < 0 || prefix_len >= (int)sizeof(prefix))
+    return NULL;
+  size_t body_len = strlen(body);
+  char* line = malloc((size_t)prefix_len + body_len + 2); /* body + '\n' + NUL */
+  if (!line)
+    return NULL;
+  memcpy(line, prefix, (size_t)prefix_len);
+  memcpy(line + prefix_len, body, body_len);
+  line[(size_t)prefix_len + body_len] = '\n';
+  line[(size_t)prefix_len + body_len + 1] = '\0';
+  return line;
+}
+
 /* Format one complete log line (timestamp prefix + body + newline) into a
  * freshly allocated buffer.  This is pure CPU/malloc work and must happen
  * OUTSIDE the log mutex: the mutex only guards the log_fp pointer, so a
@@ -84,26 +131,11 @@ LogStderrMode log_get_stderr_mode(void) {
  * on allocation/formatting failure. */
 static char* format_log_line(LogLevel log_level, const struct tm* t, const char* format,
                              va_list args) {
-  char prefix[64];
-  int prefix_len = snprintf(
-      prefix, sizeof(prefix), "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900,
-      t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, log_level_strings[log_level]);
-  if (prefix_len < 0 || prefix_len >= (int)sizeof(prefix))
+  char* body = format_log_body(format, args);
+  if (!body)
     return NULL;
-  va_list copy;
-  va_copy(copy, args);
-  int body_len = vsnprintf(NULL, 0, format, copy);
-  va_end(copy);
-  if (body_len < 0)
-    return NULL;
-  size_t total = (size_t)prefix_len + (size_t)body_len;
-  char* line = malloc(total + 2); /* body bytes + '\n' + NUL */
-  if (!line)
-    return NULL;
-  memcpy(line, prefix, (size_t)prefix_len);
-  vsnprintf(line + prefix_len, (size_t)body_len + 1, format, args);
-  line[total] = '\n';
-  line[total + 1] = '\0';
+  char* line = format_log_line_from_body(log_level, t, body);
+  free(body);
   return line;
 }
 
@@ -119,6 +151,26 @@ static void emit_log_line(FILE* console, const char* line) {
   if (file)
     fputs(line, file);
   mtx_unlock(&log_mutex);
+}
+
+void log_client_message(const char* message) {
+  if (!message)
+    return;
+  /* The body is peer-controlled: escape every non-printable byte (newlines,
+     CR, ANSI ESC, ...) so a hostile client cannot forge log lines or inject
+     terminal control sequences.  output_escape() is the codebase's canonical
+     escaper and leaves printable text untouched. */
+  char* escaped = output_escape(message, log_get_8_bit_output());
+  if (!escaped)
+    return;
+  /* Route through the ordinary log level / destination gate (log_message):
+     this respects --log-file, the configured stderr mode and the level
+     threshold instead of always writing to stderr.  The wire body carries no
+     severity, so the forwarded diagnostic is emitted as a warning -- the
+     lowest level the default gate admits, which keeps the peer's messages
+     visible without bypassing --quiet. */
+  log_message(LOG_LEVEL_WARNING, "%s", escaped);
+  free(escaped);
 }
 
 void log_message(LogLevel log_level, const char* format, ...) {
@@ -138,8 +190,23 @@ void log_message(LogLevel log_level, const char* format, ...) {
 
   va_list args;
   va_start(args, format);
-  char* line = format_log_line(log_level, &t, format, args);
+  char* body = format_log_body(format, args);
   va_end(args);
+  if (!body)
+    return;
+  /* LOG_STDERR_CLIENT: hand the diagnostic to the client-message channel.  A
+     sink that takes ownership suppresses the local write; otherwise (no sink
+     yet, or the peer connection is not up) fall through to local output so the
+     diagnostic is never lost. */
+  if (stderr_mode == LOG_STDERR_CLIENT) {
+    LogClientMsgSink sink = client_msg_sink;
+    if (sink && sink(body)) {
+      free(body);
+      return;
+    }
+  }
+  char* line = format_log_line_from_body(log_level, &t, body);
+  free(body);
   if (!line)
     return;
   emit_log_line(dest_io, line);

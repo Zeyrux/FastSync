@@ -153,7 +153,8 @@ static void test_receiver_deleted_paths_gated_by_report_deletes() {
   PipelineContextReceiver* ctx_info = pipeline_context_receiver_create(info, q_info, -1, NULL);
   EXPECT_NOT_NULL(ctx_info);
   EXPECT_NOT_NULL(ctx_info->deleted_paths);
-  receiver_record_deleted_path(ctx_info->deleted_paths, "d/old_extra");
+  ReceiverDeleteContext delctx = {NULL, ctx_info->deleted_paths};
+  receiver_record_deleted_path(&delctx, "d/old_extra", DELETE_ENTRY_REG);
   EXPECT_EQ_INT(ctx_info->deleted_paths->size, 1);
   EXPECT_EQ_STR((const char*)ctx_info->deleted_paths->items[0], "d/old_extra");
   pipeline_context_receiver_destroy(ctx_info);

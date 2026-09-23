@@ -6,6 +6,36 @@ run the same version because the handshake is strict.
 
 ## [Unreleased]
 
+Wire backlog cycle (protocol 2.29.0 → 2.30.0; config-frame layout unchanged).
+
+- **`--stderr=client` client-message channel (#313):** the client now accepts
+  `--stderr=client` (and maps the deprecated `--no-msgs2stderr` to it), routing
+  its own diagnostics over the new bounded `STATUS_CLIENT_MSG` client->server
+  frame instead of writing them locally; the server writes each received
+  message to its stderr (respecting the server log destination).  `errors`/`all`
+  behavior is unchanged.
+- **Receiver partial failures exit 23 (#320):** a per-entry receiver failure
+  that does not abort the stream (e.g. an unprivileged `--devices` mknod) now
+  sends the terminal `STATUS_PARTIAL`; the client exits 23 like rsync and, under
+  `--remove-source-files`, still removes the sources it successfully
+  transferred.  A clean run stays 0 and a fatal/connection error stays non-23.
+- **Directory/symlink destination-state itemize (#314):** when `report_dest_info`
+  is negotiated (now also for `--progress`), the receiver answers `STATUS_MKDIR`
+  and `STATUS_SYMLINK` with the entry's pre-transfer destination snapshot
+  (existence, type, perms/owner/group/time, and whether an existing symlink's
+  target already matches), and the sender probes every ancestor directory before
+  the receiver creates it implicitly.  A re-run over an unchanged tree no longer
+  emits per-directory `cd+++++++++` or unchanged-symlink lines, a changed
+  directory renders rsync's `.d..t......`, and a changed symlink renders
+  `cLc........` / `.L..t......`.  Directory/symlink time comparison uses whole
+  seconds (rsync's `cmp_time`).  The `STATUS_MKDIR` body gains a probe flag and
+  the `STATUS_DEST_INFO` record gains a symlink-target-match field; the
+  config-frame layout is unchanged.  Differential-tested against rsync 3.4.1.
+- **`--stats` deleted per-type breakdown (#316):** `STATUS_STATS` gains
+  `deleted_reg/dir/link/special`, tallied by the delete observers and rendered
+  as rsync's `Number of deleted files: X (reg: A, dir: B, link: C, special: D)`.
+  Differential-tested against rsync 3.4.1 for a mixed-type `--delete` tree.
+
 ## [2.29.0] - 2026-09-23
 
 The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).

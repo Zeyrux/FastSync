@@ -67,6 +67,12 @@ typedef struct {
      them in the manifest frame's third section and the receiver deletes each as
      an explicit request. */
   ArrayList* missing_args;
+  /* Per-directory filter rules the source scan compiled (protocol 2.30.0),
+     sent with the delete manifest/plan config so the receiver can re-derive the
+     per-directory protect/risk set.  NULL when --delete is off.  Populated by
+     the scanner (parallel workers append under mutex_scanner) or the early
+     pre-scan. */
+  FilterRuleList* per_dir_rules;
   /* A source I/O error (unreadable directory) was recorded during the scan.
      Set by the pre-scan (before the threads start) or by the scanner thread
      under mutex_scanner; the caller turns it into a non-zero exit when
@@ -134,6 +140,11 @@ typedef struct {
      deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
      exit 25 like rsync.  Read by the caller after the sender thread is joined. */
   bool delete_limit;
+  /* Set by the sender thread when the receiver reported STATUS_PARTIAL (a
+     per-entry receiver failure that did not abort the stream): the transfer
+     otherwise succeeded, successfully stored --remove-source-files sources were
+     removed, and the process must exit 23 like rsync.  Read after join. */
+  bool partial;
 } PipelineContextSender;
 
 /* `config` is borrowed and must outlive the context: destroy does NOT free it,

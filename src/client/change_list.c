@@ -123,8 +123,15 @@ static char itemize_type_char(const ChangeEvent* event) {
 static bool times_match(const Config* config, const ChangeEvent* event) {
   if (!event->dest.known || !event->dest.existed)
     return false;
-  if (event->mtime_sec == event->dest.mtime_sec)
+  if (event->mtime_sec == event->dest.mtime_sec) {
+    /* A regular file's sub-second mtime IS preserved by the receiver, so an nsec
+       difference is a real change.  A directory or symlink has no preserved
+       sub-second mtime (rsync's quick-check compares whole seconds there), so a
+       nanosecond-only difference must not render a spurious `.d..t` / `.L..t`. */
+    if (event->is_directory || event->is_symlink || event->is_special)
+      return true;
     return event->mtime_nsec == event->dest.mtime_nsec;
+  }
   long long delta = (long long)event->mtime_sec - (long long)event->dest.mtime_sec;
   if (delta < 0)
     delta = -delta;
@@ -145,6 +152,10 @@ static void itemize_code(const Config* config, const ChangeEvent* event, char co
     /* rsync: an existing directory that only has attribute changes carries no
        transfer, so the update column is `.` rather than `>`. */
     update = '.';
+  else if (event->is_symlink)
+    /* rsync: an existing symlink whose target is unchanged is a `.` update
+       (attributes only); a changed target is `c` (the link value changed). */
+    update = event->dest.target_matches ? '.' : 'c';
   else
     update = '>';
   code[0] = update;
@@ -155,12 +166,20 @@ static void itemize_code(const Config* config, const ChangeEvent* event, char co
     code[11] = '\0';
     return;
   }
-  bool size_diff = event->size != event->dest.size;
-  bool time_diff = !times_match(config, event);
+  /* rsync's value/checksum column: `c` for a symlink whose target changed (the
+     link value is the compared content); no destination digest is available for
+     a regular file. */
+  bool value_diff = event->is_symlink && !event->dest.target_matches;
+  /* rsync itemizes size only for regular files: a directory's st_size and a
+     symlink's target length are not compared. */
+  bool size_diff = !event->is_directory && !event->is_symlink && !event->is_special &&
+                   event->size != event->dest.size;
+  /* rsync itemizes the time column only when -t/--times is in effect. */
+  bool time_diff = config->preserve_times && !times_match(config, event);
   bool perms_diff = (event->mode & 07777) != (event->dest.mode & 07777);
   bool owner_diff = event->uid != (uid_t)event->dest.uid;
   bool group_diff = event->gid != (gid_t)event->dest.gid;
-  code[2] = '.'; /* checksum: no destination digest available */
+  code[2] = value_diff ? 'c' : '.';
   code[3] = size_diff ? 's' : '.';
   code[4] = time_diff ? 't' : '.';
   code[5] = (config->preserve_perms && perms_diff) ? 'p' : '.';
@@ -170,6 +189,24 @@ static void itemize_code(const Config* config, const ChangeEvent* event, char co
   code[9] = '.'; /* acl: not compared */
   code[10] = '.';
   code[11] = '\0';
+}
+
+/* True when the itemized destination entry is unchanged, i.e. rsync would print
+ * no line at all.  Reuses itemize_code so suppression is exactly consistent
+ * with what would have been rendered: the update column must be `.` and every
+ * attribute column must be `.`. */
+static bool itemize_is_unchanged(const Config* config, const ChangeEvent* event) {
+  if (!event->dest.known || !event->dest.existed)
+    return false;
+  char code[12];
+  itemize_code(config, event, code);
+  if (code[0] != '.')
+    return false;
+  for (int i = 2; i < 11; i++) {
+    if (code[i] != '.')
+      return false;
+  }
+  return true;
 }
 
 /* rsync %n: the transfer-relative name, with a trailing slash for directories.
@@ -678,6 +715,19 @@ void change_emit_file_sent_bytes(const Config* config, const File* file,
   char* name = NULL;
   char* path = NULL;
   fill_event_from_file(config, file, &event, &name, &path);
+  if (file->is_symlink) {
+    /* Output parity (protocol 2.30.0): an unchanged symlink is silent, like
+       rsync's quick check.  The itemize/log stream suppresses it only when every
+       attribute matches; the name stream suppresses it whenever the link target
+       is unchanged (rsync names a symlink only when it relinks or creates it). */
+    bool itemize_output = config->itemize_changes || config->out_format != NULL ||
+                          (config->log_file != NULL && config->log_file_format != NULL);
+    bool suppress = itemize_output
+                        ? itemize_is_unchanged(config, &event)
+                        : (event.dest.known && event.dest.existed && event.dest.target_matches);
+    if (suppress)
+      event.decision = CHANGE_UP_TO_DATE;
+  }
   if (name != NULL && path != NULL) {
     fill_event_checksum(config, file, &event);
     change_emit(config, &event);
@@ -729,6 +779,19 @@ void change_emit_dir_sent(const Config* config, const File* file) {
   char* name = NULL;
   char* path = NULL;
   fill_event_from_file(config, file, &event, &name, &path);
+  /* Output parity (protocol 2.30.0): suppress a directory rsync would leave
+     silent.  The itemize/log stream suppresses it only when every attribute
+     matches (`.d.........`); the name stream suppresses any pre-existing
+     directory (rsync names a directory only when it is created). */
+  bool itemize_output = config->itemize_changes || config->out_format != NULL ||
+                        (config->log_file != NULL && config->log_file_format != NULL);
+  bool suppress = itemize_output ? itemize_is_unchanged(config, &event)
+                                 : (event.dest.known && event.dest.existed);
+  /* The transfer root's line is an unconditional FastSync residual (rsync keys
+     it off the root's own attribute change); keep emitting it. */
+  bool is_root = event.name != NULL && event.name[0] == '\0';
+  if (suppress && !is_root)
+    event.decision = CHANGE_UP_TO_DATE;
   if (name != NULL && path != NULL)
     change_emit(config, &event);
   free(name);

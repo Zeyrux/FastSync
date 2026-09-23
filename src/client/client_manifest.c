@@ -330,9 +330,11 @@ int send_list_only(const Config* config) {
 }
 
 /* Send the delete manifest to the server.  Returns 0 on success, -1 on
-   failure.  It carries FOUR sections: the keep-set paths, the protected
-   excluded prefixes, the --delete-missing-args exact-delete paths, and the
-   destination-relative directories the sender synchronized this run.
+   failure.  It carries FOUR path sections (keep-set paths, protected excluded
+   prefixes, --delete-missing-args exact-delete paths, and the destination-
+   relative directories the sender synchronized this run) followed by the
+   protocol-2.30.0 per-directory filter-rule block (`per_dir_rules`, the rules
+   the scan compiled from each directory's merge files).
    When --delete-excluded is given `protected` is empty: excluded destination
    mirrors are then ordinary extras and are removed.  When
    --delete-missing-args is active `missing_args` holds the destination mirrors
@@ -346,7 +348,8 @@ int send_list_only(const Config* config) {
    frame.  A heavily filtered source whose exclusion list is large therefore
    fails the run cleanly on the receiver rather than being truncated. */
 int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes,
-                         ArrayList* size_skipped, ArrayList* missing_args, ArrayList* synced_dirs) {
+                         ArrayList* size_skipped, ArrayList* missing_args, ArrayList* synced_dirs,
+                         const FilterRuleList* per_dir_rules) {
   if (!send_status(fd, STATUS_MANIFEST))
     return -1;
   int keep_count = manifest ? manifest->size : 0;
@@ -389,6 +392,11 @@ int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefi
     if (!send_wire_str(fd, (char*)synced_dirs->items[i]))
       return -1;
   }
+  /* Protocol 2.30.0: the receiver-side per-directory filter rules discovered by
+     the sender's scan, so the whole-tree commit walker can shield a
+     destination-only entry that matches only a per-directory merge rule. */
+  if (!delete_filter_dir_rules_send(fd, per_dir_rules))
+    return -1;
   return 0;
 }
 
@@ -409,11 +417,11 @@ int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefi
 
 bool send_delete_manifest_early(Client* client, ArrayList* manifest, ArrayList* protected_prefixes,
                                 ArrayList* size_skipped, ArrayList* missing_args,
-                                ArrayList* synced_dirs) {
+                                ArrayList* synced_dirs, const FilterRuleList* per_dir_rules) {
   if (!client || !manifest)
     return false;
   if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes, size_skipped,
-                           missing_args, synced_dirs) != 0)
+                           missing_args, synced_dirs, per_dir_rules) != 0)
     return false;
   Status ack;
   /* The wait is long (up to an hour) and runs inline on this thread: a helper
@@ -487,6 +495,7 @@ int send_dry_run_remote(Config* config) {
   protocol_session_bind(&session);
 
   int ret = 1;
+  bool partial = false;
   time_t dry_start = time(NULL);
   ReceiverStats dry_stats;
   memset(&dry_stats, 0, sizeof(dry_stats));
@@ -497,6 +506,7 @@ int send_dry_run_remote(Config* config) {
   ArrayList* dry_dirs = NULL;
   ArrayList* dry_excluded = NULL;
   ArrayList* dry_size_skipped = NULL;
+  FilterRuleList* dry_per_dir = NULL;
   if (!config_send(client->file_descriptor, config))
     goto dry_fail;
   receive_daemon_motd(client, config);
@@ -509,8 +519,10 @@ int send_dry_run_remote(Config* config) {
     dry_manifest = array_list_create(free);
     dry_dirs = array_list_create(free);
     dry_size_skipped = array_list_create(free);
-    if (!dry_manifest || !dry_dirs || !dry_size_skipped)
+    dry_per_dir = filter_rule_list_create();
+    if (!dry_manifest || !dry_dirs || !dry_size_skipped || !dry_per_dir)
       goto dry_fail;
+    prepared.options.per_dir_rules = dry_per_dir;
     if (!config->delete_excluded) {
       dry_excluded = array_list_create(free);
       if (!dry_excluded)
@@ -612,7 +624,7 @@ int send_dry_run_remote(Config* config) {
   bool early_delete = config->use_delete && config_delete_timing_early(config);
   if (dry_manifest) {
     if (send_delete_manifest(client->file_descriptor, dry_manifest, dry_excluded, dry_size_skipped,
-                             NULL, dry_dirs) != 0)
+                             NULL, dry_dirs, dry_per_dir) != 0)
       goto dry_fail;
     if (early_delete) {
       Status ack;
@@ -642,8 +654,14 @@ int send_dry_run_remote(Config* config) {
     if (!receive_status(client->file_descriptor, &status))
       goto dry_fail;
   }
-  if (status != STATUS_OK)
+  /* A per-entry receiver failure is rsync's PARTIAL transfer (exit 23), not a
+     hard failure: a dry run transfers nothing, but keep the verdict consistent
+     with the normal path instead of treating it as a protocol error. */
+  if (status == STATUS_PARTIAL) {
+    partial = true;
+  } else if (status != STATUS_OK) {
     goto dry_fail;
+  }
   if (!config->quiet) {
     if (config->human_readable)
       printf("Total: %d files, %s\n", file_count,
@@ -661,7 +679,7 @@ int send_dry_run_remote(Config* config) {
     dry_transfer.literal_data = total_bytes;
     report_transfer_stats(config, &dry_transfer, dry_start, &dry_stats);
   }
-  ret = io_error ? 1 : 0;
+  ret = io_error ? 1 : (partial ? 23 : 0);
 
 dry_fail:
   if (dry_manifest)
@@ -672,6 +690,8 @@ dry_fail:
     array_list_delete(dry_excluded);
   if (dry_size_skipped)
     array_list_delete(dry_size_skipped);
+  if (dry_per_dir)
+    filter_rule_list_free(dry_per_dir);
   if (scanner)
     directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);

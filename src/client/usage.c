@@ -297,11 +297,13 @@ void print_usage(void) {
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  -x, --one-file-system  Do not cross filesystem boundaries\n");
   printf("  --log-file <path>, --log-file=<path>  Write log messages to file\n");
-  printf("  --stderr=MODE       Route logging to stderr: errors or all\n");
+  printf("  --stderr=MODE       Route logging: errors (default), all, or client\n");
+  printf("                      (forward the client's diagnostics to the server's\n");
+  printf("                      stderr)\n");
   printf("  --msgs2stderr       Route all messages to stderr (deprecated spelling of\n");
   printf("                      --stderr=all)\n");
-  printf("  --no-msgs2stderr    Select errors-only stderr (deprecated spelling; the\n");
-  printf("                      default)\n");
+  printf("  --no-msgs2stderr    Forward the client's diagnostics to the server\n");
+  printf("                      (deprecated spelling of --stderr=client)\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --partial-dir <dir> Directory for partial files (implies --partial)\n");
   printf("  -T, --temp-dir <dir>  Scratch dir for temp files before atomic install.\n");

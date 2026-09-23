@@ -433,12 +433,10 @@ static int set_stderr_mode(const char* value) {
     log_set_stderr_mode(LOG_STDERR_ERRORS);
   else if (strcmp(value, "all") == 0 || strcmp(value, "a") == 0)
     log_set_stderr_mode(LOG_STDERR_ALL);
-  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0) {
-    log_message(LOG_LEVEL_ERROR,
-                "--stderr=client is not supported: FastSync has no client message channel");
-    return -1;
-  } else {
-    log_message(LOG_LEVEL_ERROR, "--stderr must be errors or all");
+  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0)
+    log_set_stderr_mode(LOG_STDERR_CLIENT);
+  else {
+    log_message(LOG_LEVEL_ERROR, "--stderr must be errors, all, or client");
     return -1;
   }
   return 0;
@@ -1353,10 +1351,9 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
     return true;
   }
   /* "--no-msgs2stderr" is the deprecated spelling of --stderr=client (rsync
-   * 3.4.1).  FastSync has no separate client message channel, so the closest
-   * supported mode is the errors-only default. */
+   * 3.4.1); the client-message channel now exists, so it maps to `client`. */
   if (strcmp(arg, "--no-msgs2stderr") == 0)
-    return set_stderr_mode("errors") == 0;
+    return set_stderr_mode("client") == 0;
   /* "--no-motd" is a real rsync option name (client-side daemon MOTD display
    * suppression), not a negation of a "--motd" flag, so it is handled before
    * the generic --no-* negation branch. */
@@ -2810,8 +2807,11 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * need the pre-transfer destination snapshot (new vs modified and which
    * attributes differ), so ask the receiver to report it on every per-file
    * check.  This is a wire field. */
+  bool progress_active =
+      !config->quiet && (config->show_progress || (config->info_level & LOG_INFO_PROGRESS) != 0);
   config->report_dest_info = config->itemize_changes || config->out_format != NULL ||
-                             (config->log_file != NULL && config->log_file_format != NULL);
+                             (config->log_file != NULL && config->log_file_format != NULL) ||
+                             progress_active;
   /* Wire-stats parity: --stats, --progress/-P, an --out-format token that needs
    * a wire counter (%b/%c), or a dry-run --delete need the receiver's
    * end-of-transfer STATUS_STATS report.  This is a wire field (protocol

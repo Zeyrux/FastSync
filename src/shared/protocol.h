@@ -15,6 +15,12 @@
  * this for a rejection and the detail frame stays a small, fixed bound. */
 #define MAX_ERROR_DETAIL_BYTES 4096
 
+/* Hard cap on a client diagnostic forwarded over the STATUS_CLIENT_MSG channel
+ * (protocol 2.30.0, rsync's --stderr=client).  The body is reused from the
+ * bounded-string wire helper and sliced to this many bytes before it is sent,
+ * so a peer can never be made to retain more than this per message. */
+#define MAX_CLIENT_MSG_BYTES 4096
+
 /* Maximum uncompressed file payload accepted by the receiver's whole-file
  * paths.  A single whole file is charged against the per-connection memory
  * reservation (MAX_CONNECTION_MEMORY) and against the server allocation
@@ -123,8 +129,13 @@ enum NET_STATUS {
   STATUS_KEEPALIVE,
   STATUS_ABORT,
   STATUS_CHECK_BATCH,
-  /* An explicit directory entry (--dirs): the sender transmits only the path;
-   * the receiver creates the directory below the receive root. */
+  /* An explicit directory entry (--dirs / an empty source directory): the sender
+   * transmits the path and, when metadata/xattrs are negotiated, their blocks;
+   * the receiver creates the directory below the receive root.  Protocol 2.30.0
+   * inserts an int32 probe flag right after the status when report_dest_info is
+   * negotiated: probe=1 is a report-only frame (path only; the receiver answers
+   * STATUS_DEST_INFO and creates nothing), probe=0 is a real create that is
+   * answered with the directory's pre-transfer state before it is created. */
   STATUS_MKDIR,
   /* --append / --append-verify tail resume.  STATUS_APPEND is sent by the
    * receiver after a per-file STATUS_CHECK when the existing destination file
@@ -207,16 +218,22 @@ enum NET_STATUS {
    * limit stopped deletions").  Appended after STATUS_DRY_RUN_TRANSFER so no
    * existing status is renumbered. */
   STATUS_DELETE_LIMIT,
-  /* Destination-state report for output parity (protocol 2.23.0).  When the
-   * wire config carries report_dest_info=true, the receiver answers every
-   * per-file STATUS_CHECK request with STATUS_DEST_INFO FIRST, followed by a
-   * fixed record describing the pre-transfer destination entry
-   * (int32 has_old; uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode;
-   * int32 uid; int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict
-   * follows, so the sender can render rsync-accurate -i/--out-format columns
-   * (new vs modified, and which of size/time/perms/owner/group differ) without
-   * changing the transfer decision itself.  Appended after
-   * STATUS_DELETE_LIMIT so no existing status is renumbered. */
+  /* Destination-state report for output parity (protocol 2.23.0; extended to
+   * directories/symlinks in 2.30.0).  When the wire config carries
+   * report_dest_info=true, the receiver answers every per-file STATUS_CHECK
+   * request with STATUS_DEST_INFO FIRST, followed by a fixed record describing
+   * the pre-transfer destination entry (int32 has_old; int32 target_matches;
+   * uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode; int32 uid;
+   * int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict follows, so the
+   * sender can render rsync-accurate -i/--out-format columns (new vs modified,
+   * and which of size/time/perms/owner/group differ) without changing the
+   * transfer decision itself.  Protocol 2.30.0 also uses this record for
+   * STATUS_MKDIR and STATUS_SYMLINK: the sender consumes it into the entry's
+   * dest_state before emitting its change line, and target_matches reports
+   * whether an existing symlink's on-disk target already equals the incoming
+   * one (so the sender can render `cLc........` vs `.L..t......` and suppress
+   * an unchanged symlink).  Appended after STATUS_DELETE_LIMIT so no existing
+   * status is renumbered. */
   STATUS_DEST_INFO,
   /* Per-directory delete plan (protocol 2.24.0).  The sender of a
    * --delete-during/--delete-delay transfer streams one frame per source
@@ -238,9 +255,29 @@ enum NET_STATUS {
    * config carries report_stats=true, the receiver sends this status once,
    * immediately before its terminal success status, followed by a fixed stats
    * record (see format_stats_send/receive in format.h) and, when the run is a
-   * --dry-run with --delete, the would-delete path list.  Appended after
-   * STATUS_DELETE_PLAN so no existing status is renumbered. */
-  STATUS_STATS
+   * --dry-run with --delete, the would-delete path list.  Protocol 2.30.0
+   * appends the four deleted_reg/dir/link/special counters to that record, so
+   * --stats can render rsync's `Number of deleted files` per-type breakdown.
+   * Appended after STATUS_DELETE_PLAN so no existing status is renumbered. */
+  STATUS_STATS,
+  /* Client diagnostic channel (protocol 2.30.0, rsync's --stderr=client /
+   * --no-msgs2stderr).  When the client's --stderr mode is `client`, the
+   * client forwards its own diagnostics over this client->server frame
+   * (STATUS_CLIENT_MSG followed by a bounded length-prefixed string, capped at
+   * MAX_CLIENT_MSG_BYTES) instead of writing them to its local stderr.  The
+   * receiver reads the string and writes it to the server's stderr (respecting
+   * the server log destination).  Appended after STATUS_STATS so no existing
+   * status is renumbered. */
+  STATUS_CLIENT_MSG,
+  /* Receiver-side partial transfer (protocol 2.30.0).  Sent by the receiver as
+   * the terminal status INSTEAD of STATUS_OK when one or more entries failed
+   * per-entry without aborting the stream (currently a --devices mknod
+   * EPERM/EACCES).  The transfer otherwise succeeded and every successfully
+   * stored file was acknowledged, so the sender may still remove
+   * --remove-source-files sources; the sender maps this to rsync's exit code
+   * 23 ("partial transfer due to error"), distinct from a fatal STATUS_ERROR.
+   * Appended after STATUS_CLIENT_MSG so no existing status is renumbered. */
+  STATUS_PARTIAL
 };
 
 void io_set_fds(int read_fd, int write_fd);
@@ -341,6 +378,11 @@ bool receive_status(int file_descriptor, Status* status);
  * length-prefixed string.  Over-long messages are sliced and NULL is treated
  * as "".  Returns false if the status or the string could not be sent. */
 bool send_error_detail(int file_descriptor, const char* message);
+/* Send STATUS_CLIENT_MSG followed by a bounded (<= MAX_CLIENT_MSG_BYTES)
+ * length-prefixed string carrying a client diagnostic.  Over-long messages are
+ * sliced and NULL is treated as "".  Returns false if the status or the string
+ * could not be sent. */
+bool send_client_message(int file_descriptor, const char* message);
 /* Human-readable reason captured from the most recent STATUS_ERROR_DETAIL
  * received on this thread, or "" when the last status was a bare STATUS_ERROR
  * (or no detail was seen).  Thread-local, and valid until the next non-keepalive

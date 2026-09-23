@@ -17,6 +17,7 @@ Run locally::
     python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity
 """
 import os
+import re
 import shutil
 import sys
 import warnings
@@ -125,6 +126,66 @@ def seed_filter_protect(_src, rroot, froot):
         _mk(os.path.join(root, "other.txt"), b"dest-only other\n", _OLD_MTIME)
         _mk(os.path.join(root, "sub", "extra2.log"), b"nested dest-only log\n", _OLD_MTIME)
         _mk(os.path.join(root, "sub", "other2.txt"), b"nested dest-only other\n", _OLD_MTIME)
+
+
+def seed_perdir_protect(_src, rroot, froot):
+    """Per-directory `.rsync-filter` carrying `P` rules on the source and both
+    destinations, plus destination-only extras.  The `.log` extras must survive
+    --delete under every timing while the other extras go; the source's
+    `.rsync-filter` (which FastSync carries to the receiver) and the seeded
+    destination one (which rsync's receiver reads) are byte-identical."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, ".rsync-filter"), b"P extra.log\nP nested.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "extra.log"), b"dest-only protected\n", _OLD_MTIME)
+        _mk(os.path.join(root, "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "nested.log"), b"nested protected\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other2.txt"), b"nested deleted\n", _OLD_MTIME)
+
+
+def seed_perdir_exclude(_src, rroot, froot):
+    """Per-directory unqualified exclude (`-`): dual-sided, so it protects the
+    matching destination-only extra (and is opted back in by
+    --delete-excluded)."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, ".rsync-filter"), b"- extra.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "extra.log"), b"dest-only excluded\n", _OLD_MTIME)
+        _mk(os.path.join(root, "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+
+
+def seed_perdir_subdir_protect(_src, rroot, froot):
+    """A SUBDIRECTORY-owned `.rsync-filter` (its owner is not the transfer root):
+    the receiver must re-derive the `P` rules in the destination-relative
+    coordinate system, otherwise the destination-only nested extras are wrongly
+    deleted (silent data loss).  A root-level extra is included so a too-broad
+    rule would over-protect.  The file is seeded on both destinations because
+    rsync's receiver reads the per-directory file locally for delete-during."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, "sub", ".rsync-filter"), b"P nested.log\nP extra.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "sub", "nested.log"), b"dest-only protected\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "extra.log"), b"dest-only protected 2\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+        _mk(os.path.join(root, "root_extra.txt"), b"root dest-only deleted\n", _OLD_MTIME)
+
+
+def seed_perdir_subdir_exclude(_src, rroot, froot):
+    """A SUBDIRECTORY-owned unqualified exclude (`-`): dual-sided, so it protects
+    the matching destination-only nested extra under plain --delete and is opted
+    back in by --delete-excluded."""
+    for root in (_src, rroot, froot):
+        _mk(os.path.join(root, "sub", ".rsync-filter"), b"- nested.log\n")
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "sub", "nested.log"), b"dest-only excluded\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other.txt"), b"dest-only deleted\n", _OLD_MTIME)
+
+
+def _seed_rules(content):
+    def seed(_src, _rroot, _froot):
+        _mk(os.path.join(_src, ".rules"), content)
+
+    return seed
 
 
 def seed_max_delete(_src, rroot, froot):
@@ -271,6 +332,81 @@ _CASES = [
            ["-a", "--delete-after", "--filter=P *.log"],
            seed=seed_filter_protect, server_args=DELETE, ci=True,
            ref="--filter P/--protect under the whole-tree --delete-after commit"),
+    # Per-directory merge rules (#315): the receiver must re-derive the
+    # protect/risk verdict from the carried per-directory rules, so a
+    # destination-only entry matching ONLY a per-directory rule is shielded.
+    H.Case("filter_perdir_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under the default --delete timing"),
+    H.Case("filter_perdir_protect_during", "filters",
+           ["-a", "-F", "--delete-during"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under --delete-during"),
+    H.Case("filter_perdir_protect_delay", "filters",
+           ["-a", "-F", "--delete-delay"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under --delete-delay"),
+    H.Case("filter_perdir_protect_before", "filters",
+           ["-a", "-F", "--delete-before"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under the whole-tree --delete-before commit"),
+    H.Case("filter_perdir_protect_after", "filters",
+           ["-a", "-F", "--delete-after"],
+           seed=seed_perdir_protect, server_args=DELETE, ci=True,
+           ref="-F per-directory P rule under the whole-tree --delete-after commit"),
+    H.Case("filter_perdir_exclude_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_exclude, server_args=DELETE, ci=True,
+           ref="-F per-directory exclude protects its destination mirror"),
+    H.Case("filter_perdir_exclude_deleted", "filters",
+           ["-a", "-F", "--delete", "--delete-excluded"],
+           seed=seed_perdir_exclude, server_args=DELETE, ci=True,
+           ref="-F per-directory exclude under --delete-excluded is at risk"),
+    # #316: a rule owned by a SUBDIRECTORY (not the transfer root) must be
+    # re-expressed in the receiver's destination-relative coordinate system, or
+    # the dest-only extras it protects are silently deleted.
+    H.Case("filter_perdir_subdir_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under the default --delete timing"),
+    H.Case("filter_perdir_subdir_protect_during", "filters",
+           ["-a", "-F", "--delete-during"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under --delete-during"),
+    H.Case("filter_perdir_subdir_protect_delay", "filters",
+           ["-a", "-F", "--delete-delay"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under --delete-delay"),
+    H.Case("filter_perdir_subdir_protect_before", "filters",
+           ["-a", "-F", "--delete-before"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under the whole-tree --delete-before commit"),
+    H.Case("filter_perdir_subdir_protect_after", "filters",
+           ["-a", "-F", "--delete-after"],
+           seed=seed_perdir_subdir_protect, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned P rule under the whole-tree --delete-after commit"),
+    H.Case("filter_perdir_subdir_exclude_protect", "filters",
+           ["-a", "-F", "--delete"],
+           seed=seed_perdir_subdir_exclude, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned exclude protects its destination mirror"),
+    H.Case("filter_perdir_subdir_exclude_deleted", "filters",
+           ["-a", "-F", "--delete", "--delete-excluded"],
+           seed=seed_perdir_subdir_exclude, server_args=DELETE, ci=True,
+           ref="-F subdirectory-owned exclude under --delete-excluded is at risk"),
+    # Merge-file modifiers (#315): e/n/w/- semantics match rsync 3.4.1.
+    H.Case("dir_merge_e", "filters", ["-a", "--filter=:e .rules"],
+           seed=_seed_rules(b"- *.log\n"), ci=True,
+           ref="dir-merge,e excludes the merge file itself"),
+    H.Case("dir_merge_n", "filters", ["-a", "--filter=:n .rules"],
+           seed=_seed_rules(b"- *.log\n"), ci=True,
+           ref="dir-merge,n does not inherit into subdirectories"),
+    H.Case("dir_merge_dash", "filters", ["-a", "--filter=:- .rules"],
+           seed=_seed_rules(b"*.log\n*.bin\n"), ci=True,
+           ref="dir-merge,- reads the file as bare exclude patterns"),
+    H.Case("dir_merge_w", "filters", ["-a", "--filter=:-w .rules"],
+           seed=_seed_rules(b"*.log *.bin\n"), ci=True,
+           ref="dir-merge,w word-splits bare patterns on whitespace"),
 
     # --- relative / dirs --------------------------------------------------
     H.Case("relative_general", "basic", ["-a", "-R"], layout=H.MIRROR_ABS,
@@ -664,6 +800,157 @@ def test_added_and_deleted_between_runs(parity_server_factory):
         ["-a", "--delete", "-i", "--incremental"], server,
         stdout=H.STDOUT_ITEMIZE)
     _run_and_check(case_id, result)
+
+
+def _seed_dest_tree(src, root):
+    """Copy `src`'s tree into `root` (the transfer mirror), preserving symlinks
+    and directory mtimes, so a second differential run starts from an existing
+    destination exactly like a seeded rsync run."""
+    os.makedirs(root, exist_ok=True)
+    for dirpath, dirnames, filenames in os.walk(src):
+        rel = os.path.relpath(dirpath, src)
+        for name in dirnames:
+            s = os.path.join(dirpath, name)
+            d = os.path.join(root, rel, name) if rel != "." else os.path.join(root, name)
+            if os.path.islink(s):
+                continue
+            os.makedirs(d, exist_ok=True)
+        for name in filenames:
+            s = os.path.join(dirpath, name)
+            d = os.path.join(root, rel, name) if rel != "." else os.path.join(root, name)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            if os.path.islink(s):
+                if os.path.lexists(d):
+                    os.remove(d)
+                os.symlink(os.readlink(s), d)
+            else:
+                shutil.copy2(s, d)
+        if rel != ".":
+            os.utime(os.path.join(root, rel), None)
+    os.utime(root, None)
+
+
+# A full rsync itemize code (11 columns) followed by the name.  H._ITEMIZE_RE
+# only matches created (`+`) entries, so the changed-attribute codes this test
+# asserts need their own matcher.
+_ITEMIZE_LINE_RE = re.compile(r"^[<>ch.*][fdLDS].{9} ")
+
+
+def _itemize_dir_link_lines(text):
+    """The itemize lines for directory and symlink entries, excluding the
+    transfer-root `./` line (FastSync emits it unconditionally; a documented
+    residual)."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.rstrip()
+        if not line or not _ITEMIZE_LINE_RE.match(line):
+            continue
+        name = line.rsplit(" ", 1)[-1]
+        if name == "./":
+            continue
+        if name.endswith("/") or " -> " in line:
+            out.append(line)
+    return sorted(out)
+
+
+@requires_rsync
+@parity
+def test_itemize_rerun_dirs_symlinks_matches_rsync(parity_server_factory):
+    """#314: a re-run reports directory/symlink destination state like rsync.
+
+    On an unchanged tree FastSync emits no per-directory `cd+++++++++` (or
+    symlink) lines, and after a changed directory mtime / symlink target it
+    renders rsync's `.d..t......` / `cLc........` instead of `cd`/`cL`."""
+    case_id = "itemize_rerun_dirs_symlinks"
+    src = os.path.join(TEST_DATA_DIR, "parity_itemds_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_itemds_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_itemds_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "sub", "b.txt"), b"nested\n")
+    os.makedirs(os.path.join(src, "emptydir"), exist_ok=True)
+    os.symlink("a.txt", os.path.join(src, "link"))
+    _mk(os.path.join(src, "a.txt"), b"top\n")
+    clean_dir(rdst)
+    clean_dir(fdst)
+    server = parity_server_factory(SUPER)
+    rroot = rdst
+    froot = get_dest_received_dir(fdst, src)
+    _seed_dest_tree(src, rroot)
+    _seed_dest_tree(src, froot)
+
+    # Unchanged re-run: no directory or symlink itemize lines from either tool.
+    rs = H.run_rsync(src, rdst, ["-a", "-i"])
+    fs, _ = H.run_fastsync(src, fdst, ["-a", "-i", "--incremental"], server.port)
+    assert rs.returncode == 0, rs.stderr
+    assert fs.returncode == 0, fs.stderr
+    assert _itemize_dir_link_lines(rs.stdout) == []
+    fast_unchanged = _itemize_dir_link_lines(fs.stdout)
+    assert fast_unchanged == [], f"unchanged re-run itemized dirs/links: {fast_unchanged}"
+
+    # Change the directory mtime and the symlink target, then re-run.
+    _pin(os.path.join(src, "sub"), _OLD_MTIME)
+    os.remove(os.path.join(src, "link"))
+    os.symlink("b.txt", os.path.join(src, "link"))
+    rs = H.run_rsync(src, rdst, ["-a", "-i"])
+    fs, _ = H.run_fastsync(src, fdst, ["-a", "-i", "--incremental"], server.port)
+    assert rs.returncode == 0, rs.stderr
+    assert fs.returncode == 0, fs.stderr
+    expected = _itemize_dir_link_lines(rs.stdout)
+    actual = _itemize_dir_link_lines(fs.stdout)
+    assert actual == expected, f"rsync={rs.stdout!r} fastsync={fs.stdout!r}"
+    assert any(line.endswith(" sub/") and line.startswith(".d..t") for line in actual), actual
+    assert any(line.startswith("cLc") and " -> b.txt" in line for line in actual), actual
+
+
+def _deleted_breakdown_line(text):
+    for line in (text or "").splitlines():
+        if line.startswith("Number of deleted files:"):
+            return " ".join(line.split())
+    return ""
+
+
+@requires_rsync
+@parity
+def test_stats_deleted_breakdown_matches_rsync(parity_server_factory):
+    """#316: `--stats` renders rsync's per-type `Number of deleted files`
+    breakdown for removed regular files, directories, symlinks and a special."""
+    case_id = "stats_deleted_breakdown"
+    src = os.path.join(TEST_DATA_DIR, "parity_delbd_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_delbd_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_delbd_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "keep.txt"), b"keep\n")
+    server = parity_server_factory(DELETE)
+
+    def seed(_src, rroot, froot):
+        for root in (rroot, froot):
+            _mk(os.path.join(root, "extra1.txt"), b"e1\n", _OLD_MTIME)
+            _mk(os.path.join(root, "extradir", "inside.txt"), b"e2\n", _OLD_MTIME)
+            os.makedirs(os.path.join(root, "extradir"), exist_ok=True)
+            link = os.path.join(root, "extralink")
+            if not os.path.lexists(link):
+                os.symlink("keep.txt", link)
+            fifo = os.path.join(root, "extrafifo")
+            if not os.path.exists(fifo):
+                os.mkfifo(fifo)
+
+    def extra(_src, _rroot, _froot, rs, fs):
+        rs_line = _deleted_breakdown_line(rs.stdout)
+        fs_line = _deleted_breakdown_line(fs.stdout)
+        if not rs_line:
+            return ["rsync printed no deleted-files line"]
+        if rs_line != fs_line:
+            return [f"deleted breakdown rsync={rs_line!r} fastsync={fs_line!r}"]
+        if "reg:" not in rs_line or "dir:" not in rs_line or \
+                "link:" not in rs_line or "special:" not in rs_line:
+            return [f"breakdown missing a category: {rs_line!r}"]
+        return []
+
+    result = H.run_differential(
+        src, rdst, fdst, ["-a", "--delete", "--stats"],
+        ["-a", "--delete", "--stats", "--incremental"], server,
+        seed=seed, extra_check=extra)
+    _run_and_check(case_id, result, ref="--stats deleted per-type breakdown")
 
 
 @requires_rsync

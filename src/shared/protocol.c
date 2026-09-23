@@ -664,6 +664,10 @@ static const char* status_to_string(Status status) {
     return "DELETE_LIMIT";
   case STATUS_DEST_INFO:
     return "DEST_INFO";
+  case STATUS_CLIENT_MSG:
+    return "CLIENT_MSG";
+  case STATUS_PARTIAL:
+    return "PARTIAL";
   default:
     return "UNKNOWN";
   }
@@ -672,10 +676,10 @@ static const char* status_to_string(Status status) {
 /* Reject a raw wire status outside the known enum range before it is handed to
  * callers, so an unknown/corrupt frame fails as a protocol error instead of
  * being silently interpreted as an unexpected-but-valid verdict.  STATUS_OK is
- * the first enumerator and STATUS_STATS the last, so the range check accepts
+ * the first enumerator and STATUS_PARTIAL the last, so the range check accepts
  * every status the protocol defines. */
 static bool status_is_valid(Status status) {
-  return status >= STATUS_OK && status <= STATUS_STATS;
+  return status >= STATUS_OK && status <= STATUS_PARTIAL;
 }
 
 /* Shared string send/receive implementation.  `redact` selects whether the
@@ -1142,6 +1146,19 @@ bool send_error_detail(int fd, const char* message) {
     message = bounded;
   }
   return send_status(fd, STATUS_ERROR_DETAIL) && send_str(fd, message);
+}
+
+bool send_client_message(int fd, const char* message) {
+  if (!message)
+    message = "";
+  char bounded[MAX_CLIENT_MSG_BYTES + 1];
+  size_t len = strlen(message);
+  if (len > MAX_CLIENT_MSG_BYTES) {
+    memcpy(bounded, message, MAX_CLIENT_MSG_BYTES);
+    bounded[MAX_CLIENT_MSG_BYTES] = '\0';
+    message = bounded;
+  }
+  return send_status(fd, STATUS_CLIENT_MSG) && send_str(fd, message);
 }
 
 const char* protocol_last_error(void) {

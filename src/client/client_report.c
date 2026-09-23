@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <time.h>
 
 /* Surface a server rejection to the user.  When the last status exchange
@@ -161,6 +162,9 @@ void report_transfer_stats(const Config* config, const TransferStats* stats, tim
                  created_breakdown, sizeof(created_breakdown));
   unsigned long long created_total =
       recv->created_reg + recv->created_dir + recv->created_link + recv->created_special;
+  char deleted_breakdown[128];
+  type_breakdown(recv->deleted_reg, recv->deleted_dir, recv->deleted_link, recv->deleted_special,
+                 deleted_breakdown, sizeof(deleted_breakdown));
   printf("\n");
   if (breakdown[0] != '\0')
     printf("Number of files: %llu %s\n", flist_total, breakdown);
@@ -172,7 +176,13 @@ void report_transfer_stats(const Config* config, const TransferStats* stats, tim
     printf("Number of created files: %llu %s\n", created_total, created_breakdown);
   else
     printf("Number of created files: %llu\n", created_total);
-  printf("Number of deleted files: %llu\n", recv->deleted_files);
+  /* Protocol 2.30.0: the receiver reports the removed entries split by type, so
+     this line matches rsync's `Number of deleted files: X (reg: A, dir: B,
+     link: C, special: D)` (only the non-zero categories are listed). */
+  if (deleted_breakdown[0] != '\0')
+    printf("Number of deleted files: %llu %s\n", recv->deleted_files, deleted_breakdown);
+  else
+    printf("Number of deleted files: %llu\n", recv->deleted_files);
   printf("Number of regular files transferred: %llu\n", stats->transferred_regular);
   printf("Total file size: %s bytes\n", total);
   printf("Total transferred file size: %s bytes\n", transferred);
@@ -525,9 +535,16 @@ static void client_progress_emit_ancestors(const Config* config, const char* rel
           if (dir != NULL)
             change_emit_dir_sent(config, dir);
         } else {
-          char* escaped = output_escape(prefix, config->eight_bit_output);
-          printf("%s/\n", escaped ? escaped : prefix);
-          free(escaped);
+          /* --progress/-P names a directory only when it is newly created;
+             rsync stays silent for a pre-existing directory even when one of
+             its children changed (protocol 2.30.0 dest-state report). */
+          const File* dir = progress_dir_lookup(prefix);
+          bool existed = dir != NULL && dir->dest_state.known && dir->dest_state.existed;
+          if (!existed) {
+            char* escaped = output_escape(prefix, config->eight_bit_output);
+            printf("%s/\n", escaped ? escaped : prefix);
+            free(escaped);
+          }
         }
         g_progress_index++;
       } else {
@@ -550,6 +567,122 @@ void client_change_emit_ancestors(const Config* config, const File* file) {
     return;
   const char* rel = delete_display_path(config, file_wire_path(file));
   client_progress_emit_ancestors(config, rel);
+}
+
+/* Send one STATUS_MKDIR probe (probe=1) for a pre-count directory and cache the
+ * receiver's pre-transfer destination snapshot in `dir->dest_state`.  Returns
+ * false on a protocol/transport error. */
+static bool client_probe_dir_state(int fd, File* dir) {
+  if (dir == NULL || file_wire_path(dir) == NULL)
+    return true;
+  if (!send_status(fd, STATUS_MKDIR) || !send_int(fd, 1) || !send_wire_str(fd, file_wire_path(dir)))
+    return false;
+  Status status = STATUS_ERROR;
+  if (!receive_status(fd, &status) || status != STATUS_DEST_INFO ||
+      !format_dest_state_receive(fd, &dir->dest_state)) {
+    log_message(LOG_LEVEL_ERROR, "Directory destination-state probe failed");
+    return false;
+  }
+  return true;
+}
+
+/* Output parity (protocol 2.30.0): ask the receiver for each not-yet-probed
+ * ancestor directory's pre-transfer state BEFORE the entry that first triggers
+ * it is sent, so the ancestor's -i/--out-format line renders rsync's
+ * `.d..t......` (existing, attributes changed) versus `cd+++++++++` (created)
+ * and an unchanged directory is suppressed.  The probe is a STATUS_MKDIR frame
+ * with probe=1 (the receiver reports and creates nothing), so it must run before
+ * the receiver implicitly creates the parent for the child.  Each directory is
+ * probed at most once; the result is cached in the pre-count File's dest_state.
+ * Returns false on a protocol/transport error (the caller aborts the transfer). */
+bool client_change_probe_ancestors(const Config* config, const File* file, int fd) {
+  if (config == NULL || file == NULL || fd < 0 || !config->report_dest_info)
+    return true;
+  if (!g_progress_dir_index_valid || !g_progress_precount.dir_refs)
+    return true;
+  const char* rel = delete_display_path(config, file_wire_path(file));
+  if (rel == NULL)
+    return true;
+  size_t rel_len = strlen(rel);
+  for (size_t i = 1; i < rel_len; i++) {
+    if (rel[i] != '/')
+      continue;
+    char* prefix = malloc(i + 1);
+    if (prefix == NULL)
+      return false;
+    memcpy(prefix, rel, i);
+    prefix[i] = '\0';
+    if (path_index_contains(&g_progress_dir_index, prefix)) {
+      File* dir = progress_dir_lookup(prefix);
+      /* The probe path is the same wire path the real STATUS_MKDIR would carry
+         (the pre-count File's send_path, or its absolute source path for a
+         plain recursive scan), not the display-relative prefix. */
+      if (dir != NULL && !dir->dest_state.known && !client_probe_dir_state(fd, dir)) {
+        free(prefix);
+        return false;
+      }
+    }
+    free(prefix);
+  }
+  return true;
+}
+
+/* Mark a directory the data pass already itemized/named so the end-of-transfer
+ * pending-directory flush does not report it a second time.  `file` is a
+ * transferred directory entry (an empty-directory STATUS_MKDIR). */
+void client_change_mark_dir(const Config* config, const File* file) {
+  if (config == NULL || file == NULL || !g_progress_emitted_valid ||
+      g_progress_emitted_keys == NULL)
+    return;
+  const char* rel = delete_display_path(config, file_wire_path(file));
+  if (rel == NULL || rel[0] == '\0' || str_hash_set_lookup(&g_progress_emitted, rel))
+    return;
+  char* key = str_dup(rel);
+  if (key == NULL)
+    return;
+  if (!array_list_add(g_progress_emitted_keys, key)) {
+    free(key);
+    return;
+  }
+  str_hash_set_insert_ref(&g_progress_emitted, key);
+}
+
+/* Emit the itemize lines for source directories that CHANGED but had no
+ * transferred child, so no ancestor emission reached them (rsync reports a
+ * directory whose attributes changed even when its contents did not).  Runs at
+ * the end of the data pass, BEFORE the deferred STATUS_DIR_TIMES apply, so the
+ * probe still observes each untouched directory's pre-transfer state.  Only the
+ * itemize/out-format/log streams report attribute-only directory changes;
+ * --progress/-P stays silent for them, matching rsync.  Best-effort: a probe
+ * failure simply stops the flush (the transfer's verdict is unaffected). */
+void client_change_emit_pending_dirs(const Config* config, int fd) {
+  if (config == NULL || fd < 0 || !config->report_dest_info)
+    return;
+  bool itemize_output = config->itemize_changes || config->out_format != NULL ||
+                        (config->log_file != NULL && config->log_file_format != NULL);
+  if (!itemize_output)
+    return;
+  if (!g_progress_dir_index_valid || g_progress_precount.dir_refs == NULL ||
+      !g_progress_emitted_valid || g_progress_emitted_keys == NULL)
+    return;
+  for (int i = 0; i < g_progress_precount.dir_refs->size; i++) {
+    DirRef* ref = (DirRef*)g_progress_precount.dir_refs->items[i];
+    if (ref == NULL || ref->name == NULL || ref->name[0] == '\0')
+      continue;
+    if (str_hash_set_lookup(&g_progress_emitted, ref->name))
+      continue;
+    File* dir = ref->file;
+    if (dir == NULL)
+      continue;
+    if (!dir->dest_state.known && !client_probe_dir_state(fd, dir))
+      return;
+    change_emit_dir_sent(config, dir);
+    char* key = str_dup(ref->name);
+    if (key != NULL && array_list_add(g_progress_emitted_keys, key))
+      str_hash_set_insert_ref(&g_progress_emitted, key);
+    else
+      free(key);
+  }
 }
 
 /* rsync's --info=name/progress line for one entry: transfer-relative name (a
@@ -644,6 +777,15 @@ void client_progress_file(const Config* config, const File* file) {
 void client_progress_name(const Config* config, const File* file) {
   if (!g_progress_active || file == NULL)
     return;
+  /* rsync's --progress/-P name stream reports an entry only when it is created
+     or (for a symlink) actually relinked: a pre-existing directory or an
+     unchanged symlink is silent (protocol 2.30.0 dest-state report). */
+  if (file->dest_state.known && file->dest_state.existed) {
+    if (file->is_dir || (file->is_symlink && file->dest_state.target_matches)) {
+      g_progress_index++;
+      return;
+    }
+  }
   const char* rel = delete_display_path(config, file_wire_path(file));
   if (!config->itemize_changes && config->out_format == NULL) {
     char* line = progress_entry_line(file, rel ? rel : "");
@@ -1050,4 +1192,130 @@ const char* delete_display_path(const Config* config, const char* path) {
   if (!config || !path || !config->send_directory)
     return path;
   return utils_strip_transfer_root(path, config->send_directory);
+}
+
+/* ---- --stderr=client diagnostic channel (protocol 2.30.0) ----
+ *
+ * When the client's --stderr mode is `client`, log_message() hands each of the
+ * client's own diagnostics to the sink installed here instead of writing them
+ * locally.  The sink QUEUES the text (it may be called from scanner worker
+ * threads while the sender is streaming) and the sender thread -- the sole
+ * writer of the protocol stream -- drains the queue over the wire at frame
+ * boundaries via client_flush_client_messages().  A bounded queue caps the
+ * memory a chatty run can pin; overflow falls back to local output so a
+ * diagnostic is never silently dropped. */
+#define CLIENT_MSG_MAX_QUEUED 256
+#define CLIENT_MSG_MAX_BYTES (256 * 1024)
+
+static mtx_t client_msg_mutex;
+static once_flag client_msg_mutex_once = ONCE_FLAG_INIT;
+static ArrayList* client_msg_queue = NULL; /* owns char* */
+static size_t client_msg_bytes = 0;
+/* True only while a live transfer session exists: before the connection is up
+   (or after it drops) the sink declines so log_message falls back to local
+   output, matching rsync's documented fallback.  Written by the sender thread
+   (client_messages_activate) and read by scanner worker threads in
+   client_msg_enqueue, so it must be atomic: the queue itself stays guarded by
+   client_msg_mutex, but the flag is polled before taking that lock. */
+static _Atomic bool client_msg_active = false;
+
+static void client_msg_mutex_init(void) {
+  mtx_init(&client_msg_mutex, mtx_plain);
+}
+
+static bool client_msg_enqueue(const char* message);
+
+/* Install the global log sink for the duration of one transfer.  Safe to call
+ * more than once; the queue is created lazily. */
+void client_messages_install(void) {
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  if (!client_msg_queue)
+    client_msg_queue = array_list_create(free);
+  bool ready = client_msg_queue != NULL;
+  mtx_unlock(&client_msg_mutex);
+  /* Only arm the sink once the queue exists; on allocation failure leave the
+     sink uninstalled so log_message keeps writing locally instead of handing
+     messages to a sink that would silently drop them. */
+  if (ready)
+    log_set_client_msg_sink(client_msg_enqueue);
+}
+
+void client_messages_activate(bool active) {
+  atomic_store(&client_msg_active, active);
+}
+
+/* log_message sink: takes ownership (queues) the message when a session is
+ * live; returns false otherwise so the caller writes it locally. */
+static bool client_msg_enqueue(const char* message) {
+  bool active = atomic_load(&client_msg_active);
+  if (!message || message[0] == '\0')
+    return active;
+  if (!active)
+    return false;
+  size_t len = strlen(message);
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  bool queued = false;
+  if (client_msg_queue && (size_t)client_msg_queue->size < CLIENT_MSG_MAX_QUEUED &&
+      client_msg_bytes + len <= CLIENT_MSG_MAX_BYTES) {
+    char* copy = str_dup(message);
+    if (copy) {
+      if (array_list_add(client_msg_queue, copy)) {
+        client_msg_bytes += len;
+        queued = true;
+      } else {
+        free(copy);
+      }
+    }
+  }
+  mtx_unlock(&client_msg_mutex);
+  return queued;
+}
+
+/* Drain the queued diagnostics as STATUS_CLIENT_MSG frames on the sender
+ * thread.  Swaps the queue out under the mutex so a concurrent worker logging
+ * never blocks on the wire.  Must be called at a protocol frame boundary. */
+void client_flush_client_messages(int fd) {
+  if (fd < 0)
+    return;
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  ArrayList* pending = client_msg_queue;
+  if (pending) {
+    ArrayList* fresh = array_list_create(free);
+    if (fresh) {
+      client_msg_queue = fresh;
+    } else {
+      /* No memory for a replacement queue: stop queuing new diagnostics (they
+         fall back to local output) and drain this batch below so nothing is
+         silently dropped. */
+      client_msg_queue = NULL;
+      log_set_client_msg_sink(NULL);
+    }
+    client_msg_bytes = 0;
+  }
+  mtx_unlock(&client_msg_mutex);
+  if (!pending)
+    return;
+  for (int i = 0; i < pending->size; i++) {
+    const char* message = pending->items[i];
+    if (message && message[0] != '\0' && !send_client_message(fd, message))
+      break; /* peer is gone; the rest would fail too */
+  }
+  array_list_delete(pending);
+}
+
+/* Tear down the sink after a transfer and free anything still queued. */
+void client_messages_end(void) {
+  log_set_client_msg_sink(NULL);
+  atomic_store(&client_msg_active, false);
+  call_once(&client_msg_mutex_once, client_msg_mutex_init);
+  mtx_lock(&client_msg_mutex);
+  ArrayList* pending = client_msg_queue;
+  client_msg_queue = NULL;
+  client_msg_bytes = 0;
+  mtx_unlock(&client_msg_mutex);
+  if (pending)
+    array_list_delete(pending);
 }

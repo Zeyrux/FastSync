@@ -2924,7 +2924,7 @@ static void golden_config_populate(Config* c) {
   array_list_add(c->filters, str_dup("- /sub/dir/"));
 }
 
-/* The pinned golden frame (protocol 2.29.0).  The values below are the only
+/* The pinned golden frame (protocol 2.30.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
  * delete-plan wave changed only the version string; 2.25.0 appended the
@@ -2936,10 +2936,13 @@ static void golden_config_populate(Config* c) {
  * (project decision), so the frame grew by one int to 886 bytes.  The 2.29.0
  * symlink-xattr wave changes only the version string: the config-frame layout
  * is unchanged (use_xattrs already crosses the wire); the STATUS_SYMLINK frame
- * body grows instead.  The byte-exact values are recomputed for the merged
- * layout. */
+ * body grows instead.  The 2.30.0 client-message/partial wave changes only the
+ * version string: the config-frame layout is unchanged (the new
+ * STATUS_CLIENT_MSG and STATUS_PARTIAL statuses are not part of this frame), so
+ * the length stays 886 and only the hash moves.  The byte-exact values are
+ * recomputed for the merged layout. */
 #define GOLDEN_WIRE_LEN 886
-#define GOLDEN_WIRE_HASH 17827864270611927842ULL
+#define GOLDEN_WIRE_HASH 4169866417069573876ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -3021,7 +3024,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.29.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.30.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())

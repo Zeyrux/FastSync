@@ -19,6 +19,7 @@
 #include "data.h"
 #include "delay_updates.h"
 #include "delete_commit.h"
+#include "delete_plan.h"
 #include "delta.h"
 #include "file.h"
 #include "format.h"
@@ -102,6 +103,13 @@ DeleteManifest* receive_manifest_entries(int fd) {
     delete_manifest_free(manifest);
     return NULL;
   }
+  /* Per-directory filter rules (protocol 2.30.0) follow the manifest sections
+   * with their own bounded self-describing format. */
+  if (!delete_filter_dir_rules_receive(fd, &manifest->per_dir_rules)) {
+    delete_manifest_free(manifest);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
   return manifest;
 }
 
@@ -112,6 +120,7 @@ void delete_manifest_free(DeleteManifest* manifest) {
   array_list_delete(manifest->protected);
   array_list_delete(manifest->missing);
   array_list_delete(manifest->dirs);
+  filter_rule_list_free(manifest->per_dir_rules);
   free(manifest);
 }
 
@@ -160,9 +169,11 @@ static bool delete_extras_budgeted_observed(const Config* config, const DeleteMa
     remaining = budget->max_delete - budget->deleted;
   size_t deleted = 0;
   size_t skipped = 0;
+  DeleteProtectRules protect = {.base_rules = config->protect_rules,
+                                .dir_rules = manifest->per_dir_rules};
   DeleteWalkResult result = delete_extras_limited_observed(
       config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips.entries,
-      skips.count, config->protect_rules, &deleted, &skipped, observer, observer_context);
+      skips.count, &protect, &deleted, &skipped, observer, observer_context);
   delete_skips_free(&skips);
   budget->deleted += deleted;
   budget->skipped += skipped;
@@ -191,13 +202,13 @@ typedef struct {
   const char* prefix;
 } PrefixedDeleteObserver;
 
-static void prefixed_delete_observer(void* context, const char* rel) {
+static void prefixed_delete_observer(void* context, const char* rel, DeleteEntryType type) {
   PrefixedDeleteObserver* prefixed = context;
   if (!prefixed->inner || !rel)
     return;
   char* joined = path_cat((char*)prefixed->prefix, rel);
   if (joined) {
-    prefixed->inner(prefixed->inner_context, joined);
+    prefixed->inner(prefixed->inner_context, joined, type);
     free(joined);
   }
 }
@@ -359,7 +370,7 @@ static bool delete_missing_args_budgeted_observed(const Config* config,
     if (removed) {
       budget->deleted++;
       if (observer)
-        observer(observer_context, rel);
+        observer(observer_context, rel, delete_entry_type_of_mode(st.st_mode));
       char* escaped = output_escape(rel, log_get_8_bit_output());
       fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);
@@ -386,8 +397,10 @@ bool manifest_would_delete_list(const Config* config, const DeleteManifest* mani
   DeleteSkipSet skips;
   if (!delete_skips_build(config, manifest->protected, NULL, true, &skips))
     return false;
+  DeleteProtectRules protect = {.base_rules = config->protect_rules,
+                                .dir_rules = manifest->per_dir_rules};
   bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                               skips.entries, skips.count, config->protect_rules, out, count_out);
+                               skips.entries, skips.count, &protect, out, count_out);
   delete_skips_free(&skips);
   return ok;
 }

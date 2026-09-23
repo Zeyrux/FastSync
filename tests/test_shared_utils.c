@@ -349,8 +349,9 @@ static void test_walker_protect_rules_shield_dest_only() {
   FilterRuleList* rules = filter_base_build(rule_text, 3, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(rules);
   size_t deleted = 0;
+  DeleteProtectRules protect = {.base_rules = rules, .dir_rules = NULL};
   DeleteWalkResult result =
-      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, rules, &deleted, NULL);
+      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, &protect, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_TRUE(file_exists(root, "keep.txt"));
   EXPECT_FALSE(file_exists(root, "extra.log")); /* risk wins the first match */

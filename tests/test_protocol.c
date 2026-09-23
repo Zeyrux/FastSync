@@ -228,7 +228,7 @@ static void test_send_receive_status() {
 
 /* An unknown wire status outside the enum range must be rejected as a protocol
  * error instead of being handed to the caller as an unexpected verdict.  The
- * last known enumerator (STATUS_STATS) must still be accepted, proving the
+ * last known enumerator (STATUS_PARTIAL) must still be accepted, proving the
  * validation does not reject legitimate statuses. */
 static void test_receive_status_rejects_unknown() {
   int p[2];
@@ -236,7 +236,7 @@ static void test_receive_status_rejects_unknown() {
   ProtocolSession session;
   protocol_session_init(&session, p[0], p[1]);
 
-  Status bogus = (Status)(STATUS_STATS + 1);
+  Status bogus = (Status)(STATUS_PARTIAL + 1);
   EXPECT_EQ_INT((int)write(p[1], &bogus, sizeof(bogus)), (int)sizeof(bogus));
   Status received = STATUS_OK;
   EXPECT_FALSE(protocol_receive_status(&session, &received));
@@ -245,14 +245,51 @@ static void test_receive_status_rejects_unknown() {
   EXPECT_EQ_INT((int)write(p[1], &negative, sizeof(negative)), (int)sizeof(negative));
   EXPECT_FALSE(protocol_receive_status(&session, &received));
 
-  Status top = STATUS_STATS;
+  Status top = STATUS_PARTIAL;
   EXPECT_EQ_INT((int)write(p[1], &top, sizeof(top)), (int)sizeof(top));
   EXPECT_TRUE(protocol_receive_status(&session, &received));
-  EXPECT_EQ_INT((int)received, (int)STATUS_STATS);
+  EXPECT_EQ_INT((int)received, (int)STATUS_PARTIAL);
 
-  Status timed_bogus = (Status)(STATUS_STATS + 7);
+  Status timed_bogus = (Status)(STATUS_PARTIAL + 7);
   EXPECT_EQ_INT((int)write(p[1], &timed_bogus, sizeof(timed_bogus)), (int)sizeof(timed_bogus));
   EXPECT_FALSE(protocol_receive_status_timed(&session, &received, 5));
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* STATUS_CLIENT_MSG carries a bounded, length-prefixed diagnostic string
+ * (protocol 2.30.0, --stderr=client).  An over-long message must be sliced to
+ * MAX_CLIENT_MSG_BYTES rather than sent whole. */
+static void test_send_client_message_bounded() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  const char message[] = "client diagnostic line";
+  EXPECT_TRUE(send_client_message(0, message));
+  Status received = STATUS_OK;
+  EXPECT_TRUE(receive_status(0, &received));
+  EXPECT_EQ_INT((int)received, (int)STATUS_CLIENT_MSG);
+  char* body = receive_str(0);
+  EXPECT_NOT_NULL(body);
+  EXPECT_EQ_STR(body, message);
+  free(body);
+
+  size_t big_len = MAX_CLIENT_MSG_BYTES + 100;
+  char* big = malloc(big_len + 1);
+  EXPECT_NOT_NULL(big);
+  memset(big, 'x', big_len);
+  big[big_len] = '\0';
+  EXPECT_TRUE(send_client_message(0, big));
+  EXPECT_TRUE(receive_status(0, &received));
+  EXPECT_EQ_INT((int)received, (int)STATUS_CLIENT_MSG);
+  char* big_body = receive_str(0);
+  EXPECT_NOT_NULL(big_body);
+  EXPECT_EQ_INT((int)strlen(big_body), (int)MAX_CLIENT_MSG_BYTES);
+  free(big_body);
+  free(big);
 
   close(p[0]);
   close(p[1]);
@@ -1250,6 +1287,7 @@ void test_protocol() {
   test_send_receive_int();
   test_send_receive_status();
   test_receive_status_rejects_unknown();
+  test_send_client_message_bounded();
   test_protocol_session_io_timeout();
   test_protocol_server_io_timeout_floor();
   test_send_receive_status_timed();

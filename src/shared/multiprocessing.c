@@ -34,6 +34,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->synced_dirs = NULL;
   context->plan_dirs = NULL;
   context->missing_args = NULL;
+  context->per_dir_rules = NULL;
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
   context->early_delete = false;
@@ -53,6 +54,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->dir_entries_mutex_init = false;
   atomic_init(&context->dir_count, 0);
   context->delete_limit = false;
+  context->partial = false;
   int init = 0;
   if (config->use_metadata) {
     context->dir_entries = array_list_create(file_destroy);
@@ -209,6 +211,8 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
     array_list_delete(context->plan_dirs);
   if (context->missing_args)
     array_list_delete(context->missing_args);
+  if (context->per_dir_rules)
+    filter_rule_list_free(context->per_dir_rules);
   if (context->remove_source_files)
     array_list_delete(context->remove_source_files);
   if (context->dir_entries)

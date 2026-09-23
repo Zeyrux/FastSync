@@ -83,7 +83,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.29.0).
+ * Config wire-field table (single source of truth for protocol 2.30.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -1084,7 +1084,20 @@ typedef struct Config {
  * version must bump; the strict same-version handshake (config_receive rejects a
  * mismatched version before parsing anything else) keeps a 2.29 client and a
  * 2.28 server from ever reaching that state. */
-#define PROTOCOL_VERSION "2.29.0"
+/* (11) Client-message channel + partial exit (protocol 2.30.0): the
+ * config-frame LAYOUT is unchanged (no new config field), but the frame stream
+ * gains two statuses.  STATUS_CLIENT_MSG (client->server) carries a bounded,
+ * length-prefixed diagnostic string so a client running with --stderr=client
+ * (rsync's --no-msgs2stderr spelling) can forward its own diagnostics to the
+ * server's stderr.  STATUS_PARTIAL (receiver->client) is the terminal status
+ * sent instead of STATUS_OK when a per-entry receiver failure (e.g. an
+ * unprivileged --devices mknod) did not abort the stream; the sender exits 23
+ * (rsync's partial transfer) and still removes successfully transferred
+ * --remove-source-files sources.  A 2.29 peer that does not know these status
+ * values would reject them as an unknown status and tear the connection down,
+ * so the protocol version must bump; the strict same-version handshake keeps a
+ * 2.30 client and a 2.29 server from ever reaching that state. */
+#define PROTOCOL_VERSION "2.30.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

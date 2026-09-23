@@ -708,6 +708,7 @@ static void test_late_manifest_abort_frees_keepset() {
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* per-directory filter-rule block is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_ABORT));
 
   DeleteManifest* pending = NULL;
@@ -733,6 +734,7 @@ static void test_late_manifest_eof_frees_keepset() {
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* per-directory filter-rule block is empty */
   shutdown(p[1], SHUT_WR);
 
   DeleteManifest* pending = NULL;
@@ -758,12 +760,14 @@ static void test_late_second_manifest_frees_both() {
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* per-directory filter-rule block is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "second.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* per-directory filter-rule block is empty */
 
   DeleteManifest* pending = NULL;
   EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
@@ -799,6 +803,7 @@ static void test_receive_manifest_three_sections() {
   EXPECT_TRUE(send_int(p[1], 2));
   EXPECT_TRUE(send_str(p[1], "."));
   EXPECT_TRUE(send_str(p[1], "dir"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* per-directory filter-rule block is empty */
 
   DeleteManifest* manifest = receive_manifest_entries(p[0]);
   EXPECT_NOT_NULL(manifest);
@@ -917,6 +922,7 @@ static void test_receiver_pending_commits_missing_args() {
   EXPECT_TRUE(send_str(p[1], "gone.txt"));
   EXPECT_TRUE(send_str(p[1], "never_here.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* no synchronized directories */
+  EXPECT_TRUE(send_int(p[1], 0)); /* per-directory filter-rule block is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
 
   /* NULL pending: the single-threaded commit path deletes at FINISHED.  The
@@ -1309,6 +1315,7 @@ static void test_dry_run_delete_plan_commit_does_not_delete() {
   EXPECT_TRUE(send_int(p[1], 0)); /* size-skipped prefixes */
   EXPECT_TRUE(send_int(p[1], 1)); /* missing-args exact deletions */
   EXPECT_TRUE(send_str(p[1], "victim.txt"));
+  EXPECT_TRUE(send_int(p[1], 0));   /* per-directory filter-rule block is empty */
   EXPECT_TRUE(send_int(p[1], 1));   /* apply: a real plan */
   EXPECT_TRUE(send_str(p[1], ".")); /* receive root plan */
   EXPECT_TRUE(send_int(p[1], 0));   /* kept child directories */

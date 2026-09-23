@@ -55,10 +55,20 @@ typedef struct {
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code);
 void receiver_outcomes_destroy(ReceiverOutcomes* outcomes);
 
-/* DeletePathObserver implementation for --info=del: `context` is an ArrayList*
-   that receives owned copies of every truly-removed destination-relative path.
-   Shared by the single-threaded receiver and the -m pipeline's deferred commit. */
-void receiver_record_deleted_path(void* context, const char* rel_path);
+/* Delete observer context: `deleted_paths` (optional) receives owned copies of
+   every truly-removed destination-relative path for --info=del; `stats`
+   (optional) receives the per-type `Number of deleted files` tallies for
+   --stats.  Both may be NULL, in which case the observer is a no-op. */
+typedef struct {
+  ReceiverStats* stats;
+  struct ArrayList* deleted_paths;
+} ReceiverDeleteContext;
+
+/* DeletePathObserver implementation: records each truly-removed path (when the
+   context carries a path list) and tallies it by type (when it carries a stats
+   record).  Shared by the single-threaded receiver and the -m pipeline's
+   deferred commit. */
+void receiver_record_deleted_path(void* context, const char* rel_path, DeleteEntryType type);
 
 /* Send the terminal success frame.  `final_status` is usually STATUS_OK, or
    STATUS_DELETE_LIMIT when a --max-delete commit was capped. */
@@ -83,6 +93,17 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    for either to keep the default behaviour (delete before the success frame). */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
                              DeleteManifest** pending_manifest, DeletePlanSession** pending_plans);
+/* receiver_process_pending() with an explicit observer context for a
+   per-directory delete session that is handed to the caller via
+   `pending_plans`.  The session outlives this call (the -m pipeline commits it
+   after joining its disk writer), so its observer context must too: pass a
+   long-lived object such as PipelineContextReceiver.delete_ctx.  When
+   `delete_ctx` is NULL an internal stack context is used, which is only safe
+   when the session is committed before returning (the default behaviour). */
+int receiver_process_pending_ctx(Config* config, int file_descriptor, const ReceiverSink* sink,
+                                 DeleteManifest** pending_manifest,
+                                 DeletePlanSession** pending_plans,
+                                 ReceiverDeleteContext* delete_ctx);
 int receiver_receive_files(Config* config, int file_descriptor);
 
 /* ---- Connection time bounds (anti-slowloris) ----

@@ -25,6 +25,19 @@
  * --delete-missing-args exact deletions, the shared --max-delete budget and,
  * for --delete-delay, the snapshotted extras. */
 
+/* Per-directory filter-rule block (protocol 2.30.0).  The sender compiles the
+ * source's per-directory merge rules as it scans and streams them so the
+ * receiver can re-derive the receiver-side protect/risk verdicts for
+ * destination-only entries.  The wire format is a group count, then for each
+ * directory group its relative owner path followed by that directory's rule
+ * records (action, sides, anchored, dir-only, negate, no-inherit, pattern).
+ * All bounds (MAX_FILTER_RULES, MAX_FILTER_BYTES, MAX_PROTECT_PATTERN_LEN) are
+ * enforced on both sides; a malformed receive frame signals STATUS_ERROR and
+ * returns false.  Receive yields a flat FilterRuleList whose rules carry their
+ * owner, or NULL when no rules were sent. */
+bool delete_filter_dir_rules_send(int fd, const FilterRuleList* rules);
+bool delete_filter_dir_rules_receive(int fd, FilterRuleList** out);
+
 /* ---- Sender: plan builder ---- */
 
 typedef struct DeletePlanSender DeletePlanSender;
@@ -53,7 +66,8 @@ bool delete_plan_sender_empty(const DeletePlanSender* sender);
  * block is always transmitted by delete_plan_send_root(), on a config-only
  * carrier frame when the scope allows no directory plan. */
 void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* protected_prefixes,
-                                   const ArrayList* size_skipped, const ArrayList* missing_args);
+                                   const ArrayList* size_skipped, const ArrayList* missing_args,
+                                   const FilterRuleList* per_dir_rules);
 /* Send the root plan (even before any data, so root extras are handled like
  * rsync's first generator directory), after transmitting the per-run config
  * block on its own carrier frame.  Returns -1 on I/O error. */
