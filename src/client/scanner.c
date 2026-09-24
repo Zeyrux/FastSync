@@ -149,7 +149,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->options = *options;
   if (scanner->options.chunk_size == 0)
     scanner->options.chunk_size = DESIRED_CHUNK_SIZE;
-  scanner->directories = queue_create(100, dir_entry_destroy);
+  scanner->directories = queue_create(SCANNER_RESULT_QUEUE_CAP, dir_entry_destroy);
   if (!scanner->directories) {
     free(scanner);
     return NULL;
@@ -1101,61 +1101,23 @@ static ScannerAction scanner_process_entry(DirectoryScanner* scanner, ArrayList*
     free(rel_copy);
     return SCANNER_ACTION_CONTINUE;
   }
-  File* file = file_create(cur_path);
-  if (file == NULL) {
-    free(rel_copy);
-    free(inspected->link_target);
-    inspected->link_target = NULL;
+  /* Entry construction (data size, -R wire path, special/devices, hardlink
+     group, metadata, xattrs) is shared with the parallel scanner. */
+  File* file = NULL;
+  bool build_failed = false;
+  ScannerBuildStatus status =
+      scanner_build_file_entry(&scanner->options, inspected, rel_copy, &file, &build_failed);
+  free(rel_copy);
+  rel_copy = NULL;
+  if (build_failed)
     scanner->failed = true;
+  if (status == SCANNER_BUILD_SKIP)
     return SCANNER_ACTION_CONTINUE;
-  }
-  if (inspected->is_symlink) {
-    file->is_symlink = true;
-    file->symlink_target = inspected->link_target;
-    inspected->link_target = NULL;
-  } else {
-    file->data->size = stats.st_size;
-  }
-  if (scanner->relative_mode) {
-    file->send_path = rel_copy;
-    rel_copy = NULL;
-  } else if (scanner->options.relative_prefix) {
-    file->send_path = scanner_prefix_send_path(scanner->options.relative_prefix, rel_copy);
-    free(rel_copy);
-    rel_copy = NULL;
-    if (!file->send_path) {
-      file_destroy(file);
-      scanner->failed = true;
-      return SCANNER_ACTION_BREAK;
-    }
-  }
-  /* --devices/--specials: a device/FIFO/socket entry marked for preservation
-     becomes a node to recreate (is_special, no data, rdev captured); an
-     unrequested non-regular entry is skipped (rsync default). */
-  ScannerSpecial special =
-      scanner_prepare_special(scanner->options.preserve_devices, scanner->options.preserve_specials,
-                              scanner->options.copy_devices, file, &stats);
-  if (special == SCANNER_SPECIAL_SKIP) {
-    scanner_note_nonreg(&scanner->options, file->path);
-    free(rel_copy);
-    file_destroy(file);
-    return SCANNER_ACTION_CONTINUE;
-  }
-  if (scanner->options.hardlinks && S_ISREG(stats.st_mode))
-    scanner_assign_hardlink(scanner, scanner->options.hardlinks, file, &stats);
-  if (scanner->options.use_metadata)
-    file->metadata = file_metadata_create(file->path, &stats, scanner->options.preserve_atimes,
-                                          scanner->options.preserve_crtimes);
-  if (scanner->options.use_metadata && !file->metadata) {
-    free(rel_copy);
-    file_destroy(file);
+  if (status != SCANNER_BUILD_OK) {
     scanner->failed = true;
-    return SCANNER_ACTION_BREAK;
+    return status == SCANNER_BUILD_FAIL_CONTINUE ? SCANNER_ACTION_CONTINUE : SCANNER_ACTION_BREAK;
   }
-  if (!(file->link_group != 0 && !file->link_first))
-    scanner_capture_xattrs(scanner, file);
   if (!array_list_add(chunk_data, file)) {
-    free(rel_copy);
     file_destroy(file);
     scanner->failed = true;
     return SCANNER_ACTION_BREAK;
@@ -1163,14 +1125,12 @@ static ScannerAction scanner_process_entry(DirectoryScanner* scanner, ArrayList*
   scanner->current_dir_produced = true;
   *chunk_data_size += file->data->size;
   if (*chunk_data_size > scanner->options.chunk_size) {
-    free(rel_copy);
     Chunk* result = chunk_data_to_chunk(chunk_data);
     if (!result)
       scanner->failed = true;
     *out_chunk = result;
     return SCANNER_ACTION_CHUNK;
   }
-  free(rel_copy);
   return SCANNER_ACTION_CONTINUE;
 }
 

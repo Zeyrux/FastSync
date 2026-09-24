@@ -134,7 +134,7 @@ Server* server_create_ex(int port, const ServerBindOptions* bind_opts) {
 
   server->file_descriptor = file_descriptor;
   server->ssl_ctx = NULL;
-  server->max_connections = 100;
+  server->max_connections = SERVER_DEFAULT_MAX_CONNECTIONS;
   server->active_connections = 0;
   server->limit_registry = NULL;
 
