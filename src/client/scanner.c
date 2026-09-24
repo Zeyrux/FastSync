@@ -1026,7 +1026,7 @@ static ScannerAction scanner_process_entry(DirectoryScanner* scanner, ArrayList*
                                            Chunk** out_chunk) {
   const char* name = sorted->name;
   ScannerEntry* inspected = &sorted->entry;
-  char* cur_path = inspected->path;
+  const char* cur_path = inspected->path;
   struct stat stats = inspected->stats;
 
   /* --files-from allow-set and the filter layer apply to files and to
