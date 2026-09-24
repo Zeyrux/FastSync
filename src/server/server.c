@@ -1306,6 +1306,284 @@ static bool daemonize(void) {
   return true;
 }
 
+/* Apply the process-wide policies shared by the stdio and listener
+ * entrypoints: logging verbosity, signal handling, the parsed server
+ * authorization policies, and the socket timeout floor.  Runs after CLI
+ * parsing and after the standalone --hash-credentials tool has been ruled
+ * out. */
+static void configure_server_process(const ServerCliOptions* opts) {
+  signal(SIGPIPE, SIG_IGN);
+  if (opts->verbose) {
+    set_log_level(LOG_LEVEL_DEBUG);
+    set_log_debug_flags(LOG_DEBUG_ALL);
+  }
+  if (opts->tls_ca && !opts->use_tls)
+    log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
+  /* Persist the parsed server policies into the process-global policy state
+   * BEFORE the stdio branch: an SSH-launched `--stdio` server (whose argv came
+   * from the client via --remote-option and friends) must honor --allow-delete,
+   * --trust-sender and --client-cn exactly like the standalone listener. */
+  required_client_cn = opts->client_cn;
+  allow_delete = opts->allow_delete;
+  trust_sender = opts->trust_sender;
+  allow_unauthenticated = opts->allow_unauthenticated;
+  server_no_super = opts->no_super;
+  /* --stdio rejects --allow-super at parse time; force it off here as well so
+   * this process-global policy cannot be re-enabled by a future caller. */
+  server_allow_super = opts->allow_super && !opts->stdio_mode;
+  server_iconv_spec = opts->iconv_spec;
+  install_cleanup_handler(SIGINT);
+  install_cleanup_handler(SIGTERM);
+  /* Server-owned socket deadline floor: the client default --timeout=0 would
+   * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
+   * silent peer hold a connection (and its process slot) forever. */
+  tcp_set_timeouts(SERVER_IO_TIMEOUT_SEC, SERVER_IO_TIMEOUT_SEC);
+}
+
+/* --hash-credentials: standalone offline tool; read user:password lines and
+ * emit new-format credential-store lines, then exit.  Consumes and frees
+ * opts. */
+static int run_hash_credentials_tool(ServerCliOptions* opts) {
+  uint32_t iters = opts->hash_iterations_set ? opts->hash_iterations : CREDENTIAL_DEFAULT_ITERS;
+  /* The output is secret material: if it is redirected to a regular file,
+   * warn when that file is group/other-accessible (the store must be 0600). */
+  struct stat out_st;
+  if (fstat(STDOUT_FILENO, &out_st) == 0 && S_ISREG(out_st.st_mode) &&
+      (out_st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+    fprintf(stderr,
+            "Warning: credential-store output is a group/other-accessible file; restrict it to "
+            "mode 0600 (chmod 600)\n");
+  char hash_err[512];
+  if (credentials_hash_file(opts->hash_credentials_file, iters, stdout, hash_err,
+                            sizeof(hash_err)) != 0) {
+    fprintf(stderr, "Error: %s\n", hash_err);
+    server_cli_options_free(opts);
+    return 1;
+  }
+  server_cli_options_free(opts);
+  return 0;
+}
+
+/* SSH --stdio session: the transport is authenticated by sshd outside of
+ * FastSync, so the single connection is served over STDIN/STDOUT and the
+ * process exits.  The destination root is authorized exactly like the listener
+ * path.  Consumes and frees opts. */
+static int run_stdio_server(ServerCliOptions* opts) {
+  /* SSH authenticates the stdio transport outside of FastSync. */
+  allow_unauthenticated = true;
+  if (!configure_authorization(opts->destination_root)) {
+    char* escaped = output_escape(opts->destination_root, false);
+    fprintf(stderr, "Error: invalid destination root '%s'\n",
+            escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    server_cli_options_free(opts);
+    return 1;
+  }
+  io_set_fds(STDIN_FILENO, STDOUT_FILENO);
+  /* handler() does not own the stdio fds: it never closes its descriptor
+   * argument, so STDIN/STDOUT stay open for this (single-shot) SSH session
+   * and are released by process exit. */
+  handler(STDIN_FILENO);
+  release_authorization();
+  server_cli_options_free(opts);
+  return 0;
+}
+
+/* Load the daemon config, apply --dparam overrides, resolve the effective
+ * port/address, and surface the operator-facing module warnings.  On failure
+ * the error is printed and false is returned. */
+static bool load_daemon_policy(ServerCliOptions* opts, int* port, const char** bind_address,
+                               char* err, size_t err_size) {
+  const char* config_path = opts->config_path ? opts->config_path : default_daemon_config_path();
+  g_daemon_conf = daemon_conf_load(config_path, err, err_size);
+  if (!g_daemon_conf) {
+    fprintf(stderr, "Error: %s\n", err);
+    return false;
+  }
+  for (int i = 0; i < opts->dparam_count; i++) {
+    if (daemon_conf_apply_dparam(g_daemon_conf, opts->dparams[i], err, err_size) != 0) {
+      fprintf(stderr, "Error: --dparam: %s\n", err);
+      return false;
+    }
+  }
+  /* Effective port: -p (highest) > --dparam port > config port (default 873). */
+  if (!opts->port_set)
+    *port = g_daemon_conf->global.port;
+  if (!*bind_address)
+    *bind_address = g_daemon_conf->global.address;
+  if (g_daemon_conf->module_count == 0)
+    log_message(LOG_LEVEL_WARNING,
+                "daemon config has no modules; every connection will be refused");
+  /* Surface the operator's client-chosen-ownership opt-in prominently: an
+     opted-in module lets its clients request arbitrary owner ids inside that
+     module root. */
+  for (int i = 0; i < g_daemon_conf->module_count; i++) {
+    if (g_daemon_conf->modules[i].client_owner)
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon module '%s' allows client-chosen ownership and super-user device "
+                  "activities (`client owner = yes`); clients may request arbitrary owner ids "
+                  "and device nodes within that module root -- pair it with `auth users` "
+                  "unless the module is intentionally open to the network",
+                  g_daemon_conf->modules[i].name);
+    if (g_daemon_conf->modules[i].max_connections > 0)
+      log_message(LOG_LEVEL_INFO,
+                  "daemon module '%s': per-module 'max connections' cap = %d (enforced "
+                  "across all connection children)",
+                  g_daemon_conf->modules[i].name, g_daemon_conf->modules[i].max_connections);
+  }
+  return true;
+}
+
+/* Load the daemon credential store (Wave B) and enforce the fail-closed
+ * startup check: a module that declares `auth users` without a store (or with
+ * an empty store) refuses to start rather than serving a module whose
+ * credentials can never be verified.  On failure the error is printed and
+ * false is returned. */
+static bool validate_daemon_credentials(const ServerCliOptions* opts, char* err, size_t err_size) {
+  /* --password-file and --early-input feed the same store, loaded BEFORE the
+   * listener forks so every connection child shares one read-only store. */
+  g_credentials = credentials_load(opts->password_file, opts->early_input_file, err, err_size);
+  if (!g_credentials) {
+    fprintf(stderr, "Error: %s\n", err);
+    return false;
+  }
+  bool credential_source_given = opts->password_file != NULL || opts->early_input_file != NULL;
+  for (int i = 0; i < g_daemon_conf->module_count; i++) {
+    const DaemonModule* module = &g_daemon_conf->modules[i];
+    if (module->auth_user_count == 0)
+      continue;
+    if (!credential_source_given) {
+      fprintf(stderr,
+              "Error: module '%s' declares 'auth users' but no credential store was given "
+              "(--password-file or --early-input); refusing to start (fail closed)\n",
+              module->name);
+      return false;
+    }
+    if (credentials_store_size(g_credentials) == 0) {
+      fprintf(stderr,
+              "Error: module '%s' declares 'auth users' but the credential store is empty; "
+              "refusing to start (fail closed)\n",
+              module->name);
+      return false;
+    }
+    for (int j = 0; j < module->auth_user_count; j++) {
+      if (!credentials_store_has(g_credentials, module->auth_users[j]))
+        log_message(LOG_LEVEL_WARNING,
+                    "daemon module '%s': auth user '%s' has no credential store entry; that "
+                    "user can never authenticate",
+                    module->name, module->auth_users[j]);
+    }
+  }
+  return true;
+}
+
+/* Create the shared cross-process registry for the per-module / per-source
+ * caps and the auth lockout.  Called in the parent before any accept-loop fork;
+ * every connection child inherits the mapping.  A failure degrades to
+ * "registry disabled" (the global cap and host ACLs still apply) rather than
+ * refusing to start. */
+static void create_daemon_limits(void) {
+  g_daemon_limits = daemon_limits_create(
+      (int)g_daemon_conf->global.max_connections, g_daemon_conf->module_count,
+      g_daemon_conf->global.max_connections_per_host, g_daemon_conf->global.auth_lockout_threshold,
+      g_daemon_conf->global.auth_lockout_duration_sec);
+  if (!g_daemon_limits)
+    log_message(LOG_LEVEL_WARNING,
+                "daemon: could not allocate the shared connection registry; per-module / "
+                "per-host caps and the cross-process auth lockout are disabled (the global "
+                "'max connections' cap and host ACLs still apply)");
+}
+
+/* Bind the listener, apply the daemon caps, set up TLS when requested, detach
+ * when daemonizing, and run the accept loop.  Returns the process exit code. */
+static int start_listener(ServerCliOptions* opts, int port, int bind_family,
+                          const char* bind_address) {
+  ServerBindOptions bind_opts;
+  bind_opts.bind_address = bind_address;
+  bind_opts.family = bind_family;
+  g_server = server_create_ex(port, &bind_opts);
+  if (!g_server) {
+    log_message(LOG_LEVEL_ERROR, "Failed to create server");
+    release_authorization();
+    return 1;
+  }
+  if (g_daemon_conf)
+    server_set_max_connections(g_server, (unsigned int)g_daemon_conf->global.max_connections);
+  if (g_daemon_limits)
+    server_set_limit_registry(g_server, g_daemon_limits);
+  if (opts->use_tls) {
+    if (!opts->tls_cert || !opts->tls_key || !opts->tls_ca || !opts->client_cn) {
+      fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
+      server_delete(&g_server);
+      release_authorization();
+      return 1;
+    }
+    tls_global_init();
+    if (!server_create_tls(g_server, opts->tls_cert, opts->tls_key, opts->tls_ca)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
+      server_delete(&g_server);
+      release_authorization();
+      return 1;
+    }
+  }
+  /* Detach after the listening socket (and TLS context) exist so the
+   * background daemon inherits a fully-bound listener.  --no-detach runs in
+   * the foreground, which is how tests drive the daemon. */
+  if (opts->daemon_mode && !opts->no_detach) {
+    if (!daemonize()) {
+      log_message(LOG_LEVEL_ERROR, "Failed to daemonize");
+      server_delete(&g_server);
+      release_authorization();
+      return 1;
+    }
+  }
+  if (opts->use_tls)
+    server_listen_tls(g_server, handler);
+  else
+    server_listen(g_server, handler);
+  server_delete(&g_server);
+  release_authorization();
+  return 0;
+}
+
+/* Listener entrypoint: the daemon (config-driven, possibly detached) and the
+ * standalone TCP server share the same bind/TLS/listen path.  Consumes and
+ * frees opts. */
+static int run_daemon_server(ServerCliOptions* opts) {
+  int port = opts->port;
+  const char* bind_address = opts->bind_address;
+  char cli_err[512];
+  int exit_code = 0;
+
+  if (opts->daemon_mode) {
+    if (!load_daemon_policy(opts, &port, &bind_address, cli_err, sizeof(cli_err)) ||
+        !validate_daemon_credentials(opts, cli_err, sizeof(cli_err))) {
+      exit_code = 1;
+      goto out;
+    }
+    create_daemon_limits();
+  } else if (!configure_authorization(opts->destination_root)) {
+    char* escaped = output_escape(opts->destination_root, false);
+    fprintf(stderr, "Error: invalid destination root '%s'\n",
+            escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    exit_code = 1;
+    goto out;
+  }
+
+  exit_code = start_listener(opts, port, opts->bind_family, bind_address);
+
+out:
+  daemon_limits_destroy(g_daemon_limits);
+  g_daemon_limits = NULL;
+  daemon_conf_free(g_daemon_conf);
+  g_daemon_conf = NULL;
+  credentials_free(g_credentials);
+  g_credentials = NULL;
+  server_cli_options_free(opts);
+  return exit_code;
+}
+
 int main(int argc, char* argv[]) {
   /* Capture the process umask now, while still single-threaded: the cached
    * value is what file_mode_base() uses, and reading it later would race with
@@ -1325,250 +1603,12 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  /* --hash-credentials: standalone offline tool; read user:password lines and
-   * emit new-format credential-store lines, then exit. */
-  if (opts.hash_credentials_file) {
-    uint32_t iters = opts.hash_iterations_set ? opts.hash_iterations : CREDENTIAL_DEFAULT_ITERS;
-    /* The output is secret material: if it is redirected to a regular file,
-     * warn when that file is group/other-accessible (the store must be 0600). */
-    struct stat out_st;
-    if (fstat(STDOUT_FILENO, &out_st) == 0 && S_ISREG(out_st.st_mode) &&
-        (out_st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
-      fprintf(stderr,
-              "Warning: credential-store output is a group/other-accessible file; restrict it to "
-              "mode 0600 (chmod 600)\n");
-    char hash_err[512];
-    if (credentials_hash_file(opts.hash_credentials_file, iters, stdout, hash_err,
-                              sizeof(hash_err)) != 0) {
-      fprintf(stderr, "Error: %s\n", hash_err);
-      server_cli_options_free(&opts);
-      return 1;
-    }
-    server_cli_options_free(&opts);
-    return 0;
-  }
+  if (opts.hash_credentials_file)
+    return run_hash_credentials_tool(&opts);
 
-  int exit_code = 0;
-  signal(SIGPIPE, SIG_IGN);
-  if (opts.verbose) {
-    set_log_level(LOG_LEVEL_DEBUG);
-    set_log_debug_flags(LOG_DEBUG_ALL);
-  }
-  if (opts.tls_ca && !opts.use_tls)
-    log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
-  /* Persist the parsed server policies into the process-global policy state
-   * BEFORE the stdio branch: an SSH-launched `--stdio` server (whose argv came
-   * from the client via --remote-option and friends) must honor --allow-delete,
-   * --trust-sender and --client-cn exactly like the standalone listener. */
-  required_client_cn = opts.client_cn;
-  allow_delete = opts.allow_delete;
-  trust_sender = opts.trust_sender;
-  allow_unauthenticated = opts.allow_unauthenticated;
-  server_no_super = opts.no_super;
-  /* --stdio rejects --allow-super at parse time; force it off here as well so
-   * this process-global policy cannot be re-enabled by a future caller. */
-  server_allow_super = opts.allow_super && !opts.stdio_mode;
-  server_iconv_spec = opts.iconv_spec;
-  install_cleanup_handler(SIGINT);
-  install_cleanup_handler(SIGTERM);
-  /* Server-owned socket deadline floor: the client default --timeout=0 would
-   * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
-   * silent peer hold a connection (and its process slot) forever. */
-  tcp_set_timeouts(SERVER_IO_TIMEOUT_SEC, SERVER_IO_TIMEOUT_SEC);
-
-  if (opts.stdio_mode) {
-    /* SSH authenticates the stdio transport outside of FastSync. */
-    allow_unauthenticated = true;
-    if (!configure_authorization(opts.destination_root)) {
-      char* escaped = output_escape(opts.destination_root, false);
-      fprintf(stderr, "Error: invalid destination root '%s'\n",
-              escaped ? escaped : "<allocation failed>");
-      free(escaped);
-      server_cli_options_free(&opts);
-      return 1;
-    }
-    io_set_fds(STDIN_FILENO, STDOUT_FILENO);
-    /* handler() does not own the stdio fds: it never closes its descriptor
-     * argument, so STDIN/STDOUT stay open for this (single-shot) SSH session
-     * and are released by process exit. */
-    handler(STDIN_FILENO);
-    release_authorization();
-    server_cli_options_free(&opts);
-    return 0;
-  }
-
-  int port = opts.port;
-  int bind_family = opts.bind_family;
-  const char* bind_address = opts.bind_address;
-
-  if (opts.daemon_mode) {
-    const char* config_path = opts.config_path ? opts.config_path : default_daemon_config_path();
-    g_daemon_conf = daemon_conf_load(config_path, cli_err, sizeof(cli_err));
-    if (!g_daemon_conf) {
-      server_cli_options_free(&opts);
-      fprintf(stderr, "Error: %s\n", cli_err);
-      return 1;
-    }
-    for (int i = 0; i < opts.dparam_count; i++) {
-      if (daemon_conf_apply_dparam(g_daemon_conf, opts.dparams[i], cli_err, sizeof(cli_err)) != 0) {
-        fprintf(stderr, "Error: --dparam: %s\n", cli_err);
-        exit_code = 1;
-        goto out;
-      }
-    }
-    /* Effective port: -p (highest) > --dparam port > config port (default 873). */
-    if (!opts.port_set)
-      port = g_daemon_conf->global.port;
-    if (!bind_address)
-      bind_address = g_daemon_conf->global.address;
-    if (g_daemon_conf->module_count == 0)
-      log_message(LOG_LEVEL_WARNING,
-                  "daemon config has no modules; every connection will be refused");
-    /* Surface the operator's client-chosen-ownership opt-in prominently: an
-       opted-in module lets its clients request arbitrary owner ids inside that
-       module root. */
-    for (int i = 0; i < g_daemon_conf->module_count; i++) {
-      if (g_daemon_conf->modules[i].client_owner)
-        log_message(LOG_LEVEL_WARNING,
-                    "daemon module '%s' allows client-chosen ownership and super-user device "
-                    "activities (`client owner = yes`); clients may request arbitrary owner ids "
-                    "and device nodes within that module root -- pair it with `auth users` "
-                    "unless the module is intentionally open to the network",
-                    g_daemon_conf->modules[i].name);
-      if (g_daemon_conf->modules[i].max_connections > 0)
-        log_message(LOG_LEVEL_INFO,
-                    "daemon module '%s': per-module 'max connections' cap = %d (enforced "
-                    "across all connection children)",
-                    g_daemon_conf->modules[i].name, g_daemon_conf->modules[i].max_connections);
-    }
-    /* Daemon credential store (Wave B).  --password-file and --early-input
-     * feed the same store, loaded BEFORE the listener forks so every
-     * connection child shares one read-only store.  Fail closed at startup: a
-     * module that declares `auth users` without a store (or with an empty
-     * store) refuses to start rather than serving a module whose credentials
-     * can never be verified. */
-    g_credentials =
-        credentials_load(opts.password_file, opts.early_input_file, cli_err, sizeof(cli_err));
-    if (!g_credentials) {
-      server_cli_options_free(&opts);
-      fprintf(stderr, "Error: %s\n", cli_err);
-      return 1;
-    }
-    bool credential_source_given = opts.password_file != NULL || opts.early_input_file != NULL;
-    for (int i = 0; i < g_daemon_conf->module_count; i++) {
-      const DaemonModule* module = &g_daemon_conf->modules[i];
-      if (module->auth_user_count == 0)
-        continue;
-      if (!credential_source_given) {
-        fprintf(stderr,
-                "Error: module '%s' declares 'auth users' but no credential store was given "
-                "(--password-file or --early-input); refusing to start (fail closed)\n",
-                module->name);
-        server_cli_options_free(&opts);
-        return 1;
-      }
-      if (credentials_store_size(g_credentials) == 0) {
-        fprintf(stderr,
-                "Error: module '%s' declares 'auth users' but the credential store is empty; "
-                "refusing to start (fail closed)\n",
-                module->name);
-        server_cli_options_free(&opts);
-        return 1;
-      }
-      for (int j = 0; j < module->auth_user_count; j++) {
-        if (!credentials_store_has(g_credentials, module->auth_users[j]))
-          log_message(LOG_LEVEL_WARNING,
-                      "daemon module '%s': auth user '%s' has no credential store entry; that "
-                      "user can never authenticate",
-                      module->name, module->auth_users[j]);
-      }
-    }
-    /* Shared cross-process registry for the per-module / per-source caps and
-     * the auth lockout.  Created HERE in the parent before any accept-loop
-     * fork; every connection child inherits the mapping.  A failure degrades to
-     * "registry disabled" (the global cap and host ACLs still apply) rather
-     * than refusing to start. */
-    g_daemon_limits = daemon_limits_create((int)g_daemon_conf->global.max_connections,
-                                           g_daemon_conf->module_count,
-                                           g_daemon_conf->global.max_connections_per_host,
-                                           g_daemon_conf->global.auth_lockout_threshold,
-                                           g_daemon_conf->global.auth_lockout_duration_sec);
-    if (!g_daemon_limits)
-      log_message(LOG_LEVEL_WARNING,
-                  "daemon: could not allocate the shared connection registry; per-module / "
-                  "per-host caps and the cross-process auth lockout are disabled (the global "
-                  "'max connections' cap and host ACLs still apply)");
-  } else {
-    if (!configure_authorization(opts.destination_root)) {
-      char* escaped = output_escape(opts.destination_root, false);
-      fprintf(stderr, "Error: invalid destination root '%s'\n",
-              escaped ? escaped : "<allocation failed>");
-      free(escaped);
-      server_cli_options_free(&opts);
-      return 1;
-    }
-  }
-
-  ServerBindOptions bind_opts;
-  bind_opts.bind_address = bind_address;
-  bind_opts.family = bind_family;
-  g_server = server_create_ex(port, &bind_opts);
-  if (!g_server) {
-    log_message(LOG_LEVEL_ERROR, "Failed to create server");
-    release_authorization();
-    exit_code = 1;
-    goto out;
-  }
-  if (g_daemon_conf)
-    server_set_max_connections(g_server, (unsigned int)g_daemon_conf->global.max_connections);
-  if (g_daemon_limits)
-    server_set_limit_registry(g_server, g_daemon_limits);
-  if (opts.use_tls) {
-    if (!opts.tls_cert || !opts.tls_key || !opts.tls_ca || !opts.client_cn) {
-      fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
-      server_delete(&g_server);
-      release_authorization();
-      exit_code = 1;
-      goto out;
-    }
-    tls_global_init();
-    if (!server_create_tls(g_server, opts.tls_cert, opts.tls_key, opts.tls_ca)) {
-      log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
-      server_delete(&g_server);
-      release_authorization();
-      exit_code = 1;
-      goto out;
-    }
-  }
-
-  /* Detach after the listening socket (and TLS context) exist so the
-   * background daemon inherits a fully-bound listener.  --no-detach runs in
-   * the foreground, which is how tests drive the daemon. */
-  if (opts.daemon_mode && !opts.no_detach) {
-    if (!daemonize()) {
-      log_message(LOG_LEVEL_ERROR, "Failed to daemonize");
-      server_delete(&g_server);
-      release_authorization();
-      exit_code = 1;
-      goto out;
-    }
-  }
-
-  if (opts.use_tls)
-    server_listen_tls(g_server, handler);
-  else
-    server_listen(g_server, handler);
-  server_delete(&g_server);
-  release_authorization();
-
-out:
-  daemon_limits_destroy(g_daemon_limits);
-  g_daemon_limits = NULL;
-  daemon_conf_free(g_daemon_conf);
-  g_daemon_conf = NULL;
-  credentials_free(g_credentials);
-  g_credentials = NULL;
-  server_cli_options_free(&opts);
-  return exit_code;
+  configure_server_process(&opts);
+  if (opts.stdio_mode)
+    return run_stdio_server(&opts);
+  return run_daemon_server(&opts);
 }
 #endif
