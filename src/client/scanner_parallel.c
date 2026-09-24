@@ -338,7 +338,7 @@ static void scan_root_add_non_dir(const ScannerOptions* options, ScannerEntry* i
   File* file = NULL;
   bool failed = false;
   ScannerBuildStatus status = scanner_build_file_entry(options, inspected, rel, &file, &failed);
-  if (failed)
+  if (failed || status == SCANNER_BUILD_FAIL_CONTINUE || status == SCANNER_BUILD_FAIL_BREAK)
     ps->failed = true;
   if (status != SCANNER_BUILD_OK)
     return;
@@ -412,6 +412,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
 done:
   free(rel);
   free(cur_path);
+  free(inspected.link_target);
 }
 
 /* Scan the root directory itself, collecting root files and subdirectories.

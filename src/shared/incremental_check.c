@@ -240,6 +240,12 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   Data* sig_data = NULL;
   Status resp = STATUS_ERROR;
   bool sig_sent = false;
+  /* A delta check needs at least one basis source: the in-memory destination
+   * snapshot or a confined basis descriptor. */
+  if (!old_data && basis_fd < 0) {
+    *failed = true;
+    return NULL;
+  }
   DeltaSignature* sig =
       old_data ? delta_signature_create_seeded(old_data, old_size, config->delta_block_size,
                                                (uint32_t)config->checksum_seed)
@@ -1430,20 +1436,24 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
   if (config->use_metadata) {
     int meta_ok = 1;
     meta = metadata_receive(fd, &meta_ok);
-    if (!meta_ok)
+    if (!meta_ok) {
+      file_metadata_destroy(meta);
       return INCREMENTAL_ERROR;
+    }
   }
   if (config->use_xattrs) {
     int xok = 0;
     append_xattrs = xattr_receive(fd, &xok, config->preserve_acls);
     if (!xok) {
       xattr_list_free(append_xattrs);
+      file_metadata_destroy(meta);
       return INCREMENTAL_ERROR;
     }
   }
   Data* tail = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
   if (tail == NULL) {
     xattr_list_free(append_xattrs);
+    file_metadata_destroy(meta);
     return INCREMENTAL_ERROR;
   }
   if (config->use_compression &&
@@ -1455,16 +1465,19 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
     data_destroy(tail);
     if (uncompressed == NULL) {
       xattr_list_free(append_xattrs);
+      file_metadata_destroy(meta);
       return INCREMENTAL_ERROR;
     }
     if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
       data_destroy(uncompressed);
       xattr_list_free(append_xattrs);
+      file_metadata_destroy(meta);
       return INCREMENTAL_ERROR;
     }
     if (uncompressed->size > MAX_FILE_DATA_SIZE) {
       data_destroy(uncompressed);
       xattr_list_free(append_xattrs);
+      file_metadata_destroy(meta);
       return INCREMENTAL_ERROR;
     }
     tail = uncompressed;
@@ -1477,6 +1490,7 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
     send_status(fd, STATUS_ERROR);
     data_destroy(tail);
     xattr_list_free(append_xattrs);
+    file_metadata_destroy(meta);
     return INCREMENTAL_ERROR;
   }
   size_t full_size = (size_t)check_size;
@@ -1484,6 +1498,7 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
   if (!full) {
     data_destroy(tail);
     xattr_list_free(append_xattrs);
+    file_metadata_destroy(meta);
     return INCREMENTAL_ERROR;
   }
   if (old_size > 0 && state->old_data)
@@ -1498,6 +1513,7 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
   if (!file) {
     free(full);
     xattr_list_free(append_xattrs);
+    file_metadata_destroy(meta);
     return INCREMENTAL_ERROR;
   }
   file->metadata = meta;
