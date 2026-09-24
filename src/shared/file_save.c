@@ -817,6 +817,21 @@ static FileSaveResult file_save_directory_to_disk(const FileSavePlan* plan, bool
   } else if (ok && identity_copy_as_active()) {
     ok = false;
   }
+  /* --fake-super: park the directory's full stat in rsync's reserved
+     user.rsync.%stat xattr as soon as the directory exists.  This makes even a
+     direct file_save_to_disk_full() caller -- which never runs the deferred
+     DirTimeList pass -- produce an rsync-readable fake-super record.  The record
+     carries the full mode/uid/gid; the permission bits are replayed by the
+     deferred pass (never inline, so a restrictive mode cannot block child
+     creation) and the recorded ownership is never real-chowned.  Best-effort:
+     fake_super_store_fd() logs and skips a failure, never failing the entry. */
+  if (ok && plan->config && plan->config->fake_super && file->metadata && dir_fd >= 0) {
+    uint32_t store_uid = 0;
+    uint32_t store_gid = 0;
+    identity_resolve_storage_ids((int32_t)file->metadata->uid, (int32_t)file->metadata->gid,
+                                 &store_uid, &store_gid);
+    fake_super_store_fd(dir_fd, store_uid, store_gid, (uint32_t)file->metadata->mode, 0, 0);
+  }
   /* The final source MODE is deliberately NOT applied inline.  A restrictive
      source mode (for example 0555) would make the directory unwritable before
      its children are created, so a non-root receiver fails each child with
