@@ -62,6 +62,17 @@ typedef enum {
   SCANNER_SPECIAL_SKIP,     /* non-regular entry not requested: skip */
 } ScannerSpecial;
 
+/* Result of scanner_build_file_entry().  The two failure variants preserve the
+ * sequential scanner's historical distinction between a failure before the
+ * File existed (which kept walking the directory) and one afterwards (which cut
+ * the chunk short); both mark the scan failed. */
+typedef enum {
+  SCANNER_BUILD_OK,            /* File built; caller owns it */
+  SCANNER_BUILD_SKIP,          /* non-regular entry not preserved; no File */
+  SCANNER_BUILD_FAIL_CONTINUE, /* failed before the File existed */
+  SCANNER_BUILD_FAIL_BREAK,    /* failed after the File existed */
+} ScannerBuildStatus;
+
 /* scanner_filter.c */
 void filter_node_destroy(void* item);
 FilterNode* filter_node_alloc(FilterNode* parent, FilterRuleList* own);
@@ -79,10 +90,21 @@ bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* 
                             const FilterNode* node, const char* rel, const char* leaf, bool is_dir,
                             bool per_dir_filters, bool exclude_filter_files, bool* protect_out);
 void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file);
-void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* table, File* file,
-                             const struct stat* stats);
+void scanner_capture_xattrs_opts(const ScannerOptions* options, File* file);
+bool scanner_assign_hardlink(HardLinkTable* table, File* file, const struct stat* stats);
 ScannerSpecial scanner_prepare_special(bool preserve_devices, bool preserve_specials,
                                        bool copy_devices, File* file, const struct stat* stats);
+/* Build one non-directory transfer File from an inspected entry.  `rel` is the
+ * entry's transfer-root-relative path (used for the -R wire path); `inspected`
+ * supplies the on-disk path, stats and (for a carried symlink) the target whose
+ * ownership transfers to the File.  Populates data size, send_path, special-node
+ * state, hardlink group, metadata and xattrs.  On SCANNER_BUILD_OK the caller
+ * owns *out_file; on SCANNER_BUILD_SKIP it is NULL and the entry is dropped; on
+ * either failure it is NULL and the caller must mark the scan failed.  `*failed`
+ * additionally reports a non-fatal hardlink-table allocation failure, in which
+ * case a usable File is still returned. */
+ScannerBuildStatus scanner_build_file_entry(const ScannerOptions* options, ScannerEntry* inspected,
+                                            const char* rel, File** out_file, bool* failed);
 bool excluded_sink_append(ArrayList* list, mtx_t* mtx, const char* rel);
 void scanner_note_nonreg(const ScannerOptions* options, const char* fs_path);
 void scanner_note_mount(const ScannerOptions* options, const char* fs_path);

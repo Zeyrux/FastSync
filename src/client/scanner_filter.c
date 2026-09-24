@@ -285,32 +285,34 @@ bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* 
  * read xattrs is non-fatal: the file is transferred without them.  A symlink
  * entry reads the LINK's own xattrs (never the referent's) with the no-follow
  * variant; on Linux the VFS refuses xattrs on symlinks, so that yields NULL. */
-void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file) {
-  if (!scanner || !file || !(scanner->options.preserve_xattrs || scanner->options.preserve_acls))
+void scanner_capture_xattrs_opts(const ScannerOptions* options, File* file) {
+  if (!options || !file || !(options->preserve_xattrs || options->preserve_acls))
     return;
-  file->xattrs = file->is_symlink
-                     ? xattr_capture_path_nofollow(file->path, scanner->options.preserve_acls)
-                     : xattr_capture_path(file->path, scanner->options.preserve_acls);
+  file->xattrs = file->is_symlink ? xattr_capture_path_nofollow(file->path, options->preserve_acls)
+                                  : xattr_capture_path(file->path, options->preserve_acls);
+}
+
+void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file) {
+  if (!scanner)
+    return;
+  scanner_capture_xattrs_opts(&scanner->options, file);
 }
 
 /* Apply --hard-links (-H) detection to one regular File.  On a sibling (a
  * later member of an already-seen source inode) the File keeps the group id
  * and the first member's wire path but carries NO data payload (size 0); the
- * first member is left untouched (data present, link_first).  Allocation
- * failure is fatal: the scanner is marked failed. */
-void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* table, File* file,
-                             const struct stat* stats) {
+ * first member is left untouched (data present, link_first).  Returns false on
+ * allocation failure (the caller marks the scan failed); the File stays usable
+ * either way. */
+bool scanner_assign_hardlink(HardLinkTable* table, File* file, const struct stat* stats) {
   if (!table || !file || !stats)
-    return;
+    return true;
   int gid;
   bool is_first;
   char* first_path = NULL;
   if (!hardlink_table_assign(table, file_wire_path(file), stats->st_dev, stats->st_ino, &gid,
-                             &is_first, &first_path)) {
-    if (scanner)
-      scanner->failed = true;
-    return;
-  }
+                             &is_first, &first_path))
+    return false;
   file->link_group = gid;
   file->link_first = is_first;
   if (!is_first) {
@@ -319,6 +321,7 @@ void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* table, Fi
   } else {
     free(first_path);
   }
+  return true;
 }
 
 /* Phase 4 special/devices decision for one non-regular entry, matching rsync:
@@ -397,6 +400,76 @@ void scanner_note_nonreg(const ScannerOptions* options, const char* fs_path) {
   printf("skipping non-regular file \"%s\"\n", escaped ? escaped : rel);
   free(escaped);
   fflush(stdout);
+}
+
+/* Construct one non-directory File from an inspected entry.  Shared by the
+ * sequential and parallel scanners so entry construction has a single
+ * implementation: data size (or carried symlink), -R wire path, special/devices
+ * classification, hardlink group, metadata and xattr capture all happen here in
+ * the same order for both.  See the declaration for the ownership contract. */
+ScannerBuildStatus scanner_build_file_entry(const ScannerOptions* options, ScannerEntry* inspected,
+                                            const char* rel, File** out_file, bool* failed) {
+  *out_file = NULL;
+  if (failed)
+    *failed = false;
+  File* file = file_create(inspected->path);
+  if (!file) {
+    /* The File never existed, so drop the not-yet-transferred symlink target
+       here; the caller's entry teardown would otherwise double-free it. */
+    free(inspected->link_target);
+    inspected->link_target = NULL;
+    return SCANNER_BUILD_FAIL_CONTINUE;
+  }
+  if (inspected->is_symlink) {
+    file->is_symlink = true;
+    file->symlink_target = inspected->link_target;
+    inspected->link_target = NULL;
+  } else {
+    file->data->size = inspected->stats.st_size;
+  }
+  /* -R + --files-from uses the bare transfer-relative path; -R without
+     --files-from prefixes it.  Plain scans keep the source path. */
+  bool relative_mode = options->relative && options->file_list != NULL;
+  if (relative_mode) {
+    file->send_path = str_dup(rel);
+  } else if (options->relative_prefix) {
+    file->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
+  }
+  if ((relative_mode || options->relative_prefix) && !file->send_path) {
+    file_destroy(file);
+    return SCANNER_BUILD_FAIL_BREAK;
+  }
+  /* --devices/--specials: a device/FIFO/socket entry marked for preservation
+     becomes a node to recreate (is_special, no data, rdev captured); an
+     unrequested non-regular entry is skipped (rsync default). */
+  ScannerSpecial special =
+      scanner_prepare_special(options->preserve_devices, options->preserve_specials,
+                              options->copy_devices, file, &inspected->stats);
+  if (special == SCANNER_SPECIAL_SKIP) {
+    scanner_note_nonreg(options, file->path);
+    file_destroy(file);
+    return SCANNER_BUILD_SKIP;
+  }
+  if (options->hardlinks && S_ISREG(inspected->stats.st_mode) &&
+      !scanner_assign_hardlink(options->hardlinks, file, &inspected->stats)) {
+    /* Allocation failure is non-fatal to this entry (it is still emitted) but
+       marks the scan failed, matching the historical inlined behaviour. */
+    if (failed)
+      *failed = true;
+  }
+  if (options->use_metadata) {
+    file->metadata = file_metadata_create(file->path, &inspected->stats, options->preserve_atimes,
+                                          options->preserve_crtimes);
+    if (!file->metadata) {
+      file_destroy(file);
+      return SCANNER_BUILD_FAIL_BREAK;
+    }
+  }
+  /* A hardlink sibling carries no data, so it carries no xattrs. */
+  if (!(file->link_group != 0 && !file->link_first))
+    scanner_capture_xattrs_opts(options, file);
+  *out_file = file;
+  return SCANNER_BUILD_OK;
 }
 
 /* rsync 3.4.1's `--info=mount` line, emitted when `-xx` drops a mount-point

@@ -11,6 +11,10 @@
  * stored here so the transport layer does not depend on daemon config. */
 struct DaemonLimitRegistry;
 
+/* Connection cap applied by server_create_ex() until the daemon's configured
+ * `max connections` overrides it via server_set_max_connections(). */
+#define SERVER_DEFAULT_MAX_CONNECTIONS 100
+
 typedef struct Server {
   struct sockaddr_storage address;
   unsigned int address_length;

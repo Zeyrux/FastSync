@@ -19,6 +19,11 @@
  * keeps one transfer from spawning an unbounded pool on a very large machine. */
 #define MAX_SCANNER_THREADS 256
 
+/* Depth of the scanner's work queues: the sequential scanner's pending-directory
+ * stack and the parallel scanner's result queue.  Bounds memory for a very wide
+ * or very deep tree while leaving ample headroom for normal scans. */
+#define SCANNER_RESULT_QUEUE_CAP 100
+
 typedef struct {
   bool use_metadata;
   /* Phase 4 metadata capture: -U/--atimes and -N/--crtimes tell the scanner to

@@ -6,6 +6,11 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+/* Maximum length of a receiver-resolved identity name in a FROM:TO map's TO
+ * field.  Bounded so a malicious/huge name can never cross the wire (see
+ * identity_wire_map_valid). */
+#define IDENTITY_MAX_NAME_LEN 255
+
 /*
  * Identity mapping: --numeric-ids / --usermap / --groupmap / --chown / --copy-as.
  *
