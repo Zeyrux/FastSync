@@ -224,6 +224,235 @@ typedef struct {
   void* observer_context;      /* DELETE mode */
 } DeleteWalkState;
 
+/* The per-walk invariants threaded unchanged through every recursive descent:
+   the keep/synchronized-dir indexes, the destination mode and the protection
+   rules.  Bundling them keeps the recursive helpers below to a handful of
+   positional arguments. */
+typedef struct {
+  const PathIndex* keep;
+  const PathIndex* dirs;
+  DeleteWalkState* state;
+  const DeleteSkipEntry* skips;
+  int skip_count;
+  const DeleteProtectRules* protect;
+} DeleteWalkContext;
+
+/* Duplicate `path` with rsync's trailing-slash convention, used to report a
+   removed (or would-be-removed) directory.  Returns NULL on allocation
+   failure. */
+static char* with_trailing_slash(const char* path) {
+  size_t len = strlen(path);
+  char* copy = malloc(len + 2);
+  if (!copy)
+    return NULL;
+  memcpy(copy, path, len);
+  copy[len] = '/';
+  copy[len + 1] = '\0';
+  return copy;
+}
+
+/* Forward declaration: the ordered passes below recurse through the driver. */
+static bool delete_walk_fd(int dirfd, const char* rel_path, const DeleteWalkContext* ctx,
+                           bool parent_deletable, bool* all_removed);
+
+/* Descend into the child directory `name` of `dirfd`, walking it as part of the
+   current operation.  Returns false on a genuine open/walk failure; on success
+   *child_all_removed reports whether the child removed everything it held (so
+   the caller may rmdir it). */
+static bool delete_walk_child(int dirfd, const char* name, const char* child_rel,
+                              const DeleteWalkContext* ctx, bool deletable,
+                              bool* child_all_removed) {
+  *child_all_removed = false;
+  int childfd = openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (childfd < 0)
+    return errno == ENOENT;
+  bool ok = delete_walk_fd(childfd, child_rel, ctx, deletable, child_all_removed);
+  close(childfd);
+  return ok;
+}
+
+/* Classify every entry up front (the verdict does not depend on processing
+   order) so the ordered passes below can act on it.  Sets shielded[]/is_extra[]
+   and reports through *local_survives whether anything in this directory stays
+   in place.  Returns false on a path-construction failure. */
+static bool delete_walk_classify(const char* rel_path, const DeleteDirEntry* entries, size_t count,
+                                 const DeleteWalkContext* ctx, bool deletable, bool at_root,
+                                 bool* shielded, bool* is_extra, bool* local_survives) {
+  bool ok = true;
+  for (size_t i = 0; i < count; i++) {
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      ok = false;
+      continue;
+    }
+    /* A --delay-updates run keeps its staging directory as a direct child of
+       the receive root, and basis-dir snapshots live below it too.  Their
+       contents are not manifest entries, so descending into them would delete
+       every staged / basis file as an "extra".  Only the staging name (a
+       top-level-only prefix) and the basis prefixes are protected: a nested
+       destination directory that happens to be called .fastsync-stage is
+       ordinary content. */
+    if (path_under_skip_prefix(child_rel, at_root, ctx->skips, ctx->skip_count)) {
+      shielded[i] = true;
+      *local_survives = true;
+    } else if (delete_protect_verdict(ctx->protect, child_rel, entries[i].name,
+                                      entries[i].is_dir) == FILTER_ACTION_PROTECT) {
+      /* A first-match protect rule shields the extra; for a directory the whole
+         subtree is shielded (rsync prunes an excluded directory), so do not
+         descend. */
+      shielded[i] = true;
+      *local_survives = true;
+    } else if (entries[i].is_dir) {
+      bool child_synced = ctx->dirs && path_index_contains(ctx->dirs, child_rel);
+      is_extra[i] = deletable && !child_synced && !keep_is_dir(ctx->keep, child_rel);
+      if (!is_extra[i])
+        *local_survives = true;
+    } else {
+      is_extra[i] = deletable && !keep_is_file(ctx->keep, child_rel);
+      if (!is_extra[i])
+        *local_survives = true;
+    }
+    free(child_rel);
+  }
+  return ok;
+}
+
+/* Pass 1: extraneous subdirectories, descending.  Recurses into each and, when
+   the child removed everything it held, records or removes it and charges the
+   budget. */
+static bool delete_walk_extra_dirs(int dirfd, const char* rel_path, const DeleteDirEntry* entries,
+                                   size_t dir_count, const DeleteWalkContext* ctx, bool deletable,
+                                   const bool* is_extra, bool* local_survives) {
+  bool ok = true;
+  for (size_t i = 0; i < dir_count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      ok = false;
+      continue;
+    }
+    bool child_all_removed = false;
+    if (!delete_walk_child(dirfd, entries[i].name, child_rel, ctx, deletable, &child_all_removed))
+      ok = false;
+    if (child_all_removed && deletable) {
+      if (ctx->state->mode == DELETE_WALK_MODE_LIST) {
+        /* Record the directory with rsync's trailing slash. */
+        char* copy = with_trailing_slash(child_rel);
+        if (!copy) {
+          ok = false;
+        } else if (!array_list_add(ctx->state->out, copy)) {
+          free(copy);
+          ok = false;
+        } else {
+          (*ctx->state->recorded)++;
+        }
+      } else if (ctx->state->budget->deleted >= ctx->state->budget->max_delete) {
+        ctx->state->budget->limit_hit = true;
+        ctx->state->budget->skipped++;
+        *local_survives = true;
+      } else if (unlinkat(dirfd, entries[i].name, AT_REMOVEDIR) != 0) {
+        /* ENOENT: already gone (fine).  ENOTEMPTY/EEXIST: the directory still
+           holds entries the walker leaves in place (a protected excluded
+           prefix, a kept file the manifest protects, a symlink); rsync leaves
+           such a directory behind, so this is not an error.  Only genuine I/O
+           failures abort the deletion. */
+        if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST)
+          ok = false;
+        *local_survives = true;
+      } else {
+        ctx->state->budget->deleted++;
+        /* rsync reports a removed directory with a trailing slash. */
+        if (ctx->state->observer) {
+          char* with_slash = with_trailing_slash(child_rel);
+          if (with_slash) {
+            ctx->state->observer(ctx->state->observer_context, with_slash, DELETE_ENTRY_DIR);
+            free(with_slash);
+          } else {
+            ctx->state->observer(ctx->state->observer_context, child_rel, DELETE_ENTRY_DIR);
+          }
+        }
+      }
+    } else {
+      *local_survives = true;
+    }
+    free(child_rel);
+  }
+  return ok;
+}
+
+/* Pass 2: extraneous files, descending. */
+static bool delete_walk_extra_files(int dirfd, const char* rel_path, const DeleteDirEntry* entries,
+                                    size_t dir_count, size_t count, const DeleteWalkContext* ctx,
+                                    const bool* is_extra, bool* local_survives) {
+  bool ok = true;
+  for (size_t i = dir_count; i < count; i++) {
+    if (!is_extra[i])
+      continue;
+    if (ctx->state->mode == DELETE_WALK_MODE_LIST) {
+      char* child_rel = path_cat((char*)rel_path, entries[i].name);
+      if (!child_rel) {
+        ok = false;
+        continue;
+      }
+      char* copy = str_dup(child_rel);
+      if (!copy || !array_list_add(ctx->state->out, copy)) {
+        free(copy);
+        ok = false;
+      } else {
+        (*ctx->state->recorded)++;
+      }
+      free(child_rel);
+    } else if (ctx->state->budget->deleted >= ctx->state->budget->max_delete) {
+      ctx->state->budget->limit_hit = true;
+      ctx->state->budget->skipped++;
+      *local_survives = true;
+    } else if (unlinkat(dirfd, entries[i].name, 0) != 0) {
+      if (errno != ENOENT)
+        ok = false;
+      *local_survives = true;
+    } else {
+      ctx->state->budget->deleted++;
+      char* child_rel = path_cat((char*)rel_path, entries[i].name);
+      if (child_rel) {
+        if (ctx->state->observer)
+          ctx->state->observer(ctx->state->observer_context, child_rel,
+                               delete_entry_type_of_mode(entries[i].mode));
+        char* escaped_path = output_escape(child_rel, log_get_8_bit_output());
+        fprintf(stderr, "  Deleted: %s\n", escaped_path ? escaped_path : "<allocation failed>");
+        free(escaped_path);
+      }
+      free(child_rel);
+    }
+  }
+  return ok;
+}
+
+/* Pass 3: kept subdirectories, ascending (rsync descends into these only after
+   the parent's own extras have been handled). */
+static bool delete_walk_kept_dirs(int dirfd, const char* rel_path, const DeleteDirEntry* entries,
+                                  size_t dir_count, const DeleteWalkContext* ctx, bool deletable,
+                                  const bool* is_extra, const bool* shielded,
+                                  bool* local_survives) {
+  bool ok = true;
+  for (size_t i = dir_count; i-- > 0;) {
+    if (is_extra[i] || shielded[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      ok = false;
+      continue;
+    }
+    bool child_all_removed = false;
+    if (!delete_walk_child(dirfd, entries[i].name, child_rel, ctx, deletable, &child_all_removed))
+      ok = false;
+    /* A kept/synchronized directory is never removed. */
+    *local_survives = true;
+    free(child_rel);
+  }
+  return ok;
+}
+
 /* Remove the extras directly inside the directory open on `dirfd` (DELETE mode)
    or record the paths that WOULD be removed (LIST mode), recursing into every
    child directory so kept content below a synchronized prefix is reached.
@@ -238,11 +467,8 @@ typedef struct {
    descending name order, then extraneous files, then kept subdirectories in
    ascending order) rather than readdir() order, so `--max-delete` leaves the
    same survivors and the `--info=del`/dry-run line order matches rsync. */
-static bool delete_walk_fd(int dirfd, const char* rel_path, const PathIndex* keep,
-                           const PathIndex* dirs, DeleteWalkState* state,
-                           const DeleteSkipEntry* skips, int skip_count,
-                           const DeleteProtectRules* protect, bool parent_deletable,
-                           bool* all_removed) {
+static bool delete_walk_fd(int dirfd, const char* rel_path, const DeleteWalkContext* ctx,
+                           bool parent_deletable, bool* all_removed) {
   DeleteDirEntry* entries = NULL;
   size_t count = 0;
   bool collect_ok = true;
@@ -261,7 +487,7 @@ static bool delete_walk_fd(int dirfd, const char* rel_path, const PathIndex* kee
   /* A directory is deletable when it or ANY ancestor is synchronized; the
      `parent_deletable` flag carries that down the recursion so dest-only
      directories below a synchronized root are removed wholesale. */
-  bool deletable = parent_deletable || is_synced_dir(dirs, rel_path);
+  bool deletable = parent_deletable || is_synced_dir(ctx->dirs, rel_path);
   bool at_root = rel_path[0] == '\0';
 
   /* Reproduce rsync's traversal order: extraneous subdirectories in descending
@@ -274,182 +500,18 @@ static bool delete_walk_fd(int dirfd, const char* rel_path, const PathIndex* kee
   while (dir_count < count && entries[dir_count].is_dir)
     dir_count++;
 
-  /* Classify every entry up front (the verdict does not depend on processing
-     order) so the ordered passes below can act on it. */
-  for (size_t i = 0; i < count; i++) {
-    char* child_rel = path_cat((char*)rel_path, entries[i].name);
-    if (!child_rel) {
-      operation_ok = false;
-      continue;
-    }
-    /* A --delay-updates run keeps its staging directory as a direct child of
-       the receive root, and basis-dir snapshots live below it too.  Their
-       contents are not manifest entries, so descending into them would delete
-       every staged / basis file as an "extra".  Only the staging name (a
-       top-level-only prefix) and the basis prefixes are protected: a nested
-       destination directory that happens to be called .fastsync-stage is
-       ordinary content. */
-    if (path_under_skip_prefix(child_rel, at_root, skips, skip_count)) {
-      shielded[i] = true;
-      local_survives = true;
-    } else if (delete_protect_verdict(protect, child_rel, entries[i].name, entries[i].is_dir) ==
-               FILTER_ACTION_PROTECT) {
-      /* A first-match protect rule shields the extra; for a directory the whole
-         subtree is shielded (rsync prunes an excluded directory), so do not
-         descend. */
-      shielded[i] = true;
-      local_survives = true;
-    } else if (entries[i].is_dir) {
-      bool child_synced = dirs && path_index_contains(dirs, child_rel);
-      is_extra[i] = deletable && !child_synced && !keep_is_dir(keep, child_rel);
-      if (!is_extra[i])
-        local_survives = true;
-    } else {
-      is_extra[i] = deletable && !keep_is_file(keep, child_rel);
-      if (!is_extra[i])
-        local_survives = true;
-    }
-    free(child_rel);
-  }
-
-  /* Pass 1: extraneous subdirectories, descending. */
-  for (size_t i = 0; i < dir_count; i++) {
-    if (!is_extra[i])
-      continue;
-    char* child_rel = path_cat((char*)rel_path, entries[i].name);
-    if (!child_rel) {
-      operation_ok = false;
-      continue;
-    }
-    int childfd = openat(dirfd, entries[i].name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    bool child_all_removed = false;
-    if (childfd >= 0) {
-      if (!delete_walk_fd(childfd, child_rel, keep, dirs, state, skips, skip_count, protect,
-                          deletable, &child_all_removed))
-        operation_ok = false;
-      close(childfd);
-    } else if (errno != ENOENT) {
-      operation_ok = false;
-    }
-    if (child_all_removed && deletable) {
-      if (state->mode == DELETE_WALK_MODE_LIST) {
-        /* Record the directory with rsync's trailing slash. */
-        size_t len = strlen(child_rel);
-        char* copy = malloc(len + 2);
-        if (!copy) {
-          operation_ok = false;
-        } else {
-          memcpy(copy, child_rel, len);
-          copy[len] = '/';
-          copy[len + 1] = '\0';
-          if (!array_list_add(state->out, copy)) {
-            free(copy);
-            operation_ok = false;
-          } else {
-            (*state->recorded)++;
-          }
-        }
-      } else if (state->budget->deleted >= state->budget->max_delete) {
-        state->budget->limit_hit = true;
-        state->budget->skipped++;
-        local_survives = true;
-      } else if (unlinkat(dirfd, entries[i].name, AT_REMOVEDIR) != 0) {
-        /* ENOENT: already gone (fine).  ENOTEMPTY/EEXIST: the directory still
-           holds entries the walker leaves in place (a protected excluded
-           prefix, a kept file the manifest protects, a symlink); rsync leaves
-           such a directory behind, so this is not an error.  Only genuine I/O
-           failures abort the deletion. */
-        if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST)
-          operation_ok = false;
-        local_survives = true;
-      } else {
-        state->budget->deleted++;
-        /* rsync reports a removed directory with a trailing slash. */
-        if (state->observer) {
-          size_t len = strlen(child_rel);
-          char* with_slash = malloc(len + 2);
-          if (with_slash) {
-            memcpy(with_slash, child_rel, len);
-            with_slash[len] = '/';
-            with_slash[len + 1] = '\0';
-            state->observer(state->observer_context, with_slash, DELETE_ENTRY_DIR);
-            free(with_slash);
-          } else {
-            state->observer(state->observer_context, child_rel, DELETE_ENTRY_DIR);
-          }
-        }
-      }
-    } else {
-      local_survives = true;
-    }
-    free(child_rel);
-  }
-
-  /* Pass 2: extraneous files, descending. */
-  for (size_t i = dir_count; i < count; i++) {
-    if (!is_extra[i])
-      continue;
-    if (state->mode == DELETE_WALK_MODE_LIST) {
-      char* child_rel = path_cat((char*)rel_path, entries[i].name);
-      if (!child_rel) {
-        operation_ok = false;
-        continue;
-      }
-      char* copy = str_dup(child_rel);
-      if (!copy || !array_list_add(state->out, copy)) {
-        free(copy);
-        operation_ok = false;
-      } else {
-        (*state->recorded)++;
-      }
-      free(child_rel);
-    } else if (state->budget->deleted >= state->budget->max_delete) {
-      state->budget->limit_hit = true;
-      state->budget->skipped++;
-      local_survives = true;
-    } else if (unlinkat(dirfd, entries[i].name, 0) != 0) {
-      if (errno != ENOENT)
-        operation_ok = false;
-      local_survives = true;
-    } else {
-      state->budget->deleted++;
-      char* child_rel = path_cat((char*)rel_path, entries[i].name);
-      if (child_rel) {
-        if (state->observer)
-          state->observer(state->observer_context, child_rel,
-                          delete_entry_type_of_mode(entries[i].mode));
-        char* escaped_path = output_escape(child_rel, log_get_8_bit_output());
-        fprintf(stderr, "  Deleted: %s\n", escaped_path ? escaped_path : "<allocation failed>");
-        free(escaped_path);
-      }
-      free(child_rel);
-    }
-  }
-
-  /* Pass 3: kept subdirectories, ascending (rsync descends into these only
-     after the parent's own extras have been handled). */
-  for (size_t i = dir_count; i-- > 0;) {
-    if (is_extra[i] || shielded[i])
-      continue;
-    char* child_rel = path_cat((char*)rel_path, entries[i].name);
-    if (!child_rel) {
-      operation_ok = false;
-      continue;
-    }
-    int childfd = openat(dirfd, entries[i].name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    bool child_all_removed = false;
-    if (childfd >= 0) {
-      if (!delete_walk_fd(childfd, child_rel, keep, dirs, state, skips, skip_count, protect,
-                          deletable, &child_all_removed))
-        operation_ok = false;
-      close(childfd);
-    } else if (errno != ENOENT) {
-      operation_ok = false;
-    }
-    /* A kept/synchronized directory is never removed. */
-    local_survives = true;
-    free(child_rel);
-  }
+  if (!delete_walk_classify(rel_path, entries, count, ctx, deletable, at_root, shielded, is_extra,
+                            &local_survives))
+    operation_ok = false;
+  if (!delete_walk_extra_dirs(dirfd, rel_path, entries, dir_count, ctx, deletable, is_extra,
+                              &local_survives))
+    operation_ok = false;
+  if (!delete_walk_extra_files(dirfd, rel_path, entries, dir_count, count, ctx, is_extra,
+                               &local_survives))
+    operation_ok = false;
+  if (!delete_walk_kept_dirs(dirfd, rel_path, entries, dir_count, ctx, deletable, is_extra,
+                             shielded, &local_survives))
+    operation_ok = false;
 
   free(shielded);
   free(is_extra);
@@ -504,8 +566,13 @@ bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
                            .recorded = &recorded,
                            .observer = NULL,
                            .observer_context = NULL};
-  bool ok = delete_walk_fd(rootfd, "", &keep, have_dirs ? &dirs : NULL, &state, skips, skip_count,
-                           protect, false, &all_removed);
+  DeleteWalkContext ctx = {.keep = &keep,
+                           .dirs = have_dirs ? &dirs : NULL,
+                           .state = &state,
+                           .skips = skips,
+                           .skip_count = skip_count,
+                           .protect = protect};
+  bool ok = delete_walk_fd(rootfd, "", &ctx, false, &all_removed);
   if (close(rootfd) != 0)
     ok = false;
   path_index_free(&keep);
@@ -557,8 +624,13 @@ DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const Arr
                            .recorded = NULL,
                            .observer = observer,
                            .observer_context = observer_context};
-  bool ok = delete_walk_fd(rootfd, "", &keep, have_dirs ? &dirs : NULL, &state, skips, skip_count,
-                           protect, false, &all_removed);
+  DeleteWalkContext ctx = {.keep = &keep,
+                           .dirs = have_dirs ? &dirs : NULL,
+                           .state = &state,
+                           .skips = skips,
+                           .skip_count = skip_count,
+                           .protect = protect};
+  bool ok = delete_walk_fd(rootfd, "", &ctx, false, &all_removed);
   if (close(rootfd) != 0)
     ok = false;
   path_index_free(&keep);
