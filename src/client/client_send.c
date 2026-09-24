@@ -136,6 +136,50 @@ void disconnect_transfer_client(Client* client) {
   client_delete(client);
 }
 
+/* Connect the configured transport and install the per-thread protocol session
+ * on it: init with the socket fd pair, apply the I/O timeout and (when
+ * negotiated) the TLS object, then bind it to this thread.  Returns the
+ * connected client, or NULL (after logging the connect failure) when the
+ * transport could not connect. */
+Client* client_connect_and_bind_session(const Config* config, ProtocolSession* session) {
+  Client* client = connect_transfer_client(config);
+  if (!client) {
+    if (config->transport == TRANSPORT_TCP)
+      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
+                  config->use_tls ? " via TLS" : "");
+    return NULL;
+  }
+  protocol_session_init(session, client->file_descriptor, client->file_descriptor);
+  protocol_session_set_io_timeout(session, config->timeout);
+  protocol_session_set_ssl(session, (SSL*)client->ssl);
+  protocol_session_bind(session);
+  return client;
+}
+
+/* Shared --files-from/--delete-missing-args preamble: allocate the missing-args
+ * destination list when the option is set, then validate the --files-from list
+ * (collecting the destination mirrors of missing entries for the receiver's
+ * exact-deletion request).  On success the caller owns *missing_args_out (NULL
+ * when the option is off); on failure the list is freed and false is returned. */
+bool client_prepare_files_from(const Config* config, ArrayList** missing_args_out,
+                               int* skipped_out) {
+  ArrayList* missing_args = NULL;
+  if (config->delete_missing_args) {
+    missing_args = array_list_create(free);
+    if (!missing_args)
+      return false;
+  }
+  int skipped = 0;
+  if (!files_from_list_check(config, missing_args, &skipped)) {
+    if (missing_args)
+      array_list_delete(missing_args);
+    return false;
+  }
+  *missing_args_out = missing_args;
+  *skipped_out = skipped;
+  return true;
+}
+
 /* (finalize_transfer is defined after the SourceFile helpers below.) */
 
 typedef struct SourceFile {
@@ -1039,20 +1083,13 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
 static int send_chunks_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
   time_t start = time(NULL);
-  Client* client = connect_transfer_client(context->config);
+  ProtocolSession session;
+  Client* client = client_connect_and_bind_session(context->config, &session);
   if (!client) {
-    if (context->config->transport == TRANSPORT_TCP)
-      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
-                  context->config->use_tls ? " via TLS" : "");
     pipeline_cancel(context);
     mark_sender_done(context);
     return thrd_error;
   }
-  ProtocolSession session;
-  protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
-  protocol_session_set_io_timeout(&session, context->config->timeout);
-  protocol_session_set_ssl(&session, (SSL*)client->ssl);
-  protocol_session_bind(&session);
   client_messages_activate(true);
   if (!config_send(client->file_descriptor, context->config)) {
     pipeline_cancel(context);
@@ -2035,35 +2072,20 @@ static int send_files_impl(Config* config) {
      shielded -- rsync's `-d DIR/ --delete`. */
   state.delete_per_dir = config->use_delete && config_delete_timing_per_dir(config);
   int skipped = 0;
-  if (config->delete_missing_args) {
-    state.missing_args = array_list_create(free);
-    if (!state.missing_args)
-      return 1;
-  }
-  if (!files_from_list_check(config, state.missing_args, &skipped)) {
-    if (state.missing_args)
-      array_list_delete(state.missing_args);
+  if (!client_prepare_files_from(config, &state.missing_args, &skipped))
     return 1;
-  }
 
   /* From here on a server session may be live, so Ctrl-C/SIGTERM should set the
      abort flag (and be forwarded as STATUS_ABORT) instead of terminating. */
   client_set_abort_armed(true);
-  Client* client = connect_transfer_client(config);
+  ProtocolSession session;
+  Client* client = client_connect_and_bind_session(config, &session);
   if (!client) {
-    if (config->transport == TRANSPORT_TCP)
-      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
-                  config->use_tls ? " via TLS" : "");
     if (state.missing_args)
       array_list_delete(state.missing_args);
     return 1;
   }
   state.client = client;
-  ProtocolSession session;
-  protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
-  protocol_session_set_io_timeout(&session, config->timeout);
-  protocol_session_set_ssl(&session, (SSL*)client->ssl);
-  protocol_session_bind(&session);
   client_messages_activate(true);
 
   int ret = 1;
@@ -2099,16 +2121,8 @@ static int send_files_multithreaded_impl(Config* config) {
                                           : send_dry_run_manifest(config);
   ArrayList* missing_args = NULL;
   int skipped = 0;
-  if (config->delete_missing_args) {
-    missing_args = array_list_create(free);
-    if (!missing_args)
-      return 1;
-  }
-  if (!files_from_list_check(config, missing_args, &skipped)) {
-    if (missing_args)
-      array_list_delete(missing_args);
+  if (!client_prepare_files_from(config, &missing_args, &skipped))
     return 1;
-  }
 
   /* Armed only once a session may go live (see send_files). */
   client_set_abort_armed(true);
@@ -2137,6 +2151,8 @@ static int send_files_multithreaded_impl(Config* config) {
       queue_destroy(q1);
     if (q2)
       queue_destroy(q2);
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
   }
   PipelineContextSender* context = pipeline_context_sender_create(config, q1, q2);

@@ -102,12 +102,14 @@ bool dir_metadata_should_capture(const Config* config) {
   /* Directory metadata is captured when a directory attribute is actually
    * requested: -p/--perms (directory modes), -t/--times (directory mtimes,
    * unless -O/--omit-dir-times suppresses them), -o/-g (directory ownership),
-   * or -X/-A (directory xattrs/ACLs).  --atimes/-U alone does not pull
-   * directory metadata (matching the original dir-time bundle). */
+   * -X/-A (directory xattrs/ACLs), or --fake-super (whose reserved %stat record
+   * is written on the directory itself, so its metadata must travel).
+   * --atimes/-U alone does not pull directory metadata (matching the original
+   * dir-time bundle). */
   return config && config->use_metadata &&
          (config->preserve_perms || (config->preserve_times && !config->omit_dir_times) ||
           config->preserve_owner || config->preserve_group || config->preserve_xattrs ||
-          config->preserve_acls);
+          config->preserve_acls || config->fake_super);
 }
 
 void dir_time_list_init(DirTimeList* list) {
@@ -205,12 +207,19 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
   bool apply_times = config->preserve_times && !config->omit_dir_times;
   bool apply_mode = config->preserve_perms;
   bool apply_xattrs = config->use_xattrs;
+  bool apply_fake_super = config->fake_super;
   /* Ownership is applied through the active identity snapshot (which no-ops
-   * unless an ownership request is active), and xattrs only when -X/-A was
-   * negotiated.  Times/mode keep their own per-attribute gates. */
-  bool have_any = apply_times || apply_mode || apply_xattrs || identity_active_enabled();
+   * unless an ownership request is active), xattrs only when -X/-A was
+   * negotiated, and the --fake-super record whenever the flag is active.
+   * Times/mode keep their own per-attribute gates. */
+  bool have_any =
+      apply_times || apply_mode || apply_xattrs || apply_fake_super || identity_active_enabled();
   if (!have_any)
     return;
+  /* Built once: the --fake-super replay uses it to apply only the recorded
+   * permission bits (the special bits stay in the record, exactly like the
+   * regular-file fake-super receiver). */
+  FileAttrPolicy policy = file_attr_policy_from_config(config);
   for (size_t i = 0; i < list->count; i++) {
     char* dir_path = path_cat(root_directory, list->paths[i]);
     if (!dir_path)
@@ -260,37 +269,58 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
         free(escaped_path);
       }
     }
-    if (apply_mode) {
-      mode_t dir_mode = list->entries[i].mode;
-      bool mode_ready = true;
-      if (config->chmod_spec && *config->chmod_spec &&
-          !chmod_apply(dir_mode, config->chmod_spec, &dir_mode)) {
+    /* The final directory mode (after any --chmod) is computed once so the
+       --fake-super record can carry it even when the on-disk replay is
+       restricted to the permission bits below. */
+    mode_t dir_mode = list->entries[i].mode;
+    bool mode_ready = true;
+    if (apply_mode && config->chmod_spec && *config->chmod_spec &&
+        !chmod_apply(dir_mode, config->chmod_spec, &dir_mode)) {
+      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to apply --chmod to directory %s",
+                  escaped_path ? escaped_path : "<allocation failed>");
+      free(escaped_path);
+      mode_ready = false;
+    }
+    /* Under --fake-super the normal fchmod below still applies the mode, but
+       the fake-super replay that follows narrows the on-disk result to the
+       recorded permission bits (the full mode, including setuid/setgid/sticky,
+       lives only in the record).  Keeping the normal fchmod first means a
+       filesystem without xattr support still gets the directory mode rather than
+       silently losing it. */
+    if (apply_mode && mode_ready) {
+      /* rsync -p copies the source directory mode exactly, including
+       * group/other write and the setgid/sticky bits.  Setuid/setgid/sticky
+       * are super-user activities: when the connection forbade them
+       * (SUPER_MODE_OFF / --no-super), strip them even under -p. */
+      mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
+      if (!privilege_super_mode_permitted(config->super_mode))
+        safe_mode &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
+      if (dir_fd < 0) {
         char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-        log_message(LOG_LEVEL_WARNING, "Failed to apply --chmod to directory %s",
-                    escaped_path ? escaped_path : "<allocation failed>");
+        log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
+                    escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
         free(escaped_path);
-        mode_ready = false;
+      } else if (fchmod(dir_fd, safe_mode) != 0) {
+        char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+        log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
+                    escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+        free(escaped_path);
       }
-      if (mode_ready) {
-        /* rsync -p copies the source directory mode exactly, including
-         * group/other write and the setgid/sticky bits.  Setuid/setgid/sticky
-         * are super-user activities: when the connection forbade them
-         * (SUPER_MODE_OFF / --no-super), strip them even under -p. */
-        mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
-        if (!privilege_super_mode_permitted(config->super_mode))
-          safe_mode &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
-        if (dir_fd < 0) {
-          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-          log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
-                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-          free(escaped_path);
-        } else if (fchmod(dir_fd, safe_mode) != 0) {
-          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-          log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
-                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-          free(escaped_path);
-        }
-      }
+    }
+    /* --fake-super: park the directory's full stat (rsync 3.4.1's exact
+       grammar) on the directory ITSELF, then replay only the recorded
+       permission bits fd-relative.  The special bits live only in the record
+       and the recorded ownership is never real-chowned: the resolved ids are
+       stored for a later privileged restore, exactly like the file path.  Runs
+       before the xattr apply so a mode change cannot clobber the ACL mask. */
+    if (apply_fake_super && dir_fd >= 0) {
+      uint32_t store_uid = 0;
+      uint32_t store_gid = 0;
+      identity_resolve_storage_ids((int32_t)list->entries[i].uid, (int32_t)list->entries[i].gid,
+                                   &store_uid, &store_gid);
+      fake_super_store_fd(dir_fd, store_uid, store_gid, (uint32_t)dir_mode, 0, 0);
+      fake_super_restore_fd(dir_fd, policy);
     }
     /* xattrs/ACLs last: a mode change can rewrite the ACL mask, so the ACL
        xattrs must be (re)applied after fchmod. */

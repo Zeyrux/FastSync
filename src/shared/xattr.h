@@ -140,21 +140,25 @@ bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrL
 /* --fake-super: write the source uid/gid/mode/rdev record into the reserved
  * FAKESUPER_XATTR on `fd`, using rsync 3.4.1's exact grammar (see the key
  * comment above).  `mode` is the full st_mode including its S_IFMT bits.
- * Best-effort (logged, never fatal).  Only meaningful when metadata was
- * transmitted so the values exist. */
+ * `fd` may be a regular file, a faked char/block device (written as a regular
+ * file), or a DIRECTORY: rsync stores a directory's faked mode/uid/gid in the
+ * reserved xattr on the directory itself.  Best-effort (logged, never fatal).
+ * Only meaningful when metadata was transmitted so the values exist. */
 void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, uint32_t rdev_major,
                          uint32_t rdev_minor);
 
 /* --fake-super replay: parse the FAKESUPER_XATTR record previously written on
  * `fd` by fake_super_store_fd and re-apply the recorded permission bits
- * fd-relative.  The recorded uid/gid are deliberately NOT chowned for real:
- * --fake-super only RECORDS ownership (the caller stores the resolved mapping
- * via identity_resolve_storage_ids), it never performs a real chown.  The
+ * fd-relative.  `fd` may be a regular file, a faked device, or a DIRECTORY;
+ * fgetxattr/fchmod work identically on a directory descriptor.  The recorded
+ * uid/gid are deliberately NOT chowned for real: --fake-super only RECORDS
+ * ownership (the caller stores the resolved mapping via
+ * identity_resolve_storage_ids), it never performs a real chown.  The
  * recorded rdev is retained for a later privileged restore but is not acted on
  * here.  Best-effort: absence of the xattr or a malformed record is a silent
  * no-op that never fails the transfer.  The MODE leg is applied only when
  * policy.perms||policy.executability, and the recorded special bits
- * (setuid/setgid/sticky) are NOT applied to the real file -- exactly like
+ * (setuid/setgid/sticky) are NOT applied to the real entry -- exactly like
  * rsync's fake-super receiver, which stores the full mode in the xattr but
  * strips the special bits on disk.  mtime is not part of the record; the normal
  * metadata path carries it (policy.times) exactly as rsync sets the file's own

@@ -892,6 +892,114 @@ static void test_symlink_frame_carries_xattrs() {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+/* --fake-super for DIRECTORIES: rsync stores a directory's faked mode/uid/gid
+ * in `user.rsync.%stat` on the directory itself.  fake_super_store_fd() and
+ * fake_super_restore_fd() operate on a directory descriptor exactly like a
+ * file: the full mode (with S_IFDIR + special bits) is recorded, only the
+ * permission bits are replayed on disk, and the owner is never real-chowned.
+ * Guarded on filesystem xattr support. */
+static void test_fake_super_directory_fd_roundtrip() {
+  const char* root = "test_fake_super_dirfd_tmp";
+  const char* path = "test_fake_super_dirfd_tmp/subdir";
+  rmdir(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  if (setxattr(root, "user.fastsync-dirprobe", "p", 1, 0) != 0) {
+    rmdir(root);
+    return; /* skip silently when the filesystem has no xattr support */
+  }
+  removexattr(root, "user.fastsync-dirprobe");
+  EXPECT_EQ_INT(mkdir(path, 0755), 0);
+
+  int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  EXPECT_TRUE(fd >= 0);
+  FileAttrPolicy policy = {true, true, false, false, true};
+
+  /* No record yet: restore is a silent no-op on a directory too. */
+  EXPECT_FALSE(fake_super_restore_fd(fd, policy));
+
+  struct stat before;
+  EXPECT_EQ_INT(fstat(fd, &before), 0);
+  fake_super_store_fd(fd, 2222, 3333, S_IFDIR | 01777, 0, 0);
+  char value[64];
+  ssize_t got = fgetxattr(fd, FAKESUPER_XATTR, value, sizeof(value));
+  /* S_IFDIR | 01777 == 0041777 -> "41777 0,0 2222:3333" */
+  EXPECT_EQ_INT((int)got, 19);
+  EXPECT_TRUE(got == 19 && memcmp(value, "41777 0,0 2222:3333", 19) == 0);
+
+  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
+  struct stat after;
+  EXPECT_EQ_INT(fstat(fd, &after), 0);
+  /* The sticky bit is stored in the record but never installed on disk. */
+  EXPECT_EQ_INT((int)(after.st_mode & 07777), 0777);
+  EXPECT_EQ_INT((int)(after.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
+  EXPECT_EQ_INT((int)after.st_uid, (int)before.st_uid);
+  EXPECT_EQ_INT((int)after.st_gid, (int)before.st_gid);
+
+  close(fd);
+  removexattr(path, FAKESUPER_XATTR);
+  rmdir(path);
+  rmdir(root);
+}
+
+/* The deferred directory-metadata pass is where a recursive -a --fake-super
+ * transfer stamps each directory: dir_metadata_list_apply() must park the
+ * directory's full stat in the reserved xattr and replay only its permission
+ * bits on disk.  This is the recursive-path counterpart of the explicit
+ * --dirs store in file_save_directory_to_disk().  Guarded on xattr support. */
+static void test_fake_super_directory_deferred_apply() {
+  const char* root = "test_fake_super_dirdir_tmp";
+  const char* leaf = "subdir";
+  const char* path = "test_fake_super_dirdir_tmp/subdir";
+  rmdir(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  if (setxattr(root, "user.fastsync-dirprobe", "p", 1, 0) != 0) {
+    rmdir(root);
+    return; /* skip silently when the filesystem has no xattr support */
+  }
+  removexattr(root, "user.fastsync-dirprobe");
+  EXPECT_EQ_INT(mkdir(path, 0755), 0);
+
+  FileMetadata m;
+  memset(&m, 0, sizeof(m));
+  m.mode = S_IFDIR | 02751;
+  m.uid = 1001;
+  m.gid = 1002;
+  m.mtime_sec = 1234567890;
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->use_metadata = true;
+  config->preserve_perms = true;
+  config->preserve_times = true;
+  config->fake_super = true;
+
+  identity_clear_active();
+  DirTimeList list;
+  dir_time_list_init(&list);
+  EXPECT_TRUE(dir_time_list_add(&list, leaf, &m, NULL));
+  dir_metadata_list_apply(&list, root, config);
+  dir_time_list_free(&list);
+
+  char value[64];
+  ssize_t got = getxattr(path, FAKESUPER_XATTR, value, sizeof(value));
+  /* S_IFDIR | 02751 -> "42751 0,0 1001:1002" (resolved ids == source ids). */
+  EXPECT_EQ_INT((int)got, 19);
+  EXPECT_TRUE(got == 19 && memcmp(value, "42751 0,0 1001:1002", 19) == 0);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  /* Only the permission bits land on disk; setgid stays in the record. */
+  EXPECT_EQ_INT((int)(st.st_mode & 07777), 0751);
+  EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
+
+  config_delete(config);
+  removexattr(path, FAKESUPER_XATTR);
+  rmdir(path);
+  rmdir(root);
+}
+
 void test_xattr() {
   test_xattr_list_clone();
   test_xattr_capture_symlink_nofollow();
@@ -910,5 +1018,7 @@ void test_xattr() {
   test_fake_super_rsync_format();
   test_fake_super_no_real_chown();
   test_fake_super_storage_resolution();
+  test_fake_super_directory_fd_roundtrip();
+  test_fake_super_directory_deferred_apply();
   test_file_save_directory_applies_xattrs();
 }

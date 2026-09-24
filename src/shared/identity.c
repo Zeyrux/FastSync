@@ -276,7 +276,7 @@ static bool identity_wire_map_valid(const IdentityMap* map) {
   }
   if (map->to < IDENTITY_CURRENT)
     return false;
-  if (map->to_name && strlen(map->to_name) > 255)
+  if (map->to_name && strlen(map->to_name) > IDENTITY_MAX_NAME_LEN)
     return false;
   return true;
 }

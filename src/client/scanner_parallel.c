@@ -109,7 +109,7 @@ static void parallel_scanner_creation_failed(ParallelScanner* ps) {
 
 /* Initialize result queue and synchronization primitives. Returns true on success. */
 static bool parallel_scanner_init(ParallelScanner* ps) {
-  ps->result_queue = queue_create(100, chunk_destroy);
+  ps->result_queue = queue_create(SCANNER_RESULT_QUEUE_CAP, chunk_destroy);
   if (!ps->result_queue)
     return false;
   atomic_init(&ps->cancelled, false);
@@ -210,6 +210,157 @@ static Chunk* batch_files(ArrayList* files, unsigned long long chunk_size, Queue
   return first;
 }
 
+/* Record the delete-protection mirror of a root entry that
+ * scanner_inspect_entry() skipped (inspection == 0): a dereferenced symlink
+ * with no referent is a partial-transfer I/O error and a user-selection or size
+ * prune protects the entry's destination mirror. */
+static void scan_root_record_skipped(const ScannerOptions* options, const char* root_directory,
+                                     const char* name, const ScannerEntry* inspected,
+                                     ParallelScanner* ps) {
+  if (inspected->referent_error)
+    ps->io_error = true;
+  ArrayList* sink = NULL;
+  if (inspected->excluded)
+    sink = inspected->size_excluded ? options->size_skipped_paths : options->excluded_paths;
+  if (!sink)
+    return;
+  /* A root-level prune protects the destination mirror of the entry's wire
+     path: under -R + --files-from that is the bare relative name, otherwise it
+     is the full source path with a leading '/' removed (matching the
+     send_path/file_wire_path the scanner hands the sender). */
+  if (options->relative && options->file_list != NULL) {
+    if (!excluded_sink_append(sink, options->excluded_mutex, name))
+      ps->failed = true;
+  } else if (options->relative_prefix) {
+    char* wrel = scanner_prefix_send_path(options->relative_prefix, name);
+    if (!wrel) {
+      ps->failed = true;
+    } else {
+      if (!excluded_sink_append(sink, options->excluded_mutex, wrel))
+        ps->failed = true;
+      free(wrel);
+    }
+  } else {
+    char* abs_path = path_cat(root_directory, name);
+    if (!abs_path) {
+      ps->failed = true;
+    } else {
+      const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
+      if (!excluded_sink_append(sink, options->excluded_mutex, rel))
+        ps->failed = true;
+      free(abs_path);
+    }
+  }
+}
+
+/* Record the delete-protection mirror of a root entry dropped by the
+ * --files-from allow-set or a filter rule.  Returns false only when the -R
+ * prefix could not be built (the caller must abandon the entry immediately);
+ * other allocation failures mark the scan failed but let the caller continue to
+ * the filter-notice step, matching the historical inlined flow. */
+static bool scan_root_record_protection(const ScannerOptions* options, const char* rel,
+                                        const char* name, const char* cur_path, bool protect,
+                                        bool passes, bool use_rel, ParallelScanner* ps) {
+  if (passes && !protect)
+    return true;
+  /* --files-from subset pruning is not a filter exclusion; -R bare-wire-path
+     exclusions are never recorded (see ScannerOptions.excluded_paths). */
+  bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
+  if ((!files_from_prune && !use_rel) || protect) {
+    const char* rel_path;
+    char* prefixed = NULL;
+    if (use_rel) {
+      /* -R + --files-from: the destination/wire path is the bare relative
+         name, not the source path. */
+      rel_path = rel;
+    } else if (options->relative_prefix) {
+      prefixed = scanner_prefix_send_path(options->relative_prefix, name);
+      if (!prefixed)
+        return false;
+      rel_path = prefixed;
+    } else {
+      rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
+    }
+    if (options->excluded_paths &&
+        !excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
+      ps->failed = true;
+    free(prefixed);
+  }
+  return true;
+}
+
+/* Root-level directory node: apply -x/--one-file-system and either emit the
+ * mount-point directory (plain -x) or queue the directory for a worker. */
+static void scan_root_dir(const ScannerOptions* options, const char* cur_path, const char* rel,
+                          const struct stat* st, ArrayList* root_files, ArrayList* subdirs,
+                          dev_t root_dev, ParallelScanner* ps) {
+  if (!scanner_same_filesystem(options->one_file_system, root_dev, st->st_dev)) {
+    if (options->one_file_system > 1) {
+      /* -xx: drop the mount-point directory entirely (rsync) and print the
+         --info=mount line when enabled. */
+      scanner_note_mount(options, cur_path);
+      return;
+    }
+    /* -x/--one-file-system: emit the mount-point directory entry (empty) but do
+       not descend into it (see the sequential scanner for the same rule). */
+    File* mount = scanner_build_dir_file(cur_path, st, options);
+    if (!mount) {
+      ps->failed = true;
+      return;
+    }
+    if (options->relative_prefix) {
+      mount->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
+      if (!mount->send_path) {
+        file_destroy(mount);
+        ps->failed = true;
+        return;
+      }
+    }
+    if (!array_list_add(root_files, mount)) {
+      file_destroy(mount);
+      ps->failed = true;
+    }
+    return;
+  }
+  char* dir = str_dup(cur_path);
+  if (!dir || !array_list_add(subdirs, dir)) {
+    free(dir);
+    ps->failed = true;
+  }
+}
+
+/* Build a non-directory root entry through the shared construction path and add
+ * it to `root_files`.  A non-regular entry the options do not preserve is
+ * dropped by the builder (which prints rsync's nonreg line); an allocation
+ * failure marks the scan failed. */
+static void scan_root_add_non_dir(const ScannerOptions* options, ScannerEntry* inspected,
+                                  const char* rel, ArrayList* root_files, ParallelScanner* ps) {
+  File* file = NULL;
+  bool failed = false;
+  ScannerBuildStatus status = scanner_build_file_entry(options, inspected, rel, &file, &failed);
+  if (failed || status == SCANNER_BUILD_FAIL_CONTINUE || status == SCANNER_BUILD_FAIL_BREAK)
+    ps->failed = true;
+  if (status != SCANNER_BUILD_OK)
+    return;
+  if (!array_list_add(root_files, file)) {
+    file_destroy(file);
+    ps->failed = true;
+  }
+}
+
+/* Regular file or carried symlink at the transfer root. */
+static void scan_root_file(const ScannerOptions* options, ScannerEntry* inspected, const char* rel,
+                           ArrayList* root_files, ParallelScanner* ps) {
+  scan_root_add_non_dir(options, inspected, rel, root_files, ps);
+}
+
+/* Device/FIFO/socket at the transfer root: recreated under --devices/--specials,
+ * otherwise dropped by the shared builder. */
+static void scan_root_special(const ScannerOptions* options, ScannerEntry* inspected,
+                              const char* rel, ArrayList* root_files, ParallelScanner* ps) {
+  scan_root_add_non_dir(options, inspected, rel, root_files, ps);
+}
+
 /* Scan one root-directory entry into either the subdirs or files list. */
 static void scan_root_entry(const ScannerOptions* options, const FilterNode* root_node,
                             const char* root_directory, const struct dirent* entry,
@@ -223,51 +374,16 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     return;
   }
   if (inspection == 0) {
-    if (inspected.referent_error)
-      ps->io_error = true;
-    ArrayList* sink = NULL;
-    if (inspected.excluded)
-      sink = inspected.size_excluded ? options->size_skipped_paths : options->excluded_paths;
-    if (sink) {
-      /* A root-level prune protects the destination mirror of the entry's wire
-         path: under -R + --files-from that is the bare relative name, otherwise
-         it is the full source path with a leading '/' removed (matching the
-         send_path/file_wire_path the scanner hands the sender). */
-      if (options->relative && options->file_list != NULL) {
-        if (!excluded_sink_append(sink, options->excluded_mutex, entry->d_name))
-          ps->failed = true;
-      } else if (options->relative_prefix) {
-        char* wrel = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
-        if (!wrel) {
-          ps->failed = true;
-        } else {
-          if (!excluded_sink_append(sink, options->excluded_mutex, wrel))
-            ps->failed = true;
-          free(wrel);
-        }
-      } else {
-        char* abs_path = path_cat(root_directory, entry->d_name);
-        if (!abs_path) {
-          ps->failed = true;
-        } else {
-          const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
-          if (!excluded_sink_append(sink, options->excluded_mutex, rel))
-            ps->failed = true;
-          free(abs_path);
-        }
-      }
-    }
+    scan_root_record_skipped(options, root_directory, entry->d_name, &inspected, ps);
     return;
   }
   char* cur_path = inspected.path;
-  struct stat st = inspected.stats;
-  bool is_dir = inspected.is_directory;
   char* rel = str_dup(entry->d_name);
   if (!rel) {
-    free(cur_path);
     ps->failed = true;
-    return;
+    goto done;
   }
+  bool is_dir = inspected.is_directory;
   bool protect = false;
   bool passes = entry_passes_selection(options->file_list, options->base_filters, root_node, rel,
                                        entry->d_name, is_dir, options->per_dir_filters,
@@ -275,169 +391,28 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   /* -R + --files-from: root-level files keep their bare relative send path. */
   bool use_rel = options->relative && options->file_list != NULL;
   if (!passes || protect) {
-    /* --files-from subset pruning is not a filter exclusion; -R bare-wire-path
-       exclusions are never recorded (see ScannerOptions.excluded_paths). */
-    bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
-    if ((!files_from_prune && !use_rel) || protect) {
-      const char* rel_path;
-      char* prefixed = NULL;
-      if (use_rel) {
-        /* -R + --files-from: the destination/wire path is the bare relative
-           name, not the source path. */
-        rel_path = rel;
-      } else if (options->relative_prefix) {
-        prefixed = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
-        if (!prefixed) {
-          free(rel);
-          free(cur_path);
-          ps->failed = true;
-          return;
-        }
-        rel_path = prefixed;
-      } else {
-        rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
-      }
-      if (options->excluded_paths &&
-          !excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
-        ps->failed = true;
-      free(prefixed);
+    if (!scan_root_record_protection(options, rel, entry->d_name, cur_path, protect, passes,
+                                     use_rel, ps)) {
+      ps->failed = true;
+      goto done;
     }
     if (!passes) {
       scanner_note_filter(options, entry->d_name);
-      free(rel);
-      free(cur_path);
-      return;
+      goto done;
     }
   }
   if (is_dir) {
-    if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
-      if (options->one_file_system > 1) {
-        /* -xx: drop the mount-point directory entirely (rsync) and print the
-           --info=mount line when enabled. */
-        scanner_note_mount(options, cur_path);
-        free(rel);
-        free(cur_path);
-        return;
-      }
-      /* -x/--one-file-system: emit the mount-point directory entry (empty) but
-         do not descend into it (see the sequential scanner for the same rule). */
-      File* mount = file_create(cur_path);
-      free(cur_path);
-      if (mount == NULL) {
-        free(rel);
-        ps->failed = true;
-        return;
-      }
-      mount->is_dir = true;
-      if (options->use_metadata) {
-        mount->metadata = file_metadata_create(mount->path, &st, options->preserve_atimes,
-                                               options->preserve_crtimes);
-        if (!mount->metadata) {
-          free(rel);
-          file_destroy(mount);
-          ps->failed = true;
-          return;
-        }
-      }
-      if (options->relative_prefix) {
-        mount->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
-        if (!mount->send_path) {
-          free(rel);
-          file_destroy(mount);
-          ps->failed = true;
-          return;
-        }
-      }
-      free(rel);
-      if (!array_list_add(root_files, mount)) {
-        file_destroy(mount);
-        ps->failed = true;
-      }
-      return;
-    }
-    free(rel);
-    if (!array_list_add(subdirs, cur_path)) {
-      free(cur_path);
-      ps->failed = true;
-    }
-    return;
-  }
-  File* file = file_create(cur_path);
-  free(cur_path);
-  if (!file) {
-    free(rel);
-    free(inspected.link_target);
-    inspected.link_target = NULL;
-    ps->failed = true;
-    return;
-  }
-  if (inspected.is_symlink) {
-    file->is_symlink = true;
-    file->symlink_target = inspected.link_target;
-    inspected.link_target = NULL;
+    scan_root_dir(options, cur_path, rel, &inspected.stats, root_files, subdirs, root_dev, ps);
+  } else if (S_ISCHR(inspected.stats.st_mode) || S_ISBLK(inspected.stats.st_mode) ||
+             S_ISFIFO(inspected.stats.st_mode) || S_ISSOCK(inspected.stats.st_mode)) {
+    scan_root_special(options, &inspected, rel, root_files, ps);
   } else {
-    file->data->size = st.st_size;
+    scan_root_file(options, &inspected, rel, root_files, ps);
   }
-  if (use_rel) {
-    file->send_path = rel;
-    rel = NULL;
-  } else if (options->relative_prefix) {
-    file->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
-    free(rel);
-    rel = NULL;
-    if (!file->send_path) {
-      file_destroy(file);
-      ps->failed = true;
-      return;
-    }
-  }
-  ScannerSpecial special = scanner_prepare_special(
-      options->preserve_devices, options->preserve_specials, options->copy_devices, file, &st);
-  if (special == SCANNER_SPECIAL_SKIP) {
-    scanner_note_nonreg(ps->options, file->path);
-    free(rel);
-    file_destroy(file);
-    return;
-  }
-  if (options->hardlinks && S_ISREG(st.st_mode)) {
-    int gid;
-    bool is_first;
-    char* first_path = NULL;
-    if (!hardlink_table_assign((HardLinkTable*)options->hardlinks, file_wire_path(file), st.st_dev,
-                               st.st_ino, &gid, &is_first, &first_path)) {
-      ps->failed = true;
-    } else {
-      file->link_group = gid;
-      file->link_first = is_first;
-      if (!is_first) {
-        file->hardlink_target = first_path;
-        file->data->size = 0;
-      } else {
-        free(first_path);
-      }
-    }
-  }
-  if (options->use_metadata)
-    file->metadata =
-        file_metadata_create(file->path, &st, options->preserve_atimes, options->preserve_crtimes);
-  if (options->use_metadata && !file->metadata) {
-    free(rel);
-    file_destroy(file);
-    ps->failed = true;
-    return;
-  }
-  if ((options->preserve_xattrs || options->preserve_acls) &&
-      !(file->link_group != 0 && !file->link_first))
-    file->xattrs = file->is_symlink
-                       ? xattr_capture_path_nofollow(file->path, options->preserve_acls)
-                       : xattr_capture_path(file->path, options->preserve_acls);
-  if (!array_list_add(root_files, file)) {
-    free(rel);
-    file_destroy(file);
-    ps->failed = true;
-    return;
-  }
+done:
   free(rel);
+  free(cur_path);
+  free(inspected.link_target);
 }
 
 /* Scan the root directory itself, collecting root files and subdirectories.
