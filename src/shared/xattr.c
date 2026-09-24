@@ -450,7 +450,7 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, uint
   if (len <= 0 || (size_t)len >= sizeof(record))
     return;
   if (fsetxattr(fd, FAKESUPER_XATTR, record, (size_t)len, 0) != 0) {
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not store %s on destination file: %s",
+    log_message(LOG_LEVEL_WARNING, "--fake-super: could not store %s on destination entry: %s",
                 FAKESUPER_XATTR, strerror(errno));
   }
 }
@@ -550,7 +550,7 @@ bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
     } else if (metadata_mode_for_policy((mode_t)(ul_mode & 0777U), cur.st_mode, policy, &want)) {
       if (fchmod(fd, want) != 0)
         log_message(LOG_LEVEL_WARNING,
-                    "--fake-super: could not restore mode on destination file: %s",
+                    "--fake-super: could not restore mode on destination entry: %s",
                     strerror(errno));
     }
   }

@@ -7043,6 +7043,72 @@ class TestExtendedAttributes:
         )
 
     @pytest.mark.ci
+    def test_fake_super_directory_rsync_interop(self, shared_server):
+        """#319: --fake-super fakes DIRECTORIES too.  A recursive -a
+        --fake-super run must write rsync 3.4.1's `user.rsync.%stat` record on
+        the directory itself (full mode with S_IFDIR + special bits, rdev 0,0,
+        uid:gid), replay only the permission bits on disk, and real rsync must
+        read the tree and re-emit the identical record."""
+        rsync = shutil.which("rsync")
+        if rsync is None:
+            pytest.skip("rsync not installed")
+        source, dest = self._source_and_dest("fakesuper_dir_interop")
+        sub = os.path.join(source, "subdir")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "f.txt"), "wb") as fh:
+            fh.write(b"dir interop\n")
+        if not _xattr_supported(sub):
+            pytest.skip("filesystem does not support user xattrs")
+        # A special bit (setgid) is exactly what a fake-super record exists to
+        # carry: rsync only re-emits a directory record when there is something
+        # it cannot represent on disk (a special bit, or a mode it would widen
+        # to keep the owner's rwx).  Skip cleanly when the filesystem drops it.
+        os.chmod(sub, 0o2751)
+        if stat.S_IMODE(os.stat(sub).st_mode) & 0o7000 == 0:
+            pytest.skip("filesystem drops directory special bits")
+        uid = os.stat(sub).st_uid
+
+        result, _ = run_client(source, dest, flags=["-a", "--fake-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-a --fake-super dir sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        dst_sub = os.path.join(received, "subdir")
+        assert os.path.isdir(dst_sub), "the directory entry was not transferred"
+
+        rec = os.getxattr(dst_sub, "user.rsync.%stat").decode()
+        fields = rec.split()
+        assert len(fields) == 3, f"unexpected rsync fake-super record {rec!r}"
+        mode_field, rdev_field, owner_field = fields
+        assert rdev_field == "0,0", f"directory rdev must be 0,0, got {rdev_field!r}"
+        assert int(mode_field, 8) & 0o170000 == stat.S_IFDIR, (
+            f"recorded mode {mode_field!r} must carry S_IFDIR"
+        )
+        assert int(mode_field, 8) & 0o7777 == 0o2751, (
+            f"recorded mode {mode_field!r} must carry the full source mode 02751"
+        )
+        assert owner_field.split(":")[0] == str(uid), \
+            f"recorded uid {owner_field!r} != source uid {uid}"
+        # Permission bits only on disk: the setgid bit stays in the record.
+        assert stat.S_IMODE(os.stat(dst_sub).st_mode) == 0o751, (
+            "the directory's special bits must not be installed on disk"
+        )
+
+        # Real rsync reads FastSync's directory record and re-emits it verbatim.
+        out = os.path.join(TEST_DATA_DIR, "fakesuper_dir_interop_rsync")
+        clean_dir(out)
+        rs = subprocess.run([rsync, "-aX", "--fake-super", received + "/", out + "/"],
+                            capture_output=True, text=True, timeout=120)
+        assert rs.returncode == 0, (
+            f"rsync could not read FastSync's fake-super directory tree: {rs.stderr[:300]}"
+        )
+        out_rec = os.getxattr(os.path.join(out, "subdir"), "user.rsync.%stat").decode()
+        assert out_rec == rec, (
+            "rsync re-emitted a different directory fake-super record; FastSync's "
+            f"grammar is not interoperable: ours={rec!r} rsync={out_rec!r}"
+        )
+
+    @pytest.mark.ci
     def test_directory_xattrs_preserved(self, shared_server):
         """#286.3: -aX must preserve user.* xattrs on DIRECTORIES, not just files."""
         source, dest = self._source_and_dest("dirxattr")
