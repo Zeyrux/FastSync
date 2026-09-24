@@ -47,285 +47,230 @@ bool receive_file_xattrs(File* file, int fd, const Config* config) {
 static bool receive_file_payload_into(File* file, int fd, const Config* config,
                                       const char* dest_path, unsigned long long expected_size);
 
+/* Receive a STATUS_DELTA_DATA response: the sender's delta against the basis we
+   signed.  Deserializes, decompresses and applies the delta (in memory or
+   through a spool temp file), then receives the metadata/xattr block and
+   installs the reconstructed payload.  Takes ownership of `old_data` and `sig`,
+   releasing both on every path. */
+static File* receive_delta_data_branch(int fd, const Config* config, const char* check_path,
+                                       void* old_data, unsigned long long old_size, int basis_fd,
+                                       DeltaSignature* sig, bool* failed) {
+  Data* raw_delta = NULL;
+  Delta* delta = NULL;
+  void* new_data = NULL;
+  char* spool = NULL;
+  File* file = NULL;
+
+  raw_delta = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
+  if (!raw_delta)
+    goto fail;
+
+  if (config->use_compression &&
+      !compression_should_skip_with_suffixes(check_path, config->skip_compress_suffixes,
+                                             config->skip_compress_set ? config->skip_compress_count
+                                                                       : -1)) {
+    ProtocolSession* owner = raw_delta->owner;
+    Data* decompressed = data_decompress_limited(raw_delta, MAX_RECEIVE_WHOLE_FILE_SIZE);
+    data_destroy(raw_delta);
+    raw_delta = decompressed;
+    if (!raw_delta)
+      goto fail;
+    /* Charge the decompressed delta to the connection budget (the paired
+       wire buffer's charge was just released). */
+    if (!data_charge_session(raw_delta, owner, raw_delta->size))
+      goto fail;
+  }
+
+  delta = delta_deserialize(raw_delta);
+  data_destroy(raw_delta);
+  raw_delta = NULL;
+  if (!delta)
+    goto fail;
+
+  uint64_t new_size = delta->new_file_size;
+  if (new_size > SIZE_MAX) {
+    send_status(fd, STATUS_ERROR);
+    goto fail;
+  }
+  /* Wire-stats tally: bytes taken straight from the basis file (matched
+     delta blocks) and bytes shipped literally (protocol 2.28.0).  Computed
+     before the delta is destroyed. */
+  unsigned long long matched = 0;
+  unsigned long long literal = 0;
+  for (uint32_t k = 0; k < delta->instruction_count; k++) {
+    if (delta->instructions[k].type == DELTA_INSTR_BLOCK_MATCH)
+      matched += delta->instructions[k].match.length;
+    else if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+      literal += delta->instructions[k].literal.length;
+  }
+
+  /* A reconstructed file above the streaming bound is written into a spool
+     temp file through delta_apply_to_fd; a smaller one keeps the historical
+     in-memory reconstruction. */
+  if (new_size > protocol_whole_file_receive_limit()) {
+    char* dest_path = path_cat(config->receive_root_directory, check_path);
+    int spool_fd = dest_path ? file_spool_for_payload(dest_path, &spool) : -1;
+    free(dest_path);
+    if (spool_fd < 0) {
+      send_status(fd, STATUS_ERROR);
+      goto fail;
+    }
+    bool applied =
+        delta_apply_to_fd(old_data, basis_fd, old_size, delta, config->delta_block_size, spool_fd);
+    if (close(spool_fd) != 0)
+      applied = false;
+    delta_destroy(delta);
+    delta = NULL;
+    if (!applied) {
+      send_status(fd, STATUS_ERROR);
+      goto fail;
+    }
+  } else {
+    new_data = old_data ? delta_apply(old_data, old_size, delta, config->delta_block_size)
+                        : delta_apply_fd(basis_fd, old_size, delta, config->delta_block_size);
+    delta_destroy(delta);
+    delta = NULL;
+    if (!new_data)
+      goto fail;
+  }
+
+  file = file_create(check_path);
+  if (!file)
+    goto fail;
+  file->matched_bytes = matched;
+  file->literal_bytes = literal;
+
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok)
+      goto fail;
+  }
+  if (!receive_file_xattrs(file, fd, config))
+    goto fail;
+
+  if (spool) {
+    Data* reserved = data_create_reserve((size_t)new_size);
+    if (reserved == NULL) {
+      send_status(fd, STATUS_ERROR);
+      goto fail;
+    }
+    data_destroy(file->data);
+    file->data = reserved;
+    file->basis_copy = spool;
+    spool = NULL; /* ownership moved into file->basis_copy */
+    file->data_spool = true;
+  } else {
+    Data* replacement = data_create(new_data, (size_t)new_size);
+    new_data = NULL; /* data_create owns, and frees, the buffer on failure */
+    if (replacement == NULL) {
+      send_status(fd, STATUS_ERROR);
+      goto fail;
+    }
+    data_destroy(file->data);
+    file->data = replacement;
+  }
+
+  free(old_data);
+  delta_signature_destroy(sig);
+  return file;
+
+fail:
+  free(new_data);
+  if (spool) {
+    unlink(spool);
+    free(spool);
+  }
+  file_destroy(file);
+  delta_destroy(delta);
+  data_destroy(raw_delta);
+  free(old_data);
+  delta_signature_destroy(sig);
+  *failed = true;
+  return NULL;
+}
+
+/* Receive a STATUS_NEXT response: the sender declined the delta and will send
+   the whole file.  Releases the basis signature and snapshot, then receives the
+   metadata/xattr block and the full payload.  Takes ownership of `old_data` and
+   `sig`, releasing both immediately. */
+static File* receive_next_branch(int fd, const Config* config, const char* check_path,
+                                 unsigned long long expected_size, void* old_data,
+                                 DeltaSignature* sig, bool* failed) {
+  delta_signature_destroy(sig);
+  free(old_data);
+
+  File* file = file_create(check_path);
+  if (!file)
+    goto fail;
+
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok)
+      goto fail;
+  }
+  if (!receive_file_xattrs(file, fd, config))
+    goto fail;
+
+  char* dest_path = path_cat(config->receive_root_directory, check_path);
+  if (!dest_path)
+    goto fail;
+  bool payload_ok = receive_file_payload_into(file, fd, config, dest_path, expected_size);
+  free(dest_path);
+  if (!payload_ok)
+    goto fail;
+  return file;
+
+fail:
+  file_destroy(file);
+  *failed = true;
+  return NULL;
+}
+
+/* Delta handshake dispatcher: sign the basis, ship the signature, then hand the
+   response off to the matching branch helper.  Takes ownership of `old_data`
+   (and, once created, `sig`); sets `*failed` on every error path. */
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
                                 void* old_data, unsigned long long old_size,
                                 unsigned long long expected_size, int basis_fd, bool* failed) {
-  if (!old_data && basis_fd < 0) {
-    free(old_data); /* defensive: a basis source is always provided today */
-    *failed = true;
-    return NULL;
-  }
-
   /* The basis is either an in-memory snapshot (the destination file, bounded) or
    * a confined descriptor (a --fuzzy sibling, possibly larger than memory) that
    * is signed/applied in bounded chunks. */
+  Data* sig_data = NULL;
+  Status resp = STATUS_ERROR;
+  bool sig_sent = false;
   DeltaSignature* sig =
       old_data ? delta_signature_create_seeded(old_data, old_size, config->delta_block_size,
                                                (uint32_t)config->checksum_seed)
                : delta_signature_create_fd_seeded(basis_fd, old_size, config->delta_block_size,
                                                   (uint32_t)config->checksum_seed);
-  if (!sig) {
-    free(old_data);
-    *failed = true;
-    return NULL;
-  }
+  if (!sig)
+    goto fail;
 
-  Data* sig_data = delta_signature_serialize(sig);
-  if (!sig_data) {
-    delta_signature_destroy(sig);
-    free(old_data);
-    *failed = true;
-    return NULL;
-  }
+  sig_data = delta_signature_serialize(sig);
+  if (!sig_data)
+    goto fail;
 
-  bool sig_sent = send_status(fd, STATUS_DELTA_SIGNATURE) && send_data(fd, sig_data);
+  sig_sent = send_status(fd, STATUS_DELTA_SIGNATURE) && send_data(fd, sig_data);
   data_destroy(sig_data);
+  sig_data = NULL;
 
-  if (!sig_sent) {
-    delta_signature_destroy(sig);
-    free(old_data);
-    *failed = true;
-    return NULL;
-  }
+  if (!sig_sent || !receive_status(fd, &resp))
+    goto fail;
 
-  Status resp;
-  if (!receive_status(fd, &resp)) {
-    delta_signature_destroy(sig);
-    free(old_data);
-    *failed = true;
-    return NULL;
-  }
+  if (resp == STATUS_DELTA_DATA)
+    return receive_delta_data_branch(fd, config, check_path, old_data, old_size, basis_fd, sig,
+                                     failed);
 
-  if (resp == STATUS_DELTA_DATA) {
-    Data* delta_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
-    if (!delta_data) {
-      delta_signature_destroy(sig);
-      free(old_data);
-      *failed = true;
-      return NULL;
-    }
+  if (resp == STATUS_NEXT)
+    return receive_next_branch(fd, config, check_path, expected_size, old_data, sig, failed);
 
-    Data* raw_delta = delta_data;
-    if (config->use_compression &&
-        !compression_should_skip_with_suffixes(
-            check_path, config->skip_compress_suffixes,
-            config->skip_compress_set ? config->skip_compress_count : -1)) {
-      ProtocolSession* owner = delta_data->owner;
-      raw_delta = data_decompress_limited(delta_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
-      data_destroy(delta_data);
-      if (!raw_delta) {
-        free(old_data);
-        delta_signature_destroy(sig);
-        *failed = true;
-        return NULL;
-      }
-      /* Charge the decompressed delta to the connection budget (the paired
-         wire buffer's charge was just released). */
-      if (!data_charge_session(raw_delta, owner, raw_delta->size)) {
-        data_destroy(raw_delta);
-        free(old_data);
-        delta_signature_destroy(sig);
-        *failed = true;
-        return NULL;
-      }
-    }
-
-    Delta* delta = delta_deserialize(raw_delta);
-    data_destroy(raw_delta);
-    if (!delta) {
-      free(old_data);
-      delta_signature_destroy(sig);
-      *failed = true;
-      return NULL;
-    }
-
-    uint64_t new_size = delta->new_file_size;
-    if (new_size > SIZE_MAX) {
-      delta_destroy(delta);
-      free(old_data);
-      delta_signature_destroy(sig);
-      send_status(fd, STATUS_ERROR);
-      *failed = true;
-      return NULL;
-    }
-    /* Wire-stats tally: bytes taken straight from the basis file (matched
-       delta blocks) and bytes shipped literally (protocol 2.28.0).  Computed
-       before the delta is destroyed. */
-    unsigned long long matched = 0;
-    unsigned long long literal = 0;
-    for (uint32_t k = 0; k < delta->instruction_count; k++) {
-      if (delta->instructions[k].type == DELTA_INSTR_BLOCK_MATCH)
-        matched += delta->instructions[k].match.length;
-      else if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
-        literal += delta->instructions[k].literal.length;
-    }
-
-    /* A reconstructed file above the streaming bound is written into a spool
-       temp file through delta_apply_to_fd; a smaller one keeps the historical
-       in-memory reconstruction. */
-    void* new_data = NULL;
-    char* spool = NULL;
-    if (new_size > protocol_whole_file_receive_limit()) {
-      char* dest_path = path_cat(config->receive_root_directory, check_path);
-      int spool_fd = dest_path ? file_spool_for_payload(dest_path, &spool) : -1;
-      free(dest_path);
-      if (spool_fd < 0) {
-        delta_destroy(delta);
-        free(old_data);
-        delta_signature_destroy(sig);
-        send_status(fd, STATUS_ERROR);
-        *failed = true;
-        return NULL;
-      }
-      bool applied = delta_apply_to_fd(old_data, basis_fd, old_size, delta,
-                                       config->delta_block_size, spool_fd);
-      if (close(spool_fd) != 0)
-        applied = false;
-      delta_destroy(delta);
-      if (!applied) {
-        unlink(spool);
-        free(spool);
-        free(old_data);
-        delta_signature_destroy(sig);
-        send_status(fd, STATUS_ERROR);
-        *failed = true;
-        return NULL;
-      }
-    } else {
-      new_data = old_data ? delta_apply(old_data, old_size, delta, config->delta_block_size)
-                          : delta_apply_fd(basis_fd, old_size, delta, config->delta_block_size);
-      delta_destroy(delta);
-      if (!new_data) {
-        free(old_data);
-        delta_signature_destroy(sig);
-        *failed = true;
-        return NULL;
-      }
-    }
-
-    File* file = file_create(check_path);
-    if (!file) {
-      free(new_data);
-      if (spool) {
-        unlink(spool);
-        free(spool);
-      }
-      free(old_data);
-      delta_signature_destroy(sig);
-      *failed = true;
-      return NULL;
-    }
-    file->matched_bytes = matched;
-    file->literal_bytes = literal;
-
-    if (config->use_metadata) {
-      int meta_ok = 1;
-      file->metadata = metadata_receive(fd, &meta_ok);
-      if (!meta_ok) {
-        file_destroy(file);
-        free(new_data);
-        if (spool) {
-          unlink(spool);
-          free(spool);
-        }
-        free(old_data);
-        delta_signature_destroy(sig);
-        *failed = true;
-        return NULL;
-      }
-    }
-    if (!receive_file_xattrs(file, fd, config)) {
-      file_destroy(file);
-      free(new_data);
-      if (spool) {
-        unlink(spool);
-        free(spool);
-      }
-      free(old_data);
-      delta_signature_destroy(sig);
-      *failed = true;
-      return NULL;
-    }
-
-    if (spool) {
-      Data* reserved = data_create_reserve((size_t)new_size);
-      if (reserved == NULL) {
-        unlink(spool);
-        free(spool);
-        file_destroy(file);
-        free(old_data);
-        delta_signature_destroy(sig);
-        send_status(fd, STATUS_ERROR);
-        *failed = true;
-        return NULL;
-      }
-      data_destroy(file->data);
-      file->data = reserved;
-      file->basis_copy = spool;
-      file->data_spool = true;
-    } else {
-      Data* replacement = data_create(new_data, (size_t)new_size);
-      if (replacement == NULL) {
-        file_destroy(file);
-        free(old_data);
-        delta_signature_destroy(sig);
-        send_status(fd, STATUS_ERROR);
-        *failed = true;
-        return NULL;
-      }
-      data_destroy(file->data);
-      file->data = replacement;
-    }
-
-    free(old_data);
-    delta_signature_destroy(sig);
-    return file;
-  }
-
-  if (resp == STATUS_NEXT) {
-    delta_signature_destroy(sig);
-    free(old_data);
-
-    File* file = file_create(check_path);
-    if (!file) {
-      *failed = true;
-      return NULL;
-    }
-
-    if (config->use_metadata) {
-      int meta_ok = 1;
-      file->metadata = metadata_receive(fd, &meta_ok);
-      if (!meta_ok) {
-        file_destroy(file);
-        *failed = true;
-        return NULL;
-      }
-    }
-    if (!receive_file_xattrs(file, fd, config)) {
-      file_destroy(file);
-      *failed = true;
-      return NULL;
-    }
-
-    char* dest_path = path_cat(config->receive_root_directory, check_path);
-    if (!dest_path) {
-      file_destroy(file);
-      *failed = true;
-      return NULL;
-    }
-    bool payload_ok = receive_file_payload_into(file, fd, config, dest_path, expected_size);
-    free(dest_path);
-    if (!payload_ok) {
-      file_destroy(file);
-      *failed = true;
-      return NULL;
-    }
-    return file;
-  }
-
+  send_status(fd, STATUS_ERROR);
+fail:
+  data_destroy(sig_data);
   delta_signature_destroy(sig);
   free(old_data);
-  send_status(fd, STATUS_ERROR);
   *failed = true;
   return NULL;
 }
