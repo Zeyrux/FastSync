@@ -13,6 +13,7 @@
 #include "delta.h"
 #include "format.h"
 #include "log.h"
+#include "protocol.h"
 #include "scanner.h"
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -91,6 +92,20 @@ void client_messages_end(void);
 /* client_send.c */
 void receive_daemon_motd(Client* client, const Config* config);
 Client* connect_transfer_client(const Config* config);
+/* Connect the configured transport and install `session` on it: init with the
+ * socket fd pair, apply the I/O timeout and (when negotiated) the TLS object,
+ * then bind the session to this thread.  Returns the connected client, or NULL
+ * after logging the connect failure.  The caller owns the client and must keep
+ * `session` alive until it calls protocol_session_unbind(). */
+Client* client_connect_and_bind_session(const Config* config, ProtocolSession* session);
+/* Shared --files-from/--delete-missing-args preamble for the send entry points:
+ * when --delete-missing-args is set, allocate the list that
+ * files_from_list_check fills with the destination mirrors of missing entries;
+ * then validate the --files-from list.  On success returns true and stores the
+ * (possibly NULL) owned list in *missing_args_out plus the skipped count; on
+ * failure returns false after freeing the list. */
+bool client_prepare_files_from(const Config* config, ArrayList** missing_args_out,
+                               int* skipped_out);
 void disconnect_transfer_client(Client* client);
 int incremental_check(Client* client, File* file, const Config* config, DeltaSignature** out_sig,
                       unsigned long long* resume_offset);

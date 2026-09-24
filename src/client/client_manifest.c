@@ -64,16 +64,8 @@ bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
 int send_dry_run_manifest(const Config* config) {
   int skipped = 0;
   ArrayList* missing_dest = NULL;
-  if (config->delete_missing_args) {
-    missing_dest = array_list_create(free);
-    if (!missing_dest)
-      return -1;
-  }
-  if (!files_from_list_check(config, missing_dest, &skipped)) {
-    if (missing_dest)
-      array_list_delete(missing_dest);
+  if (!client_prepare_files_from(config, &missing_dest, &skipped))
     return -1;
-  }
   PreparedScanner prepared;
   if (!prepare_scanner(config, 0, &prepared)) {
     if (missing_dest)
@@ -466,33 +458,18 @@ bool send_delete_manifest_early(Client* client, ArrayList* manifest, ArrayList* 
 int send_dry_run_remote(Config* config) {
   int from_skipped = 0;
   ArrayList* missing_args = NULL;
-  if (config->delete_missing_args) {
-    missing_args = array_list_create(free);
-    if (!missing_args)
-      return 1;
-  }
-  if (!files_from_list_check(config, missing_args, &from_skipped)) {
-    if (missing_args)
-      array_list_delete(missing_args);
+  if (!client_prepare_files_from(config, &missing_args, &from_skipped))
     return 1;
-  }
   if (missing_args)
     array_list_delete(missing_args);
   /* A live session may follow, so arm graceful abort handling. */
   client_set_abort_armed(true);
-  Client* client = connect_transfer_client(config);
+  ProtocolSession session;
+  Client* client = client_connect_and_bind_session(config, &session);
   if (!client) {
-    if (config->transport == TRANSPORT_TCP)
-      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
-                  config->use_tls ? " via TLS" : "");
     client_set_abort_armed(false);
     return 1;
   }
-  ProtocolSession session;
-  protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
-  protocol_session_set_io_timeout(&session, config->timeout);
-  protocol_session_set_ssl(&session, (SSL*)client->ssl);
-  protocol_session_bind(&session);
 
   int ret = 1;
   bool partial = false;
