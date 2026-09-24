@@ -227,6 +227,166 @@ static void prefixed_delete_observer(void* context, const char* rel, DeleteEntry
    --max-delete budget: once it is exhausted the remaining requests are skipped
    and counted.  Returns false only on a genuine error (a confinement failure on
    a validated path or an I/O error), which fails the run. */
+
+/* How one missing-args request leaves the driver loop.  The original walker
+   `continue`s past an invalid/protected/absent/budget-skipped request (without
+   breaking) but stops after a request that ran to completion while an error is
+   pending; NEXT/STOP preserve that control flow exactly. */
+typedef enum { MISSING_ARG_NEXT, MISSING_ARG_STOP } MissingArgStep;
+
+/* Remove a NON-empty missing-args directory recursively (--delete/--force in
+   effect): walk its contents through the budgeted extras walker so every removed
+   file/dir counts toward --max-delete (rsync parity), then remove the now-empty
+   directory itself, which costs one more budget unit.  A run that hits the cap
+   leaves the remaining entries in place.  The observer is wrapped so the nested
+   walk reports receive-root-relative paths.  Sets the *removed and *ok outputs. */
+static void delete_nonempty_missing_dir(const char* full, const char* rel,
+                                        DeleteBudgetState* budget, DeletePathObserver observer,
+                                        void* observer_context, bool* removed, bool* ok) {
+  ArrayList* no_keeps = array_list_create(free);
+  /* Never let an accounting slip (deleted > max_delete) underflow the remaining
+     budget into SIZE_MAX, which would grant unlimited deletions. */
+  size_t remaining =
+      budget->deleted >= budget->max_delete ? 0 : budget->max_delete - budget->deleted;
+  size_t contents_deleted = 0;
+  size_t contents_skipped = 0;
+  PrefixedDeleteObserver nested = {observer, observer_context, rel};
+  DeleteWalkResult walk =
+      no_keeps ? delete_extras_limited_observed(full, no_keeps, NULL, remaining, NULL, 0, NULL,
+                                                &contents_deleted, &contents_skipped,
+                                                observer ? prefixed_delete_observer : NULL,
+                                                observer ? &nested : NULL)
+               : DELETE_WALK_ERROR;
+  if (no_keeps)
+    array_list_delete(no_keeps);
+  budget->deleted += contents_deleted;
+  budget->skipped += contents_skipped;
+  if (walk == DELETE_WALK_LIMIT_REACHED) {
+    budget->limit_hit = true;
+  } else if (walk != DELETE_WALK_OK) {
+    *ok = false;
+  } else if (budget->deleted >= budget->max_delete) {
+    budget->limit_hit = true;
+    budget->skipped++;
+  } else if (file_remove_tree_secure(full)) {
+    /* The shared `if (removed)` tail charges this directory exactly once;
+       counting it here too would consume two budget units. */
+    *removed = true;
+  } else {
+    *ok = false;
+  }
+}
+
+/* Remove one missing-args destination mirror.  `skips` holds the receiver
+   artifacts (staging directory, basis snapshots) that stay protected.  Returns
+   MISSING_ARG_STOP when the driver loop must stop (a completed removal left a
+   genuine error pending) and MISSING_ARG_NEXT otherwise; *ok accumulates the
+   overall success across the whole run. */
+static MissingArgStep delete_one_missing_arg(const Config* config, const char* rel,
+                                             const DeleteSkipSet* skips, DeleteBudgetState* budget,
+                                             DeletePathObserver observer, void* observer_context,
+                                             bool* ok) {
+  if (!rel || *rel == '\0' || *rel == '/' || has_path_traversal(rel)) {
+    /* Defensive only: receive_manifest_entries already validated every
+       section identically, so a controlled peer never reaches this branch. */
+    log_message(LOG_LEVEL_ERROR, "invalid missing-args delete path");
+    *ok = false;
+    return MISSING_ARG_NEXT;
+  }
+  bool at_root = strchr(rel, '/') == NULL;
+  if (path_under_skip_prefix(rel, at_root, skips->entries, skips->count)) {
+    char* escaped = output_escape(rel, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING,
+                "missing-args path '%s' is protected (staging directory or basis snapshot); "
+                "not deleting",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    return MISSING_ARG_NEXT;
+  }
+  char* full = path_cat(config->receive_root_directory, rel);
+  if (!full) {
+    *ok = false;
+    return MISSING_ARG_NEXT;
+  }
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(full, &leaf, false);
+  if (parent_fd < 0) {
+    /* The mirror's parent directory may itself not exist on the destination
+       (a deeper missing entry whose leading directories were never created).
+       That is a no-op -- there is nothing to delete -- matching
+       file_remove_tree_secure's absent-path handling; only a genuine I/O
+       error (EACCES, a symlink loop, ...) fails the run. */
+    bool absent = errno == ENOENT || errno == ENOTDIR;
+    free(full);
+    free(leaf);
+    if (!absent)
+      *ok = false;
+    return MISSING_ARG_NEXT;
+  }
+  struct stat st;
+  if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+    /* Already absent: nothing to delete (a no-op, not a deletion). */
+    if (errno != ENOENT)
+      *ok = false;
+    close(parent_fd);
+    free(leaf);
+    free(full);
+    return MISSING_ARG_NEXT;
+  }
+  /* An entry that exists is one deletion: skip it (and count it) when the
+     shared --max-delete budget is already exhausted. */
+  if (budget->deleted >= budget->max_delete) {
+    budget->limit_hit = true;
+    budget->skipped++;
+    close(parent_fd);
+    free(leaf);
+    free(full);
+    return MISSING_ARG_NEXT;
+  }
+  bool removed = false;
+  if (S_ISDIR(st.st_mode)) {
+    if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0) {
+      removed = true;
+    } else if (errno == ENOTEMPTY || errno == EEXIST) {
+      close(parent_fd);
+      parent_fd = -1;
+      free(leaf);
+      leaf = NULL;
+      if (config->use_delete || config->force_delete) {
+        delete_nonempty_missing_dir(full, rel, budget, observer, observer_context, &removed, ok);
+      } else {
+        char* escaped = output_escape(rel, log_get_8_bit_output());
+        log_message(LOG_LEVEL_WARNING,
+                    "missing-args destination '%s' is a non-empty directory; use --force or "
+                    "--delete to remove it",
+                    escaped ? escaped : "<allocation failed>");
+        free(escaped);
+      }
+    } else if (errno != ENOENT) {
+      *ok = false;
+    }
+  } else {
+    if (unlinkat(parent_fd, leaf, 0) == 0) {
+      removed = true;
+    } else if (errno != ENOENT) {
+      *ok = false;
+    }
+  }
+  if (removed) {
+    budget->deleted++;
+    if (observer)
+      observer(observer_context, rel, delete_entry_type_of_mode(st.st_mode));
+    char* escaped = output_escape(rel, log_get_8_bit_output());
+    fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
+    free(escaped);
+  }
+  if (parent_fd >= 0)
+    close(parent_fd);
+  free(leaf);
+  free(full);
+  return *ok ? MISSING_ARG_NEXT : MISSING_ARG_STOP;
+}
+
 static bool delete_missing_args_budgeted_observed(const Config* config,
                                                   const DeleteManifest* manifest,
                                                   DeleteBudgetState* budget,
@@ -246,141 +406,8 @@ static bool delete_missing_args_budgeted_observed(const Config* config,
   bool ok = true;
   for (int i = 0; i < manifest->missing->size; i++) {
     const char* rel = (const char*)manifest->missing->items[i];
-    if (!rel || *rel == '\0' || *rel == '/' || has_path_traversal(rel)) {
-      /* Defensive only: receive_manifest_entries already validated every
-         section identically, so a controlled peer never reaches this branch. */
-      log_message(LOG_LEVEL_ERROR, "invalid missing-args delete path");
-      ok = false;
-      continue;
-    }
-    bool at_root = strchr(rel, '/') == NULL;
-    if (path_under_skip_prefix(rel, at_root, skips.entries, skips.count)) {
-      char* escaped = output_escape(rel, log_get_8_bit_output());
-      log_message(LOG_LEVEL_WARNING,
-                  "missing-args path '%s' is protected (staging directory or basis snapshot); "
-                  "not deleting",
-                  escaped ? escaped : "<allocation failed>");
-      free(escaped);
-      continue;
-    }
-    char* full = path_cat(config->receive_root_directory, rel);
-    if (!full) {
-      ok = false;
-      continue;
-    }
-    char* leaf = NULL;
-    int parent_fd = file_open_secure_parent(full, &leaf, false);
-    if (parent_fd < 0) {
-      /* The mirror's parent directory may itself not exist on the destination
-         (a deeper missing entry whose leading directories were never created).
-         That is a no-op -- there is nothing to delete -- matching
-         file_remove_tree_secure's absent-path handling; only a genuine I/O
-         error (EACCES, a symlink loop, ...) fails the run. */
-      bool absent = errno == ENOENT || errno == ENOTDIR;
-      free(full);
-      free(leaf);
-      if (!absent)
-        ok = false;
-      continue;
-    }
-    struct stat st;
-    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-      /* Already absent: nothing to delete (a no-op, not a deletion). */
-      if (errno != ENOENT)
-        ok = false;
-      close(parent_fd);
-      free(leaf);
-      free(full);
-      continue;
-    }
-    /* An entry that exists is one deletion: skip it (and count it) when the
-       shared --max-delete budget is already exhausted. */
-    if (budget->deleted >= budget->max_delete) {
-      budget->limit_hit = true;
-      budget->skipped++;
-      close(parent_fd);
-      free(leaf);
-      free(full);
-      continue;
-    }
-    bool removed = false;
-    if (S_ISDIR(st.st_mode)) {
-      if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0) {
-        removed = true;
-      } else if (errno == ENOTEMPTY || errno == EEXIST) {
-        close(parent_fd);
-        parent_fd = -1;
-        free(leaf);
-        leaf = NULL;
-        if (config->use_delete || config->force_delete) {
-          /* Remove the contents entry-by-entry through the budgeted extras
-             walker so every deleted file/dir counts toward --max-delete (rsync
-             parity); the now-empty directory itself costs one more.  A run that
-             hits the cap leaves the remaining entries in place. */
-          ArrayList* no_keeps = array_list_create(free);
-          /* Never let an accounting slip (deleted > max_delete) underflow the
-             remaining budget into SIZE_MAX, which would grant unlimited
-             deletions. */
-          size_t remaining =
-              budget->deleted >= budget->max_delete ? 0 : budget->max_delete - budget->deleted;
-          size_t contents_deleted = 0;
-          size_t contents_skipped = 0;
-          PrefixedDeleteObserver nested = {observer, observer_context, rel};
-          DeleteWalkResult walk =
-              no_keeps ? delete_extras_limited_observed(full, no_keeps, NULL, remaining, NULL, 0,
-                                                        NULL, &contents_deleted, &contents_skipped,
-                                                        observer ? prefixed_delete_observer : NULL,
-                                                        observer ? &nested : NULL)
-                       : DELETE_WALK_ERROR;
-          if (no_keeps)
-            array_list_delete(no_keeps);
-          budget->deleted += contents_deleted;
-          budget->skipped += contents_skipped;
-          if (walk == DELETE_WALK_LIMIT_REACHED) {
-            budget->limit_hit = true;
-          } else if (walk != DELETE_WALK_OK) {
-            ok = false;
-          } else if (budget->deleted >= budget->max_delete) {
-            budget->limit_hit = true;
-            budget->skipped++;
-          } else if (file_remove_tree_secure(full)) {
-            /* The shared `if (removed)` tail charges this directory exactly
-               once; counting it here too would consume two budget units. */
-            removed = true;
-          } else {
-            ok = false;
-          }
-        } else {
-          char* escaped = output_escape(rel, log_get_8_bit_output());
-          log_message(LOG_LEVEL_WARNING,
-                      "missing-args destination '%s' is a non-empty directory; use --force or "
-                      "--delete to remove it",
-                      escaped ? escaped : "<allocation failed>");
-          free(escaped);
-        }
-      } else if (errno != ENOENT) {
-        ok = false;
-      }
-    } else {
-      if (unlinkat(parent_fd, leaf, 0) == 0) {
-        removed = true;
-      } else if (errno != ENOENT) {
-        ok = false;
-      }
-    }
-    if (removed) {
-      budget->deleted++;
-      if (observer)
-        observer(observer_context, rel, delete_entry_type_of_mode(st.st_mode));
-      char* escaped = output_escape(rel, log_get_8_bit_output());
-      fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
-      free(escaped);
-    }
-    if (parent_fd >= 0)
-      close(parent_fd);
-    free(leaf);
-    free(full);
-    if (!ok)
+    if (delete_one_missing_arg(config, rel, &skips, budget, observer, observer_context, &ok) ==
+        MISSING_ARG_STOP)
       break;
   }
   delete_skips_free(&skips);
